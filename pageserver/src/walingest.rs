@@ -52,6 +52,7 @@ use crate::metrics::WAL_INGEST;
 use crate::pgdatadir_mapping::{DatadirModification, Version};
 use crate::span::debug_assert_current_span_has_tenant_and_timeline_id;
 use crate::tenant::{PageReconstructError, Timeline};
+use crate::walredo::apply_neon;
 
 enum_pgversion! {CheckPoint, pgv::CheckPoint}
 
@@ -308,7 +309,8 @@ impl WalIngest {
                         .await?;
                 }
                 MultiXactRecord::Create(create) => {
-                    self.ingest_multixact_create(modification, &create)?;
+                    self.ingest_multixact_create(modification, &create, ctx)
+                        .await?;
                 }
                 MultiXactRecord::Truncate(truncate) => {
                     self.ingest_multixact_truncate(modification, &truncate, ctx)
@@ -1012,25 +1014,87 @@ impl WalIngest {
         .await
     }
 
-    fn ingest_multixact_create(
+    async fn ingest_multixact_create(
         &mut self,
-        modification: &mut DatadirModification,
+        modification: &mut DatadirModification<'_>,
         xlrec: &XlMultiXactCreate,
+        ctx: &RequestContext,
     ) -> Result<(), WalIngestError> {
-        // Create WAL record for updating the multixact-offsets page
+        // Like Postgres' RecordNewMultiXact, set this multixact's offset and the next
+        // one's (the end of these members): readers of this multixact need it even
+        // when the next multixact's own record never makes it (a branch cut between
+        // two concurrently created multixacts). Offset 0 is skipped, as in
+        // GetNewMultiXactId.
+        let next_mid = apply_neon::next_multixact_id(xlrec.mid);
+        let next_moff = match xlrec.moff.wrapping_add(xlrec.nmembers) {
+            0 => 1,
+            next => next,
+        };
+        let offsets_rec = NeonWalRecord::MultixactOffsetCreateWithNext {
+            mid: xlrec.mid,
+            moff: xlrec.moff,
+            next_moff,
+        };
+
         let pageno = xlrec.mid / pg_constants::MULTIXACT_OFFSETS_PER_PAGE as u32;
         let segno = pageno / pg_constants::SLRU_PAGES_PER_SEGMENT;
         let rpageno = pageno % pg_constants::SLRU_PAGES_PER_SEGMENT;
-
         modification.put_slru_wal_record(
             SlruKind::MultiXactOffsets,
             segno,
             rpageno,
-            NeonWalRecord::MultixactOffsetCreate {
-                mid: xlrec.mid,
-                moff: xlrec.moff,
-            },
+            offsets_rec.clone(),
         )?;
+
+        let next_pageno = next_mid / pg_constants::MULTIXACT_OFFSETS_PER_PAGE as u32;
+        if next_pageno != pageno && self.shard.is_shard_zero() {
+            let next_segno = next_pageno / pg_constants::SLRU_PAGES_PER_SEGMENT;
+            let next_rpageno = next_pageno % pg_constants::SLRU_PAGES_PER_SEGMENT;
+            let page_exists = modification
+                .tline
+                .get_slru_segment_exists(
+                    SlruKind::MultiXactOffsets,
+                    next_segno,
+                    Version::Modified(modification),
+                    ctx,
+                )
+                .await?
+                && modification
+                    .tline
+                    .get_slru_segment_size(
+                        SlruKind::MultiXactOffsets,
+                        next_segno,
+                        Version::Modified(modification),
+                        ctx,
+                    )
+                    .await?
+                    > next_rpageno;
+            if page_exists {
+                modification.put_slru_wal_record(
+                    SlruKind::MultiXactOffsets,
+                    next_segno,
+                    next_rpageno,
+                    offsets_rec,
+                )?;
+            } else {
+                // WAL from older Postgres minors doesn't zero the next page before this
+                // record (RecordNewMultiXact initializes it during recovery). Write it as
+                // one image with the entry set: a key holds one value per LSN, so a zero
+                // image followed by a record would lose one of them.
+                let mut page = ZERO_PAGE.to_vec();
+                let entry = (next_mid % pg_constants::MULTIXACT_OFFSETS_PER_PAGE as u32) as usize;
+                page[entry * 4..entry * 4 + 4].copy_from_slice(&next_moff.to_le_bytes());
+                self.put_slru_page_image(
+                    modification,
+                    SlruKind::MultiXactOffsets,
+                    next_segno,
+                    next_rpageno,
+                    Bytes::from(page),
+                    ctx,
+                )
+                .await?;
+            }
+        }
 
         // Create WAL records for the update of each affected multixact-members page
         let mut members = xlrec.members.iter();
@@ -1038,9 +1102,14 @@ impl WalIngest {
         loop {
             let pageno = offset / pg_constants::MULTIXACT_MEMBERS_PER_PAGE as u32;
 
-            // How many members fit on this page?
-            let page_remain = pg_constants::MULTIXACT_MEMBERS_PER_PAGE as u32
+            // How many members fit on this page? The last page is cut short where the
+            // 32-bit member offset wraps around; the rest continue on page 0.
+            let mut page_remain = pg_constants::MULTIXACT_MEMBERS_PER_PAGE as u32
                 - offset % pg_constants::MULTIXACT_MEMBERS_PER_PAGE as u32;
+            let until_wrap = 0u32.wrapping_sub(offset);
+            if until_wrap != 0 {
+                page_remain = page_remain.min(until_wrap);
+            }
 
             let mut this_page_members: Vec<MultiXactMember> = Vec::new();
             for _ in 0..page_remain {
@@ -2437,5 +2506,320 @@ mod tests {
 
         let duration = started_at.elapsed();
         println!("done in {duration:?}");
+    }
+
+    const OFFSETS_PER_PAGE: u32 = pg_constants::MULTIXACT_OFFSETS_PER_PAGE as u32;
+    const MEMBERS_PER_PAGE: u32 = pg_constants::MULTIXACT_MEMBERS_PER_PAGE as u32;
+
+    fn slru_key(kind: SlruKind, pageno: u32) -> Key {
+        pageserver_api::key::slru_block_to_key(
+            kind,
+            pageno / pg_constants::SLRU_PAGES_PER_SEGMENT,
+            pageno % pg_constants::SLRU_PAGES_PER_SEGMENT,
+        )
+    }
+
+    /// A CREATE_ID record whose members are xids 1000, 1001, ...
+    fn mx_create(mid: u32, moff: u32, nmembers: u32) -> XlMultiXactCreate {
+        XlMultiXactCreate {
+            mid,
+            moff,
+            nmembers,
+            members: (0..nmembers)
+                .map(|i| MultiXactMember {
+                    xid: 1000 + i,
+                    status: 1,
+                })
+                .collect(),
+        }
+    }
+
+    /// Creates zeroed SLRU pages, as ZERO_OFF_PAGE / ZERO_MEM_PAGE records do.
+    async fn zero_slru_pages(
+        walingest: &mut WalIngest,
+        tline: &Timeline,
+        lsn: Lsn,
+        pages: &[(SlruKind, u32)],
+        ctx: &RequestContext,
+    ) -> Result<()> {
+        let mut m = tline.begin_modification(lsn);
+        for &(kind, pageno) in pages {
+            walingest
+                .put_slru_page_image(
+                    &mut m,
+                    kind,
+                    pageno / pg_constants::SLRU_PAGES_PER_SEGMENT,
+                    pageno % pg_constants::SLRU_PAGES_PER_SEGMENT,
+                    ZERO_PAGE.clone(),
+                    ctx,
+                )
+                .await?;
+        }
+        m.commit(ctx).await?;
+        Ok(())
+    }
+
+    async fn ingest_mx_create(
+        walingest: &mut WalIngest,
+        tline: &Timeline,
+        lsn: Lsn,
+        xlrec: XlMultiXactCreate,
+        ctx: &RequestContext,
+    ) -> Result<()> {
+        let mut m = tline.begin_modification(lsn);
+        walingest
+            .ingest_multixact_create(&mut m, &xlrec, ctx)
+            .await?;
+        m.commit(ctx).await?;
+        Ok(())
+    }
+
+    async fn offsets_entry(
+        tline: &Timeline,
+        mid: u32,
+        lsn: Lsn,
+        ctx: &RequestContext,
+    ) -> Result<u32> {
+        let page = tline
+            .get(
+                slru_key(SlruKind::MultiXactOffsets, mid / OFFSETS_PER_PAGE),
+                lsn,
+                ctx,
+            )
+            .await?;
+        let off = (mid % OFFSETS_PER_PAGE) as usize * 4;
+        Ok(u32::from_le_bytes(page[off..off + 4].try_into().unwrap()))
+    }
+
+    async fn member_xid(
+        tline: &Timeline,
+        offset: u32,
+        lsn: Lsn,
+        ctx: &RequestContext,
+    ) -> Result<u32> {
+        let page = tline
+            .get(
+                slru_key(SlruKind::MultiXactMembers, offset / MEMBERS_PER_PAGE),
+                lsn,
+                ctx,
+            )
+            .await?;
+        let off = postgres_ffi::v14::nonrelfile_utils::mx_offset_to_member_offset(offset);
+        Ok(u32::from_le_bytes(page[off..off + 4].try_into().unwrap()))
+    }
+
+    #[tokio::test]
+    async fn ingest_emits_next_offset_record() -> Result<()> {
+        let (tenant, ctx) = TenantHarness::create("ingest_emits_next_offset_record")
+            .await?
+            .load()
+            .await;
+        let tline = tenant
+            .create_test_timeline(TIMELINE_ID, Lsn(8), DEFAULT_PG_VERSION, &ctx)
+            .await?;
+        let mut walingest = init_walingest_test(&tline, &ctx).await?;
+        zero_slru_pages(
+            &mut walingest,
+            &tline,
+            Lsn(0x20),
+            &[
+                (SlruKind::MultiXactOffsets, 0),
+                (SlruKind::MultiXactMembers, 0),
+            ],
+            &ctx,
+        )
+        .await?;
+
+        ingest_mx_create(&mut walingest, &tline, Lsn(0x30), mx_create(5, 10, 3), &ctx).await?;
+
+        assert_eq!(offsets_entry(&tline, 5, Lsn(0x30), &ctx).await?, 10);
+        // Like Postgres' RecordNewMultiXact: the next multixact's entry holds the end of
+        // these members, so mid 5's members can be read before mid 6 exists.
+        assert_eq!(offsets_entry(&tline, 6, Lsn(0x30), &ctx).await?, 13);
+        assert_eq!(offsets_entry(&tline, 7, Lsn(0x30), &ctx).await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn next_entry_across_page_boundary_creates_page() -> Result<()> {
+        let (tenant, ctx) = TenantHarness::create("next_entry_across_page_boundary_creates_page")
+            .await?
+            .load()
+            .await;
+        let tline = tenant
+            .create_test_timeline(TIMELINE_ID, Lsn(8), DEFAULT_PG_VERSION, &ctx)
+            .await?;
+        let mut walingest = init_walingest_test(&tline, &ctx).await?;
+        zero_slru_pages(
+            &mut walingest,
+            &tline,
+            Lsn(0x20),
+            &[
+                (SlruKind::MultiXactOffsets, 0),
+                (SlruKind::MultiXactMembers, 0),
+            ],
+            &ctx,
+        )
+        .await?;
+
+        // mid is the last entry of offsets page 0; page 1 doesn't exist yet.
+        let mid = OFFSETS_PER_PAGE - 1;
+        ingest_mx_create(
+            &mut walingest,
+            &tline,
+            Lsn(0x30),
+            mx_create(mid, 10, 3),
+            &ctx,
+        )
+        .await?;
+
+        assert_eq!(
+            tline
+                .get_slru_segment_size(SlruKind::MultiXactOffsets, 0, Version::at(Lsn(0x30)), &ctx)
+                .await?,
+            2
+        );
+        assert_eq!(offsets_entry(&tline, mid, Lsn(0x30), &ctx).await?, 10);
+        assert_eq!(offsets_entry(&tline, mid + 1, Lsn(0x30), &ctx).await?, 13);
+        assert_eq!(offsets_entry(&tline, mid + 2, Lsn(0x30), &ctx).await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn next_mid_wraps_to_first_multixact_id() -> Result<()> {
+        let (tenant, ctx) = TenantHarness::create("next_mid_wraps_to_first_multixact_id")
+            .await?
+            .load()
+            .await;
+        let tline = tenant
+            .create_test_timeline(TIMELINE_ID, Lsn(8), DEFAULT_PG_VERSION, &ctx)
+            .await?;
+        let mut walingest = init_walingest_test(&tline, &ctx).await?;
+        zero_slru_pages(
+            &mut walingest,
+            &tline,
+            Lsn(0x20),
+            &[
+                (SlruKind::MultiXactOffsets, 0),
+                (SlruKind::MultiXactOffsets, u32::MAX / OFFSETS_PER_PAGE),
+                (SlruKind::MultiXactMembers, u32::MAX / MEMBERS_PER_PAGE),
+            ],
+            &ctx,
+        )
+        .await?;
+
+        // The last multixact id, whose members end exactly at the members wrap point.
+        ingest_mx_create(
+            &mut walingest,
+            &tline,
+            Lsn(0x30),
+            mx_create(u32::MAX, u32::MAX - 1, 2),
+            &ctx,
+        )
+        .await?;
+
+        assert_eq!(
+            offsets_entry(&tline, u32::MAX, Lsn(0x30), &ctx).await?,
+            u32::MAX - 1
+        );
+        // The next multixact is FirstMultiXactId (1), and offset 0 is skipped as in Postgres.
+        assert_eq!(offsets_entry(&tline, 0, Lsn(0x30), &ctx).await?, 0);
+        assert_eq!(offsets_entry(&tline, 1, Lsn(0x30), &ctx).await?, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn members_wrap_at_last_page() -> Result<()> {
+        let (tenant, ctx) = TenantHarness::create("members_wrap_at_last_page")
+            .await?
+            .load()
+            .await;
+        let tline = tenant
+            .create_test_timeline(TIMELINE_ID, Lsn(8), DEFAULT_PG_VERSION, &ctx)
+            .await?;
+        let mut walingest = init_walingest_test(&tline, &ctx).await?;
+        zero_slru_pages(
+            &mut walingest,
+            &tline,
+            Lsn(0x20),
+            &[
+                (SlruKind::MultiXactOffsets, 0),
+                (SlruKind::MultiXactMembers, u32::MAX / MEMBERS_PER_PAGE),
+                (SlruKind::MultiXactMembers, 0),
+            ],
+            &ctx,
+        )
+        .await?;
+
+        // 16 members fit before the wrap point, the last 4 wrap to offsets 0..=3.
+        let moff = 0xFFFF_FFF0;
+        ingest_mx_create(
+            &mut walingest,
+            &tline,
+            Lsn(0x30),
+            mx_create(1, moff, 20),
+            &ctx,
+        )
+        .await?;
+
+        for i in 0..20u32 {
+            let offset = moff.wrapping_add(i);
+            assert_eq!(
+                member_xid(&tline, offset, Lsn(0x30), &ctx).await?,
+                1000 + i,
+                "member {i} at offset {offset}"
+            );
+        }
+        assert_eq!(offsets_entry(&tline, 2, Lsn(0x30), &ctx).await?, 4);
+        Ok(())
+    }
+
+    /// Two backends create multixacts concurrently and the later one's record is
+    /// logged first; mid 2047's record must not wipe mid 2048's entries on page 1.
+    #[tokio::test]
+    async fn concurrent_creates_out_of_order_reconstruct() -> Result<()> {
+        let (tenant, ctx) = TenantHarness::create("concurrent_creates_out_of_order_reconstruct")
+            .await?
+            .load()
+            .await;
+        let tline = tenant
+            .create_test_timeline(TIMELINE_ID, Lsn(8), DEFAULT_PG_VERSION, &ctx)
+            .await?;
+        let mut walingest = init_walingest_test(&tline, &ctx).await?;
+        zero_slru_pages(
+            &mut walingest,
+            &tline,
+            Lsn(0x20),
+            &[
+                (SlruKind::MultiXactOffsets, 0),
+                (SlruKind::MultiXactOffsets, 1),
+                (SlruKind::MultiXactMembers, 0),
+            ],
+            &ctx,
+        )
+        .await?;
+
+        let mid = OFFSETS_PER_PAGE - 1;
+        ingest_mx_create(
+            &mut walingest,
+            &tline,
+            Lsn(0x30),
+            mx_create(mid + 1, 13, 2),
+            &ctx,
+        )
+        .await?;
+        ingest_mx_create(
+            &mut walingest,
+            &tline,
+            Lsn(0x40),
+            mx_create(mid, 10, 3),
+            &ctx,
+        )
+        .await?;
+
+        assert_eq!(offsets_entry(&tline, mid, Lsn(0x40), &ctx).await?, 10);
+        assert_eq!(offsets_entry(&tline, mid + 1, Lsn(0x40), &ctx).await?, 13);
+        assert_eq!(offsets_entry(&tline, mid + 2, Lsn(0x40), &ctx).await?, 15);
+        Ok(())
     }
 }
