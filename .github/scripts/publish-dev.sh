@@ -3,10 +3,17 @@
 # It mirrors the dev-storage and dev-compute jobs of .github/workflows/images.yml (which is now
 # only for tags and the platform images, run by hand).
 #
-#   .github/scripts/publish-dev.sh [--no-push] [--only storage|compute] [--allow-dirty]
-#                                  [--allow-unpushed] [--force-retag]
+#   .github/scripts/publish-dev.sh [--no-push | --push-only] [--only storage|compute]
+#                                  [--allow-dirty] [--allow-unpushed] [--force-retag]
 #
 #   --no-push         build and test only; push nothing
+#   --push-only       build nothing and run no variant test: push the images already built
+#                     locally (images are built once, e.g. by an earlier --no-push run). Keeps
+#                     every pre-check that applies to pushing (HEAD on origin/main, tag free,
+#                     ghcr login, clean tree), and for each selected image requires the local
+#                     ref to exist and its org.opencontainers.image.revision label (the build's
+#                     full SHA) to equal HEAD; otherwise it refuses before pushing anything.
+#                     Refused together with --no-push or --allow-unpushed.
 #   --only NAME       build just the storage or the compute image (default: both)
 #   --allow-dirty     build from a working tree with uncommitted changes
 #   --allow-unpushed  build a HEAD that is not on origin/main (the image must not be pushed
@@ -43,10 +50,11 @@ die() {
     return 1
 }
 
-# parse_args <args...>: sets NO_PUSH, ONLY, ALLOW_DIRTY, ALLOW_UNPUSHED, FORCE_RETAG.
+# parse_args <args...>: sets NO_PUSH, PUSH_ONLY, ONLY, ALLOW_DIRTY, ALLOW_UNPUSHED, FORCE_RETAG.
 # Returns 2 for --help.
 parse_args() {
     NO_PUSH=0
+    PUSH_ONLY=0
     ONLY=""
     ALLOW_DIRTY=0
     ALLOW_UNPUSHED=0
@@ -54,6 +62,7 @@ parse_args() {
     while (($# > 0)); do
         case "$1" in
         --no-push) NO_PUSH=1; shift ;;
+        --push-only) PUSH_ONLY=1; shift ;;
         --allow-dirty) ALLOW_DIRTY=1; shift ;;
         --allow-unpushed) ALLOW_UNPUSHED=1; shift ;;
         --force-retag) FORCE_RETAG=1; shift ;;
@@ -69,6 +78,14 @@ parse_args() {
         *) die "unknown argument '$1'"; return 1 ;;
         esac
     done
+    if ((PUSH_ONLY == 1 && NO_PUSH == 1)); then
+        die "--push-only and --no-push contradict each other"
+        return 1
+    fi
+    if ((PUSH_ONLY == 1 && ALLOW_UNPUSHED == 1)); then
+        die "--push-only cannot be combined with --allow-unpushed (it only pushes images of a HEAD that is on origin/main)"
+        return 1
+    fi
 }
 
 # sha12 <full sha>
@@ -154,12 +171,31 @@ precheck() {
         die "HEAD is not on origin/main: images must come from commits that exist on the fork (merge first, or pass --allow-unpushed with --no-push)"
         return 1
     fi
-    if ! submodules_ok "$(git -C "$ROOT" submodule status)"; then
+    if ((PUSH_ONLY == 0)) && ! submodules_ok "$(git -C "$ROOT" submodule status)"; then
         die "submodules are not initialised at the recorded commits (run: git submodule update --init)"
         return 1
     fi
     if ((NO_PUSH == 0)) && ! ghcr_login_present; then
         die "no ghcr.io login found in the docker config (pushing needs one even though the packages are public: docker login ghcr.io)"
+        return 1
+    fi
+}
+
+# image_revision <ref>: the full build SHA recorded in the local image's revision label (set by
+# build_image); empty when the label is absent. Fails when the image does not exist locally.
+image_revision() {
+    docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$1" 2>/dev/null
+}
+
+# check_local_image <ref> <full sha>: the image exists locally and was built from that commit.
+check_local_image() {
+    local ref="$1" want="$2" got
+    got="$(image_revision "$ref")" || {
+        die "--push-only: the image $ref was not found locally (build it first: publish-dev.sh --no-push --allow-unpushed)"
+        return 1
+    }
+    if [[ "$got" != "$want" ]]; then
+        die "--push-only: the image $ref was built from '${got:-<no revision label>}', not from HEAD $want (rebuild, or check out the commit it was built from)"
         return 1
     fi
 }
@@ -225,18 +261,25 @@ main() {
         # Fail before the long builds, not after.
         if ((NO_PUSH == 0)); then check_tag_free "${refs[-1]}"; fi
     done
-    echo "publish-dev: commit $SHA, images: ${refs[*]}, push=$((1 - NO_PUSH))"
+    echo "publish-dev: commit $SHA, images: ${refs[*]}, push=$((1 - NO_PUSH)), push-only=$PUSH_ONLY"
 
     local i
-    for i in "${!whiches[@]}"; do
-        build_image "${whiches[$i]}" "${refs[$i]}"
-        if [[ "${whiches[$i]}" == storage ]]; then
-            echo
-            echo "##### image_variant_test.sh ${refs[$i]}"
-            "$ROOT/.github/scripts/image_variant_test.sh" "${refs[$i]}" ||
-                { die "the storage image failed the variant test, nothing was pushed"; exit 1; }
-        fi
-    done
+    if ((PUSH_ONLY == 1)); then
+        # Check every image before pushing any.
+        for i in "${!refs[@]}"; do
+            check_local_image "${refs[$i]}" "$SHA" || exit 1
+        done
+    else
+        for i in "${!whiches[@]}"; do
+            build_image "${whiches[$i]}" "${refs[$i]}"
+            if [[ "${whiches[$i]}" == storage ]]; then
+                echo
+                echo "##### image_variant_test.sh ${refs[$i]}"
+                "$ROOT/.github/scripts/image_variant_test.sh" "${refs[$i]}" ||
+                    { die "the storage image failed the variant test, nothing was pushed"; exit 1; }
+            fi
+        done
+    fi
 
     if ((NO_PUSH == 1)); then
         echo

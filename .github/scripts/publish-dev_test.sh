@@ -113,6 +113,124 @@ FORCE_RETAG=1
 expect_ok "force-retag allows existing tag" check_tag_free ghcr.io/x/exists:1
 unset -f docker
 
+# --push-only: argument parsing
+parse_po() {
+    (
+        parse_args "$@" || exit 1
+        echo "push_only=$PUSH_ONLY no_push=$NO_PUSH only=$ONLY"
+    )
+}
+expect "push-only default off" "push_only=0 no_push=0 only=" "$(parse_po)"
+expect "push-only on" "push_only=1 no_push=0 only=" "$(parse_po --push-only)"
+expect "push-only with only" "push_only=1 no_push=0 only=compute" "$(parse_po --push-only --only compute)"
+expect_fail "push-only refuses --no-push" parse_po --push-only --no-push
+expect_fail "--no-push refuses push-only (other order)" parse_po --no-push --push-only
+expect_fail "push-only refuses --allow-unpushed" parse_po --push-only --allow-unpushed
+expect_ok "push-only accepts --allow-dirty and --force-retag" parse_po --push-only --allow-dirty --force-retag
+expect_ok "usage documents push-only" grep -q -- --push-only <<<"$(usage 2>&1)"
+
+# --push-only: the local image must carry the build SHA of HEAD (the revision label)
+full=7dc4d86b7d48aabbccddeeff00112233445566ff
+other=1111111111112222222222223333333333334444
+# shellcheck disable=SC2329 # called by image_revision
+docker() {
+    case "$*" in
+    "image inspect --format {{index .Config.Labels \"org.opencontainers.image.revision\"}} ghcr.io/x/good:1") echo "$full" ;;
+    "image inspect --format {{index .Config.Labels \"org.opencontainers.image.revision\"}} ghcr.io/x/stale:1") echo "$other" ;;
+    "image inspect --format {{index .Config.Labels \"org.opencontainers.image.revision\"}} ghcr.io/x/nolabel:1") echo "" ;;
+    *) return 1 ;;
+    esac
+}
+expect "image_revision reads the label" "$full" "$(image_revision ghcr.io/x/good:1)"
+expect_fail "image_revision of a missing image" image_revision ghcr.io/x/absent:1
+expect_ok "matching image passes" check_local_image ghcr.io/x/good:1 "$full"
+expect_fail "missing image refused" check_local_image ghcr.io/x/absent:1 "$full"
+expect_fail "stale image refused" check_local_image ghcr.io/x/stale:1 "$full"
+expect_fail "image without a revision label refused" check_local_image ghcr.io/x/nolabel:1 "$full"
+expect "missing image message" "1" "$(check_local_image ghcr.io/x/absent:1 "$full" 2>&1 | grep -c 'not found locally')"
+expect "stale image message" "1" "$(check_local_image ghcr.io/x/stale:1 "$full" 2>&1 | grep -c 'built from')"
+unset -f docker
+
+# --push-only: whole-run behaviour with git, docker and the login stubbed
+calls="$tmp/calls"
+# run_main <local-images: good|stale|none> <tag-exists: 0|1> <args...>: prints output, then calls
+run_main() {
+    local imgs="$1" exists="$2"
+    shift 2
+    : >"$calls"
+    (
+        # shellcheck disable=SC2329 # called by main
+        git() {
+            case "$*" in
+            *"rev-parse HEAD") echo "$full" ;;
+            *"status --porcelain") echo "${FAKE_STATUS:-}" ;;
+            *"submodule status") echo "-deadbeef vendor/postgres-v17" ;;
+            *"merge-base --is-ancestor"*) return "${FAKE_ANCESTOR:-0}" ;;
+            *) return 0 ;;
+            esac
+        }
+        # shellcheck disable=SC2329 # called by main
+        docker() {
+            echo "docker $*" >>"$calls"
+            case "$1 $2" in
+            "image inspect")
+                case "$imgs" in
+                good) echo "$full" ;;
+                stale) echo "$other" ;;
+                *) return 1 ;;
+                esac
+                ;;
+            "buildx imagetools")
+                if [[ "$exists" == 1 && "${FAKE_PUSHED:-0}" == 0 ]]; then return 0; fi
+                if [[ "${FAKE_PUSHED:-0}" == 1 ]]; then
+                    echo "Digest:    sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    return 0
+                fi
+                return 1
+                ;;
+            push\ *) FAKE_PUSHED=1 ;;
+            esac
+            return 0
+        }
+        # shellcheck disable=SC2329 # called by main
+        ghcr_login_present() { return "${FAKE_LOGIN:-0}"; }
+        main "$@"
+    ) 2>&1
+    cat "$calls"
+}
+pushes() { grep -c '^docker push ' "$calls"; }
+
+out="$(run_main good 0 --push-only)"
+expect "push-only pushes both images" "2" "$(pushes)"
+expect "push-only never builds" "0" "$(grep -c 'buildx build' "$calls")"
+expect "push-only skips the variant test" "0" "$(grep -c 'image_variant_test' <<<"$out")"
+expect "push-only prints pin-ready digests" "2" \
+    "$(grep -c '^  ghcr.io/chelabase/neon-.*-dev@sha256:0123456789abcdef' <<<"$out")"
+out="$(run_main good 0 --push-only --only compute)"
+expect "push-only --only pushes one image" "1" "$(pushes)"
+out="$(run_main stale 0 --push-only)"
+expect "push-only refuses a stale image" "0" "$(pushes)"
+expect "stale refusal is explained" "1" "$(grep -c 'built from' <<<"$out")"
+out="$(run_main none 0 --push-only)"
+expect "push-only refuses a missing image" "0" "$(pushes)"
+expect "missing refusal is explained" "1" "$(grep -c 'not found locally' <<<"$out")"
+out="$(run_main good 1 --push-only)"
+expect "push-only refuses an existing tag" "0" "$(pushes)"
+out="$(run_main good 1 --push-only --force-retag)"
+expect "push-only --force-retag overrides the tag check" "2" "$(pushes)"
+FAKE_LOGIN=1; out="$(run_main good 0 --push-only)"
+expect "push-only needs a ghcr login" "0" "$(pushes)"
+unset FAKE_LOGIN
+FAKE_STATUS=" M x"; out="$(run_main good 0 --push-only)"
+expect "push-only refuses a dirty tree" "0" "$(pushes)"
+unset FAKE_STATUS
+FAKE_STATUS=" M x"; out="$(run_main good 0 --push-only --allow-dirty)"
+expect "push-only --allow-dirty pushes" "2" "$(pushes)"
+unset FAKE_STATUS
+FAKE_ANCESTOR=1; out="$(run_main good 0 --push-only)"
+expect "push-only needs HEAD on origin/main" "0" "$(pushes)"
+unset FAKE_ANCESTOR
+
 if ((failures > 0)); then
     echo "$failures check(s) failed"
     exit 1
