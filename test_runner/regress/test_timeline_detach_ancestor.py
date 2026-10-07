@@ -2327,7 +2327,9 @@ def test_multi_level_detach_copies_just_compacted_image_layer(neon_env_builder: 
     detach copies it by reference from remote storage without a failed copy, while the
     compaction is still held.
     """
-    env = neon_env_builder.init_start()
+    # No background compaction: only the test's own compaction may hit the (process-wide)
+    # failpoint.
+    env = neon_env_builder.init_start(initial_tenant_conf={"compaction_period": "0s"})
     env.pageserver.allowed_errors.extend(SHUTDOWN_ALLOWED_ERRORS)
     # The held compaction, cancelled by the detach's tenant reset.
     env.pageserver.allowed_errors.append(

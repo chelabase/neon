@@ -5265,7 +5265,6 @@ impl Timeline {
                     .extend(metadata_partition.into_dense().parts);
             }
 
-            let layers_to_upload = Vec::new();
             let (generated_image_layers, is_complete) = self
                 .create_image_layers(
                     &partitions,
@@ -5286,7 +5285,7 @@ impl Timeline {
             // uploads the index.
             drop(generated_image_layers);
 
-            (layers_to_upload, None)
+            (Vec::new(), None)
         } else {
             // Normal case, write out a L0 delta layer file.
             // `create_delta_layer` will not modify the layer map.
@@ -6167,7 +6166,16 @@ impl Timeline {
         for layer in &image_layers {
             self.remote_client
                 .schedule_layer_file_upload(layer.clone())
-                .map_err(|_| CreateImageLayersError::Cancelled)?;
+                .map_err(|e| match e {
+                    // as `From<NotInitialized> for CompactionError` does
+                    super::upload_queue::NotInitialized::ShuttingDown
+                    | super::upload_queue::NotInitialized::Stopped => {
+                        CreateImageLayersError::Cancelled
+                    }
+                    super::upload_queue::NotInitialized::Uninitialized => {
+                        CreateImageLayersError::Other(anyhow::anyhow!(e))
+                    }
+                })?;
         }
         drop_layer_manager_wlock(guard);
         // Holds a compaction right after its new image layers became visible in the layer map.
