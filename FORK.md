@@ -10,6 +10,17 @@ Apache License 2.0, unchanged. NOTICE file and upstream copyright are retained.
 
 We do not rewrite the core engine (pageserver, safekeepers, or Neon's PostgreSQL patches). We replace specific components only when our needs genuinely differ from upstream. Performance improvements must have supporting profiling evidence.
 
+## Pageserver changes
+
+The policy above keeps the engine upstream's; these are the changes we made to it, each fixing a bug Chelabase hit. Keep them in mind when merging upstream.
+
+- **Detach waits for its ancestors' WAL.** Before copying anything, `detach_ancestor` waits for every ancestor level to ingest its WAL up to the cut (an ancestor reloaded since its last flush only has its WAL up to its disk consistent LSN until its walreceiver catches up). Each wait is up to 30 s, one level after the other, so the worst case is 30 s × the chain's depth; a timeout returns 503 ("not caught up yet, retry later"), a broken ancestor 500.
+- **Multi-level detach copies every ancestor's layers.** Under `DetachBehavior::MultiLevelAndNoReparent` the detached timeline gets each level's layers up to that level's cut (straddling deltas rewritten). Nothing is reparented.
+- **Multixact next offset, as Postgres writes it.** A multixact `CREATE_ID` also sets the next multixact's offset (when still zero), as Postgres' `RecordNewMultiXact` does, through one combined record `NeonWalRecord::MultixactOffsetCreateWithNext` at **enum index 8** (just before the testing-only `Test` variant; byte tests pin the indices). `MultixactOffsetCreate` stays decodable but is no longer emitted. This is a stored format:
+  - **Never roll the pageserver back to a build without the variant** once it has ingested a `CREATE_ID`: its layers then hold discriminator 8, and an older pageserver can't read those pages.
+  - **On an upstream merge, renumber any upstream variant that lands at index 8**; ours keeps it.
+- **Multixact create on a missing offsets page creates it.** After a compute upgrade from an older Postgres minor, `TrimMultiXact` can zero an offsets page without logging it; a `CREATE_ID` on a page the pageserver doesn't have writes the page as one image with its entries set (also after a multixact id wraparound, for offsets segment 0). Accepted limit: data already damaged by an older pageserver (`CREATE_ID` records stored on a page that was never created) gets a zero image at the first new `CREATE_ID` there, so the earlier multixacts on that page read offset 0 instead of failing with "no base image".
+
 ## PostgreSQL Minors
 
 When a new PostgreSQL minor release becomes available:
