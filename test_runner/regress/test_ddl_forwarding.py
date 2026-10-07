@@ -295,6 +295,8 @@ def test_ddl_forwarding(ddl: DdlForwardingContext):
 
 
 SCRAM = "<scram-sha-256 hash>"
+# A role dropped and created again in one transaction
+RECREATED = {"touched": True, "recreated": True}
 
 
 class RoleBodies:
@@ -309,6 +311,7 @@ class RoleBodies:
             [
                 f"neon.console_url=http://{host}:{port}{endpoint}",
                 "shared_preload_libraries = 'neon'",
+                "max_prepared_transactions = 2",
             ]
         )
 
@@ -336,6 +339,17 @@ class RoleBodies:
             cur.execute("COMMIT")
         assert len(self.received) == 1, self.received
         return sorted(self.received[0].get("roles", []), key=lambda r: r["name"])
+
+    def dbs_of(self, statements: list[str]) -> list[dict[str, Any]]:
+        """Like roles_of, for the body's databases."""
+        self.received.clear()
+        with self.pg.cursor() as cur:
+            cur.execute("BEGIN")
+            for stmt in statements:
+                cur.execute(stmt)
+            cur.execute("COMMIT")
+        assert len(self.received) == 1, self.received
+        return sorted(self.received[0].get("dbs", []), key=lambda d: d["name"])
 
 
 @pytest.fixture(scope="function")
@@ -395,9 +409,10 @@ def test_alter_role_nologin_forwards_login_false(role_bodies: RoleBodies):
 
 
 def test_drop_then_create_sends_a_new_role(role_bodies: RoleBodies):
-    # One transaction: the DROP and the CREATE merge into one set without the old password
+    # One transaction: the DROP and the CREATE merge into one set without the old password,
+    # marked recreated (and touched: the old role's members lost their membership)
     assert role_bodies.roles_of(["DROP ROLE app", "CREATE USER app"]) == [
-        {"op": "set", "name": "app", "password": None, "login": True}
+        {"op": "set", "name": "app", "password": None, "login": True, **RECREATED}
     ]
     # A CREATE in a released savepoint forgets what the parent recorded before the DROP
     role_bodies.setup("ALTER ROLE app PASSWORD 'x'")
@@ -409,11 +424,460 @@ def test_drop_then_create_sends_a_new_role(role_bodies: RoleBodies):
             "CREATE ROLE app",
             "RELEASE SAVEPOINT s",
         ]
-    ) == [{"op": "set", "name": "app", "password": None, "login": False}]
-    # A created role renamed in the same transaction: a rename plus the explicit null
+    ) == [{"op": "set", "name": "app", "password": None, "login": False, **RECREATED}]
+    # A role created and renamed in the same transaction is a new role under its last name:
+    # no old_name (the receiver must not move whatever it holds under "a")
     assert role_bodies.roles_of(["CREATE ROLE a", "ALTER ROLE a RENAME TO b"]) == [
-        {"op": "set", "name": "b", "old_name": "a", "password": None, "login": False}
+        {"op": "set", "name": "b", "password": None, "login": False}
     ]
+
+
+def test_drop_then_create_marks_recreated(role_bodies: RoleBodies):
+    # With a password: the receiver must still treat it as a DROP for the old role's data keys
+    assert role_bodies.roles_of(["DROP ROLE app", "CREATE USER app PASSWORD 'y'"]) == [
+        {
+            "op": "set",
+            "name": "app",
+            "password": "y",
+            "encrypted_password": SCRAM,
+            "login": True,
+            **RECREATED,
+        }
+    ]
+    # Without a password
+    assert role_bodies.roles_of(["DROP ROLE app", "CREATE USER app"]) == [
+        {"op": "set", "name": "app", "password": None, "login": True, **RECREATED}
+    ]
+    # CREATE GROUP
+    assert role_bodies.roles_of(["DROP ROLE grp", "CREATE GROUP grp"]) == [
+        {"op": "set", "name": "grp", "password": None, "login": False, **RECREATED}
+    ]
+    # A plain CREATE with no DROP before it isn't recreated
+    assert role_bodies.roles_of(["CREATE USER fresh PASSWORD 'p'"]) == [
+        {"op": "set", "name": "fresh", "password": "p", "encrypted_password": SCRAM, "login": True}
+    ]
+    # A DROP rolled back with its savepoint doesn't count
+    assert role_bodies.roles_of(
+        [
+            "SAVEPOINT s",
+            "DROP ROLE fresh",
+            "CREATE USER fresh",
+            "ROLLBACK TO SAVEPOINT s",
+            "ALTER ROLE fresh NOLOGIN",
+        ]
+    ) == [{"op": "set", "name": "fresh", "login": False}]
+
+
+def test_recreated_across_savepoints(role_bodies: RoleBodies):
+    # DROP in the parent, CREATE in a released savepoint
+    assert role_bodies.roles_of(
+        ["DROP ROLE app", "SAVEPOINT s", "CREATE USER app PASSWORD 'y'", "RELEASE SAVEPOINT s"]
+    ) == [
+        {
+            "op": "set",
+            "name": "app",
+            "password": "y",
+            "encrypted_password": SCRAM,
+            "login": True,
+            **RECREATED,
+        }
+    ]
+    # DROP in a released savepoint, CREATE in the parent
+    assert role_bodies.roles_of(
+        ["SAVEPOINT s", "DROP ROLE app", "RELEASE SAVEPOINT s", "CREATE USER app"]
+    ) == [{"op": "set", "name": "app", "password": None, "login": True, **RECREATED}]
+    # DROP in the parent, CREATE two savepoints down
+    assert role_bodies.roles_of(
+        [
+            "DROP ROLE grp",
+            "SAVEPOINT s",
+            "SAVEPOINT t",
+            "CREATE GROUP grp",
+            "RELEASE SAVEPOINT t",
+            "RELEASE SAVEPOINT s",
+        ]
+    ) == [{"op": "set", "name": "grp", "password": None, "login": False, **RECREATED}]
+
+
+def test_recreated_survives_alter_and_rename(role_bodies: RoleBodies):
+    # A later ALTER, in the same transaction or a released savepoint, keeps the flag
+    assert role_bodies.roles_of(
+        [
+            "DROP ROLE app",
+            "CREATE USER app",
+            "ALTER ROLE app PASSWORD 'z'",
+            "SAVEPOINT s",
+            "ALTER ROLE app NOLOGIN",
+            "RELEASE SAVEPOINT s",
+        ]
+    ) == [
+        {
+            "op": "set",
+            "name": "app",
+            "password": "z",
+            "encrypted_password": SCRAM,
+            "login": False,
+            **RECREATED,
+        }
+    ]
+    # The new role renamed away: no role holds "app" any more, so the old one is a del (the
+    # receiver's DROP check), and the new one is a plain new role under its last name
+    dropped_and_new = [
+        {"op": "del", "name": "app"},
+        {"op": "set", "name": "app2", "password": None, "login": True},
+    ]
+    assert (
+        role_bodies.roles_of(["DROP ROLE app", "CREATE USER app", "ALTER ROLE app RENAME TO app2"])
+        == dropped_and_new
+    )
+    role_bodies.setup("ALTER ROLE app2 RENAME TO app")
+    assert (
+        role_bodies.roles_of(
+            [
+                "DROP ROLE app",
+                "CREATE USER app",
+                "SAVEPOINT s",
+                "ALTER ROLE app RENAME TO app2",
+                "RELEASE SAVEPOINT s",
+            ]
+        )
+        == dropped_and_new
+    )
+
+
+@pytest.mark.parametrize("new_name", ["app2", "b", "c", "renamed", "zz"])
+def test_recreated_rename_then_create_in_savepoint(role_bodies: RoleBodies, new_name: str):
+    # The savepoint holds both the rename away from `app` and a new `app`. The role now under
+    # `app` replaces the dropped one (recreated); the first new role is a plain new role under
+    # its last name (no old_name: it has nothing at the receiver to move)
+    assert role_bodies.roles_of(
+        [
+            "DROP ROLE app",
+            "CREATE USER app PASSWORD 'y'",
+            "SAVEPOINT s",
+            f"ALTER ROLE app RENAME TO {new_name}",
+            "CREATE ROLE app",
+            "RELEASE SAVEPOINT s",
+        ]
+    ) == [
+        # Every new_name sorts after "app"
+        {"op": "set", "name": "app", "password": None, "login": False, **RECREATED},
+        {
+            "op": "set",
+            "name": new_name,
+            "password": "y",
+            "encrypted_password": SCRAM,
+            "login": True,
+        },
+    ]
+
+
+def test_role_created_in_savepoint_ignores_old_name_state(role_bodies: RoleBodies):
+    # m1: a role created (and renamed) in a savepoint doesn't inherit what the parent recorded
+    # under the name it was created with
+    assert role_bodies.roles_of(
+        [
+            "ALTER ROLE app VALID UNTIL 'infinity'",
+            "SAVEPOINT s",
+            "DROP ROLE app",
+            "CREATE ROLE app",
+            "ALTER ROLE app RENAME TO app2",
+            "RELEASE SAVEPOINT s",
+        ]
+    ) == [
+        {"op": "del", "name": "app"},
+        {"op": "set", "name": "app2", "password": None, "login": False},
+    ]
+
+
+@pytest.mark.parametrize(
+    "statements",
+    [
+        pytest.param(
+            [
+                "DROP ROLE app",
+                "ALTER ROLE y RENAME TO app",
+                "ALTER ROLE app RENAME TO z",
+                "CREATE USER app",
+            ],
+            id="top_level",
+        ),
+        pytest.param(
+            [
+                "DROP ROLE app",
+                "SAVEPOINT s",
+                "ALTER ROLE y RENAME TO app",
+                "ALTER ROLE app RENAME TO z",
+                "RELEASE SAVEPOINT s",
+                "CREATE USER app",
+            ],
+            id="renames_in_savepoint",
+        ),
+        pytest.param(
+            [
+                "SAVEPOINT s",
+                "DROP ROLE app",
+                "RELEASE SAVEPOINT s",
+                "ALTER ROLE y RENAME TO app",
+                "SAVEPOINT t",
+                "ALTER ROLE app RENAME TO z",
+                "CREATE USER app",
+                "RELEASE SAVEPOINT t",
+            ],
+            id="drop_in_released_savepoint",
+        ),
+        pytest.param(
+            [
+                "SAVEPOINT s",
+                "DROP ROLE app",
+                "ALTER ROLE y RENAME TO app",
+                "SAVEPOINT t",
+                "ALTER ROLE app RENAME TO z",
+                "SAVEPOINT u",
+                "CREATE USER app",
+                "RELEASE SAVEPOINT u",
+                "RELEASE SAVEPOINT t",
+                "RELEASE SAVEPOINT s",
+            ],
+            id="nested",
+        ),
+    ],
+)
+def test_recreated_after_rename_onto_dropped_name(role_bodies: RoleBodies, statements: list[str]):
+    # A rename onto the dropped name and away again doesn't make the transaction forget the
+    # DROP: the new `app` still replaces the dropped one
+    role_bodies.setup("CREATE ROLE y")
+    assert role_bodies.roles_of(statements) == [
+        {"op": "set", "name": "app", "password": None, "login": True, **RECREATED},
+        {"op": "set", "name": "z", "old_name": "y"},
+    ]
+
+
+@pytest.mark.parametrize(
+    "statements",
+    [
+        pytest.param(
+            ["DROP ROLE app", "ALTER ROLE y RENAME TO app", "ALTER ROLE app RENAME TO z"],
+            id="top_level",
+        ),
+        pytest.param(
+            [
+                "DROP ROLE app",
+                "SAVEPOINT s",
+                "ALTER ROLE y RENAME TO app",
+                "ALTER ROLE app RENAME TO z",
+                "RELEASE SAVEPOINT s",
+            ],
+            id="renames_in_savepoint",
+        ),
+        pytest.param(
+            [
+                "SAVEPOINT s",
+                "DROP ROLE app",
+                "RELEASE SAVEPOINT s",
+                "ALTER ROLE y RENAME TO app",
+                "ALTER ROLE app RENAME TO z",
+            ],
+            id="drop_in_released_savepoint",
+        ),
+        pytest.param(
+            [
+                "SAVEPOINT s",
+                "DROP ROLE app",
+                "ALTER ROLE y RENAME TO app",
+                "RELEASE SAVEPOINT s",
+                "SAVEPOINT t",
+                "ALTER ROLE app RENAME TO z",
+                "RELEASE SAVEPOINT t",
+            ],
+            id="rename_away_in_later_savepoint",
+        ),
+    ],
+)
+def test_dropped_name_renamed_onto_and_away_is_deleted(
+    role_bodies: RoleBodies, statements: list[str]
+):
+    # The DROP still reaches the receiver, though the name's entry was overwritten and moved
+    role_bodies.setup("CREATE ROLE y")
+    assert role_bodies.roles_of(statements) == [
+        {"op": "del", "name": "app"},
+        {"op": "set", "name": "z", "old_name": "y"},
+    ]
+
+
+def test_dropped_name_rolled_back_or_renamed_onto(role_bodies: RoleBodies):
+    role_bodies.setup("CREATE ROLE y")
+    # Rolled back with its savepoint: no del
+    assert role_bodies.roles_of(
+        [
+            "SAVEPOINT s",
+            "DROP ROLE app",
+            "ALTER ROLE y RENAME TO app",
+            "ALTER ROLE app RENAME TO z",
+            "ROLLBACK TO SAVEPOINT s",
+            "ALTER ROLE app NOLOGIN",
+        ]
+    ) == [{"op": "set", "name": "app", "login": False}]
+    # The rename onto the dropped name stays: the rename entry decides, no del. It's touched:
+    # the dropped role's members lost their membership
+    assert role_bodies.roles_of(["DROP ROLE app", "ALTER ROLE y RENAME TO app"]) == [
+        {"op": "set", "name": "app", "old_name": "y", "touched": True}
+    ]
+    role_bodies.setup("CREATE ROLE y")
+    assert role_bodies.roles_of(
+        ["SAVEPOINT s", "DROP ROLE app", "RELEASE SAVEPOINT s", "ALTER ROLE y RENAME TO app"]
+    ) == [{"op": "set", "name": "app", "old_name": "y", "touched": True}]
+
+
+def test_drop_rolled_back_then_rename_isnt_recreated(role_bodies: RoleBodies):
+    # The DROP went with its savepoint; the name was freed by a rename only
+    assert role_bodies.roles_of(
+        [
+            "SAVEPOINT s",
+            "DROP ROLE app",
+            "ROLLBACK TO SAVEPOINT s",
+            "ALTER ROLE app RENAME TO z",
+            "CREATE USER app",
+        ]
+    ) == [
+        {"op": "set", "name": "app", "password": None, "login": True},
+        {"op": "set", "name": "z", "old_name": "app"},
+    ]
+
+
+def test_swap_in_savepoint(role_bodies: RoleBodies):
+    # Each name keeps what the parent recorded for the role now under it
+    role_bodies.setup("CREATE ROLE a; CREATE ROLE b")
+    assert role_bodies.roles_of(
+        [
+            "ALTER ROLE a PASSWORD 'pa'",
+            "ALTER ROLE b LOGIN",
+            "SAVEPOINT s",
+            "ALTER ROLE a RENAME TO t",
+            "ALTER ROLE b RENAME TO a",
+            "ALTER ROLE t RENAME TO b",
+            "RELEASE SAVEPOINT s",
+        ]
+    ) == [
+        {"op": "set", "name": "a", "old_name": "b", "login": True},
+        {
+            "op": "set",
+            "name": "b",
+            "old_name": "a",
+            "password": "pa",
+            "encrypted_password": SCRAM,
+        },
+    ]
+
+
+def test_rename_chain_across_nested_savepoints(role_bodies: RoleBodies):
+    assert role_bodies.roles_of(
+        [
+            "ALTER ROLE app PASSWORD 'pa' CREATEDB",
+            "SAVEPOINT s",
+            "ALTER ROLE app RENAME TO b",
+            "SAVEPOINT t",
+            "ALTER ROLE b RENAME TO c",
+            "RELEASE SAVEPOINT t",
+            "RELEASE SAVEPOINT s",
+        ]
+    ) == [
+        {
+            "op": "set",
+            "name": "c",
+            "old_name": "app",
+            "password": "pa",
+            "encrypted_password": SCRAM,
+            "touched": True,
+        }
+    ]
+    # A new role renamed along the chain: the dropped role is a del, the new one a plain set
+    role_bodies.setup("ALTER ROLE c RENAME TO app")
+    assert role_bodies.roles_of(
+        [
+            "DROP ROLE app",
+            "CREATE USER app",
+            "SAVEPOINT s",
+            "ALTER ROLE app RENAME TO b",
+            "SAVEPOINT t",
+            "ALTER ROLE b RENAME TO c",
+            "RELEASE SAVEPOINT t",
+            "RELEASE SAVEPOINT s",
+        ]
+    ) == [
+        {"op": "del", "name": "app"},
+        {"op": "set", "name": "c", "password": None, "login": True},
+    ]
+
+
+@pytest.mark.parametrize("password", ["PASSWORD NULL", "PASSWORD 'p9'"])
+def test_rolled_back_savepoint_below_a_released_one(role_bodies: RoleBodies, password: str):
+    # s2 is released into s1, then s1 is rolled back: nothing of s2 is left
+    assert role_bodies.roles_of(
+        [
+            "SAVEPOINT s1",
+            "SAVEPOINT s2",
+            f"ALTER ROLE app {password}",
+            "RELEASE SAVEPOINT s2",
+            "ROLLBACK TO SAVEPOINT s1",
+            "ALTER ROLE app NOLOGIN",
+        ]
+    ) == [{"op": "set", "name": "app", "login": False}]
+
+
+def test_database_renames_in_savepoints(role_bodies: RoleBodies):
+    role_bodies.pg.safe_psql("CREATE DATABASE p")
+    role_bodies.pg.safe_psql("CREATE DATABASE y")
+    # p -> x, then x and y swap in a released savepoint: p is now y, y is now x
+    assert role_bodies.dbs_of(
+        [
+            "ALTER DATABASE p RENAME TO x",
+            "SAVEPOINT s",
+            "ALTER DATABASE x RENAME TO t",
+            "ALTER DATABASE y RENAME TO x",
+            "ALTER DATABASE t RENAME TO y",
+            "RELEASE SAVEPOINT s",
+        ]
+    ) == [
+        {"op": "set", "name": "x", "old_name": "y"},
+        {"op": "set", "name": "y", "old_name": "p"},
+    ]
+    # A rename rolled back with its savepoint isn't sent; an owner change is, with the owner
+    assert role_bodies.dbs_of(
+        [
+            "SAVEPOINT s",
+            "ALTER DATABASE x RENAME TO z",
+            "ROLLBACK TO SAVEPOINT s",
+            "ALTER DATABASE x OWNER TO app",
+        ]
+    ) == [{"op": "set", "name": "x", "owner": "app"}]
+
+
+def test_database_owner_renamed(role_bodies: RoleBodies):
+    # The receiver keeps owners by name: the database is sent again with its owner's new name
+    role_bodies.pg.safe_psql("CREATE DATABASE o OWNER app")
+    assert role_bodies.dbs_of(["ALTER ROLE app RENAME TO app9"]) == [
+        {"op": "set", "name": "o", "owner": "app9"}
+    ]
+
+
+def test_prepare_refused_with_pending_changes(role_bodies: RoleBodies):
+    role_bodies.pg.safe_psql("CREATE DATABASE p")
+    with role_bodies.pg.cursor() as cur:
+        for stmt in ["ALTER ROLE app PASSWORD 'p2'", "ALTER DATABASE p RENAME TO q"]:
+            cur.execute("BEGIN")
+            cur.execute(stmt)
+            with pytest.raises(psycopg2.Error, match="cannot PREPARE"):
+                cur.execute("PREPARE TRANSACTION 'p1'")
+            cur.execute("ROLLBACK")
+        # Nothing pending: PREPARE works
+        cur.execute("BEGIN")
+        cur.execute("SELECT 1")
+        cur.execute("PREPARE TRANSACTION 'p2'")
+        cur.execute("COMMIT PREPARED 'p2'")
+        # The refused changes weren't made
+        cur.execute("SELECT count(*) FROM pg_database WHERE datname = 'p'")
+        assert cur.fetchone() == (1,)
 
 
 def test_valid_until_forwarded(role_bodies: RoleBodies):
