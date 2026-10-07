@@ -26,9 +26,14 @@
 #include <curl/curl.h>
 #include <unistd.h>
 
+#include "access/heapam.h"
+#include "access/table.h"
+#include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/pg_authid.h"
+#include "catalog/pg_database.h"
 #include "catalog/pg_proc.h"
+#include "commands/dbcommands.h"
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
 #include "commands/user.h"
@@ -71,36 +76,25 @@ static bool RegressTestMode = false;
  */
 static char CurlErrorBuf[CURL_ERROR_SIZE];
 
-typedef enum
-{
-	Op_Set,						/* An upsert: Either a creation or an alter */
-	Op_Delete,
-} OpType;
-
-typedef struct
-{
-	char		name[NAMEDATALEN];
-	Oid			owner;
-	char		old_name[NAMEDATALEN];
-	OpType		type;
-} DbEntry;
-
 /*
- * Roles are tracked by OID, never by name: a transaction can drop a role,
- * rename another one onto its name, create a third under it and rename that
- * one away, and keying by name mixed those roles' state (lost DROPs, data
- * keys passed to a new role, a dropped role's attributes sent for another).
+ * Roles and databases are tracked by OID, never by name: a transaction can
+ * drop a role, rename another one onto its name, create a third under it and
+ * rename that one away (or swap two databases' names in a savepoint), and
+ * keying by name mixed those objects' state (lost DROPs, data keys passed to
+ * a new role, a dropped role's attributes sent for another, payloads that
+ * depended on hash order).
  *
- * RoleIdentities (the whole top-level transaction, never rolled back) holds,
- * for every role a statement touched, its name before the transaction (the
- * name at its first touch: any rename is a touch) or that the transaction
- * created it. A subtransaction's rollback needs no undo: at commit the
- * catalog, looked up by OID, says which roles exist and under which names.
+ * RoleIdentities and DbIdentities (the whole top-level transaction, never
+ * rolled back) hold, for every object a statement touched, its name before
+ * the transaction (the name at its first touch: any rename is a touch) or
+ * that the transaction created it. A subtransaction's rollback needs no undo:
+ * at commit the catalog, looked up by OID, says which objects exist and under
+ * which names.
  *
- * The per-(sub)transaction role tables hold what only the statements know
- * (the password as typed, which options were given), by OID, and follow the
+ * The per-(sub)transaction tables hold what only the statements know (a
+ * role's password as typed, which options were given), by OID, and follow the
  * subtransactions: a released one's merge into its parent, a rolled-back
- * one's are dropped.
+ * one's are dropped (with the memory they point to).
  */
 typedef struct
 {
@@ -108,7 +102,13 @@ typedef struct
 	/* The name before the transaction; unused when created */
 	char		orig_name[NAMEDATALEN];
 	bool		created;
-} RoleIdentity;
+} ObjIdentity;
+
+typedef struct
+{
+	Oid			oid;			/* hash key */
+	bool		owner_set;		/* ALTER DATABASE ... OWNER TO was given */
+} DbAttrs;
 
 typedef struct
 {
@@ -143,14 +143,19 @@ typedef struct DdlHashTable
 {
 	struct DdlHashTable *prev_table;
 	size_t		subtrans_level;
-	HTAB	   *db_table;
+	HTAB	   *db_table;		/* DbAttrs by OID */
 	HTAB	   *role_table;		/* RoleAttrs by OID */
 } DdlHashTable;
 
 static DdlHashTable RootTable;
 static DdlHashTable *CurrentDdlTable = &RootTable;
 static int SubtransLevel; /* current nesting level of subtransactions */
-static HTAB *RoleIdentities;	/* RoleIdentity by OID, in TopTransactionContext */
+/* ObjIdentity by OID, in TopTransactionContext */
+static HTAB *RoleIdentities;
+static HTAB *DbIdentities;
+
+static DbAttrs *DbAttrsFor(Oid oid);
+static Oid	TouchExistingDbOid(Oid oid, const char *db_name);
 
 static void
 PushKeyNull(JsonbParseState **state, char *key)
@@ -208,86 +213,149 @@ InitRoleAttrs(RoleAttrs *attrs)
 	attrs->touched = false;
 }
 
-/* What became of a role the transaction touched, read from the catalog at commit */
+/* What became of an object the transaction touched, read from the catalog at commit */
 typedef struct
 {
 	Oid			oid;
 	const char *orig_name;		/* NULL when created */
 	bool		exists;
 	char		name[NAMEDATALEN];	/* the name at commit, when it exists */
-	bool		canlogin;
-	bool		has_password;
-	RoleAttrs  *attrs;			/* NULL when no option was given */
-} RoleOutcome;
+	bool		canlogin;		/* a role's */
+	bool		has_password;	/* a role's */
+	Oid			owner;			/* a database's */
+	void	   *attrs;			/* RoleAttrs or DbAttrs; NULL when no option was given */
+} ObjOutcome;
 
-/* A role that exists at commit has this name */
-static bool
-NameTaken(RoleOutcome *outcomes, int count, const char *name)
+/* All roles' (or all databases') outcomes */
+typedef struct
 {
-	for (int i = 0; i < count; i++)
-	{
-		if (outcomes[i].exists && strcmp(outcomes[i].name, name) == 0)
-			return true;
-	}
-	return false;
+	int			count;
+	ObjOutcome *items;
+	HTAB	   *taken;			/* the names that exist at commit */
+	HTAB	   *dropped;		/* the names before the transaction of objects that are gone */
+} Outcomes;
+
+static HTAB *
+NewNameSet(const char *what)
+{
+	HASHCTL		ctl = {};
+
+	ctl.keysize = NAMEDATALEN;
+	ctl.entrysize = NAMEDATALEN;
+	ctl.hcxt = CurrentMemoryContext;
+	return hash_create(what, 16, &ctl, HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
 }
 
-/* A role that held this name before the transaction is gone */
 static bool
-NameOfDroppedRole(RoleOutcome *outcomes, int count, const char *name)
+InNameSet(HTAB *set, const char *name)
 {
-	for (int i = 0; i < count; i++)
-	{
-		if (!outcomes[i].exists && outcomes[i].orig_name != NULL &&
-			strcmp(outcomes[i].orig_name, name) == 0)
-			return true;
-	}
-	return false;
+	return hash_search(set, name, HASH_FIND, NULL) != NULL;
 }
 
 /*
- * The roles' outcomes, one per touched role, from the catalog. Returns the
- * count; *out is palloc'd.
+ * The outcomes of the objects in identities (roles, or databases), from the
+ * catalog, with their options from attrs_table (the top-level table).
  */
-static int
-RoleOutcomes(RoleOutcome **out)
+static void
+CollectOutcomes(HTAB *identities, bool roles, HTAB *attrs_table, Outcomes *out)
 {
 	HASH_SEQ_STATUS status;
-	RoleIdentity *id;
-	RoleOutcome *outcomes;
-	int			count = 0;
+	ObjIdentity *id;
 
-	if (!RoleIdentities)
-	{
-		*out = NULL;
-		return 0;
-	}
-	outcomes = palloc0(sizeof(RoleOutcome) * Max(hash_get_num_entries(RoleIdentities), 1));
-	hash_seq_init(&status, RoleIdentities);
+	out->count = 0;
+	out->items = NULL;
+	out->taken = NewNameSet("Names Taken");
+	out->dropped = NewNameSet("Names Dropped");
+	if (!identities)
+		return;
+	out->items = palloc0(sizeof(ObjOutcome) * Max(hash_get_num_entries(identities), 1));
+	hash_seq_init(&status, identities);
 	while ((id = hash_seq_search(&status)) != NULL)
 	{
-		RoleOutcome *o = &outcomes[count++];
-		HeapTuple	tuple = SearchSysCache1(AUTHOID, ObjectIdGetDatum(id->oid));
+		ObjOutcome *o = &out->items[out->count++];
+		HeapTuple	tuple = SearchSysCache1(roles ? AUTHOID : DATABASEOID,
+											ObjectIdGetDatum(id->oid));
 
 		o->oid = id->oid;
 		o->orig_name = id->created ? NULL : id->orig_name;
 		if (HeapTupleIsValid(tuple))
 		{
-			Form_pg_authid form = (Form_pg_authid) GETSTRUCT(tuple);
-			bool		isnull;
-
 			o->exists = true;
-			strlcpy(o->name, NameStr(form->rolname), NAMEDATALEN);
-			o->canlogin = form->rolcanlogin;
-			(void) SysCacheGetAttr(AUTHOID, tuple, Anum_pg_authid_rolpassword, &isnull);
-			o->has_password = !isnull;
+			if (roles)
+			{
+				Form_pg_authid form = (Form_pg_authid) GETSTRUCT(tuple);
+				bool		isnull;
+
+				strlcpy(o->name, NameStr(form->rolname), NAMEDATALEN);
+				o->canlogin = form->rolcanlogin;
+				(void) SysCacheGetAttr(AUTHOID, tuple, Anum_pg_authid_rolpassword, &isnull);
+				o->has_password = !isnull;
+			}
+			else
+			{
+				Form_pg_database form = (Form_pg_database) GETSTRUCT(tuple);
+
+				strlcpy(o->name, NameStr(form->datname), NAMEDATALEN);
+				o->owner = form->datdba;
+			}
 			ReleaseSysCache(tuple);
+			hash_search(out->taken, o->name, HASH_ENTER, NULL);
 		}
-		if (RootTable.role_table)
-			o->attrs = hash_search(RootTable.role_table, &id->oid, HASH_FIND, NULL);
+		else if (o->orig_name)
+			hash_search(out->dropped, o->orig_name, HASH_ENTER, NULL);
+		if (attrs_table)
+			o->attrs = hash_search(attrs_table, &id->oid, HASH_FIND, NULL);
 	}
-	*out = outcomes;
-	return count;
+}
+
+/* A del under the name before the transaction */
+static void
+PushDel(JsonbParseState **state, const char *name)
+{
+	pushJsonbValue(state, WJB_BEGIN_OBJECT, NULL);
+	PushKeyValue(state, "op", "del");
+	PushKeyValue(state, "name", (char *) name);
+	pushJsonbValue(state, WJB_END_OBJECT, NULL);
+}
+
+/*
+ * Pushes the database's entry, if it has one (with state NULL it only
+ * tells): a created one is a set with its owner; one from before the
+ * transaction a set with old_name when renamed and owner when ALTER ... OWNER
+ * was given; a gone one a del under its name before the transaction, unless a
+ * database now has that name.
+ */
+static bool
+PushDbEntry(JsonbParseState **state, Outcomes *dbs, ObjOutcome *o)
+{
+	DbAttrs    *attrs = o->attrs;
+	bool		created = o->orig_name == NULL;
+	bool		renamed;
+	bool		owner;
+
+	if (!o->exists)
+	{
+		if (created || InNameSet(dbs->taken, o->orig_name))
+			return false;
+		if (state)
+			PushDel(state, o->orig_name);
+		return true;
+	}
+	renamed = !created && strcmp(o->orig_name, o->name) != 0;
+	owner = created || (attrs && attrs->owner_set);
+	if (!renamed && !owner)
+		return false;
+	if (!state)
+		return true;
+	pushJsonbValue(state, WJB_BEGIN_OBJECT, NULL);
+	PushKeyValue(state, "op", "set");
+	PushKeyValue(state, "name", o->name);
+	if (owner)
+		PushKeyValue(state, "owner", GetUserNameFromId(o->owner, false));
+	if (renamed)
+		PushKeyValue(state, "old_name", (char *) o->orig_name);
+	pushJsonbValue(state, WJB_END_OBJECT, NULL);
+	return true;
 }
 
 /*
@@ -309,7 +377,7 @@ RoleOutcomes(RoleOutcome **out)
  *   when it moves its rows).
  */
 static bool
-PushRoleEntry(JsonbParseState **state, RoleOutcome *outcomes, int count, RoleOutcome *o)
+PushRoleEntry(JsonbParseState **state, Outcomes *roles, ObjOutcome *o)
 {
 	RoleAttrs  *attrs = o->attrs;
 	bool		created = o->orig_name == NULL;
@@ -321,20 +389,15 @@ PushRoleEntry(JsonbParseState **state, RoleOutcome *outcomes, int count, RoleOut
 
 	if (!o->exists)
 	{
-		if (created || NameTaken(outcomes, count, o->orig_name))
+		if (created || InNameSet(roles->taken, o->orig_name))
 			return false;
 		if (state)
-		{
-			pushJsonbValue(state, WJB_BEGIN_OBJECT, NULL);
-			PushKeyValue(state, "op", "del");
-			PushKeyValue(state, "name", (char *) o->orig_name);
-			pushJsonbValue(state, WJB_END_OBJECT, NULL);
-		}
+			PushDel(state, o->orig_name);
 		return true;
 	}
 
 	renamed = !created && strcmp(o->orig_name, o->name) != 0;
-	replaces_dropped = NameOfDroppedRole(outcomes, count, o->name);
+	replaces_dropped = InNameSet(roles->dropped, o->name);
 	password_set = created || (attrs && attrs->password_set);
 	login = created || (attrs && attrs->login_set);
 	touched = (attrs && attrs->touched) || replaces_dropped;
@@ -391,63 +454,90 @@ PushRoleEntry(JsonbParseState **state, RoleOutcome *outcomes, int count, RoleOut
 	return true;
 }
 
+/*
+ * The receiver keeps each database's owner by name: a database whose owner
+ * was renamed is sent again with its owner (a set with "owner").
+ */
+static void
+TouchDbsOfRenamedRoles(Outcomes *roles)
+{
+	Relation	rel;
+	TableScanDesc scan;
+	HeapTuple	tuple;
+	List	   *renamed = NIL;
+
+	for (int i = 0; i < roles->count; i++)
+	{
+		ObjOutcome *o = &roles->items[i];
+
+		if (o->exists && o->orig_name && strcmp(o->orig_name, o->name) != 0)
+			renamed = lappend_oid(renamed, o->oid);
+	}
+	if (renamed == NIL)
+		return;
+	rel = table_open(DatabaseRelationId, AccessShareLock);
+	scan = table_beginscan_catalog(rel, 0, NULL);
+	while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		Form_pg_database form = (Form_pg_database) GETSTRUCT(tuple);
+
+		if (list_member_oid(renamed, form->datdba))
+		{
+			(void) TouchExistingDbOid(form->oid, NameStr(form->datname));
+			DbAttrsFor(form->oid)->owner_set = true;
+		}
+	}
+	table_endscan(scan);
+	table_close(rel, AccessShareLock);
+	list_free(renamed);
+}
+
 /* NULL when there is nothing to send */
 static char *
 ConstructDeltaMessage()
 {
 	JsonbParseState *state = NULL;
-	RoleOutcome *outcomes;
-	int			count = RoleOutcomes(&outcomes);
+	Outcomes	roles;
+	Outcomes	dbs;
 	bool		any_role = false;
+	bool		any_db = false;
 
-	for (int i = 0; i < count && !any_role; i++)
-		any_role = PushRoleEntry(NULL, outcomes, count, &outcomes[i]);
-	if (!RootTable.db_table && !any_role)
+	CollectOutcomes(RoleIdentities, true, RootTable.role_table, &roles);
+	TouchDbsOfRenamedRoles(&roles);
+	CollectOutcomes(DbIdentities, false, RootTable.db_table, &dbs);
+	for (int i = 0; i < roles.count && !any_role; i++)
+		any_role = PushRoleEntry(NULL, &roles, &roles.items[i]);
+	for (int i = 0; i < dbs.count && !any_db; i++)
+		any_db = PushDbEntry(NULL, &dbs, &dbs.items[i]);
+	if (!any_db && !any_role)
 		return NULL;
 
 	pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
-	if (RootTable.db_table)
+	if (any_db)
 	{
-		JsonbValue	dbs;
-		HASH_SEQ_STATUS status;
-		DbEntry    *entry;
+		JsonbValue	key;
 
-		dbs.type = jbvString;
-		dbs.val.string.val = "dbs";
-		dbs.val.string.len = strlen(dbs.val.string.val);
-		pushJsonbValue(&state, WJB_KEY, &dbs);
+		key.type = jbvString;
+		key.val.string.val = "dbs";
+		key.val.string.len = strlen(key.val.string.val);
+		pushJsonbValue(&state, WJB_KEY, &key);
 		pushJsonbValue(&state, WJB_BEGIN_ARRAY, NULL);
-
-		hash_seq_init(&status, RootTable.db_table);
-		while ((entry = hash_seq_search(&status)) != NULL)
-		{
-			pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
-			PushKeyValue(&state, "op", entry->type == Op_Set ? "set" : "del");
-			PushKeyValue(&state, "name", entry->name);
-			if (entry->owner != InvalidOid)
-			{
-				PushKeyValue(&state, "owner", GetUserNameFromId(entry->owner, false));
-			}
-			if (entry->old_name[0] != '\0')
-			{
-				PushKeyValue(&state, "old_name", entry->old_name);
-			}
-			pushJsonbValue(&state, WJB_END_OBJECT, NULL);
-		}
+		for (int i = 0; i < dbs.count; i++)
+			PushDbEntry(&state, &dbs, &dbs.items[i]);
 		pushJsonbValue(&state, WJB_END_ARRAY, NULL);
 	}
 
 	if (any_role)
 	{
-		JsonbValue	roles;
+		JsonbValue	key;
 
-		roles.type = jbvString;
-		roles.val.string.val = "roles";
-		roles.val.string.len = strlen(roles.val.string.val);
-		pushJsonbValue(&state, WJB_KEY, &roles);
+		key.type = jbvString;
+		key.val.string.val = "roles";
+		key.val.string.len = strlen(key.val.string.val);
+		pushJsonbValue(&state, WJB_KEY, &key);
 		pushJsonbValue(&state, WJB_BEGIN_ARRAY, NULL);
-		for (int i = 0; i < count; i++)
-			PushRoleEntry(&state, outcomes, count, &outcomes[i]);
+		for (int i = 0; i < roles.count; i++)
+			PushRoleEntry(&state, &roles, &roles.items[i]);
 		pushJsonbValue(&state, WJB_END_ARRAY, NULL);
 	}
 	{
@@ -500,7 +590,7 @@ SendDeltasToControlPlane()
 
 	char	   *message;
 
-	if (!RootTable.db_table && !RoleIdentities)
+	if (!DbIdentities && !RoleIdentities)
 		return;
 	if (!ConsoleURL)
 	{
@@ -631,15 +721,29 @@ InitDbTableIfNeeded()
 	{
 		HASHCTL		db_ctl = {};
 
-		db_ctl.keysize = NAMEDATALEN;
-		db_ctl.entrysize = sizeof(DbEntry);
+		db_ctl.keysize = sizeof(Oid);
+		db_ctl.entrysize = sizeof(DbAttrs);
 		db_ctl.hcxt = CurTransactionContext;
 		CurrentDdlTable->db_table = hash_create(
-												"Dbs Created",
+												"Database Options",
 												4,
 												&db_ctl,
-												HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
+												HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	}
+}
+
+/* The database's options entry in the current (sub)transaction's table */
+static DbAttrs *
+DbAttrsFor(Oid oid)
+{
+	bool		found = false;
+	DbAttrs    *attrs;
+
+	InitDbTableIfNeeded();
+	attrs = hash_search(CurrentDdlTable->db_table, &oid, HASH_ENTER, &found);
+	if (!found)
+		attrs->owner_set = false;
+	return attrs;
 }
 
 static void
@@ -675,46 +779,74 @@ RoleAttrsFor(Oid oid)
 	return attrs;
 }
 
-/* The role's identity entry, made when missing (found tells whether it was there) */
-static RoleIdentity *
-RoleIdentityFor(Oid oid, bool *found)
+/* The object's identity entry, made when missing (found tells whether it was there) */
+static ObjIdentity *
+IdentityFor(HTAB **identities, Oid oid, bool *found)
 {
-	if (!RoleIdentities)
+	if (!*identities)
 	{
 		HASHCTL		ctl = {};
 
 		ctl.keysize = sizeof(Oid);
-		ctl.entrysize = sizeof(RoleIdentity);
+		ctl.entrysize = sizeof(ObjIdentity);
 		ctl.hcxt = TopTransactionContext;
-		RoleIdentities = hash_create("Role Identities", 8, &ctl,
-									 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		*identities = hash_create("Identities", 8, &ctl,
+								  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	}
-	return hash_search(RoleIdentities, &oid, HASH_ENTER, found);
+	return hash_search(*identities, &oid, HASH_ENTER, found);
 }
 
 /*
- * Called before a statement that changes, renames, drops or grants an
- * existing role: at the role's first touch in the transaction its current
- * name is its name before the transaction. Returns the OID, or InvalidOid
- * when there is no such role (the statement then fails, or does nothing with
- * IF EXISTS).
+ * Called before a statement that changes, renames or drops an existing
+ * object: at its first touch in the transaction its current name is its name
+ * before the transaction. Returns the OID, or InvalidOid when there is no such
+ * object (the statement then fails, or does nothing with IF EXISTS).
  */
 static Oid
-TouchExistingRole(const char *role_name)
+TouchExisting(HTAB **identities, Oid oid, const char *name)
 {
-	Oid			oid = get_role_oid(role_name, true);
 	bool		found = false;
-	RoleIdentity *id;
+	ObjIdentity *id;
 
 	if (!OidIsValid(oid))
 		return InvalidOid;
-	id = RoleIdentityFor(oid, &found);
+	id = IdentityFor(identities, oid, &found);
 	if (!found)
 	{
-		strlcpy(id->orig_name, role_name, NAMEDATALEN);
+		strlcpy(id->orig_name, name, NAMEDATALEN);
 		id->created = false;
 	}
 	return oid;
+}
+
+/* Likewise for a role (also one a GRANT names) */
+static Oid
+TouchExistingRole(const char *role_name)
+{
+	return TouchExisting(&RoleIdentities, get_role_oid(role_name, true), role_name);
+}
+
+static Oid
+TouchExistingDb(const char *db_name)
+{
+	return TouchExisting(&DbIdentities, get_database_oid(db_name, true), db_name);
+}
+
+static Oid
+TouchExistingDbOid(Oid oid, const char *db_name)
+{
+	return TouchExisting(&DbIdentities, oid, db_name);
+}
+
+/* After CREATE ROLE or CREATE DATABASE ran: the new object, by its OID */
+static void
+RecordCreated(HTAB **identities, Oid oid)
+{
+	bool		found = false;
+	ObjIdentity *id = IdentityFor(identities, oid, &found);
+
+	id->created = true;
+	id->orig_name[0] = '\0';
 }
 
 static void
@@ -737,67 +869,38 @@ MergeTable()
 	old_table = CurrentDdlTable;
 	CurrentDdlTable = old_table->prev_table;
 
+	/*
+	 * Options are by OID, so a rename needs nothing here. The parent's table
+	 * may be several levels down (tables are made lazily): Init* then makes
+	 * one at the released level, so a later rollback of an enclosing
+	 * savepoint still drops these options. The entries' strings live in this
+	 * subtransaction's memory, which outlives the parent level's table.
+	 */
 	if (old_table->db_table)
 	{
-		DbEntry    *entry;
+		DbAttrs    *entry;
 		HASH_SEQ_STATUS status;
 
 		InitDbTableIfNeeded();
-
 		hash_seq_init(&status, old_table->db_table);
 		while ((entry = hash_seq_search(&status)) != NULL)
 		{
 			bool		found_parent = false;
-			DbEntry    *to_write = hash_search(
-											   CurrentDdlTable->db_table,
-											   entry->name,
+			DbAttrs    *to_write = hash_search(CurrentDdlTable->db_table,
+											   &entry->oid,
 											   HASH_ENTER,
 											   &found_parent);
 
 			if (!found_parent)
-			{
-				to_write->owner = InvalidOid;
-				memset(to_write->old_name, 0, sizeof(to_write->old_name));
-			}
-			to_write->type = entry->type;
-			if (entry->owner != InvalidOid)
-				to_write->owner = entry->owner;
-
-			/*
-			 * An entry without old_name (e.g. an ALTER after a rename in the
-			 * parent) must keep the parent's old_name.
-			 */
-			if (entry->old_name[0] != '\0')
-			{
-				bool		found_old = false;
-				DbEntry    *old = hash_search(
-											  CurrentDdlTable->db_table,
-											  entry->old_name,
-											  HASH_FIND,
-											  &found_old);
-
-				strlcpy(to_write->old_name, entry->old_name, NAMEDATALEN);
-				if (found_old)
-				{
-					if (old->old_name[0] != '\0')
-						strlcpy(to_write->old_name, old->old_name, NAMEDATALEN);
-					else
-						strlcpy(to_write->old_name, entry->old_name, NAMEDATALEN);
-					hash_search(
-								CurrentDdlTable->db_table,
-								entry->old_name,
-								HASH_REMOVE,
-								NULL);
-				}
-			}
+				to_write->owner_set = false;
+			to_write->owner_set |= entry->owner_set;
 		}
 		hash_destroy(old_table->db_table);
 	}
 
 	/*
-	 * Role options are by OID, so a rename needs nothing here: what this
-	 * subtransaction gave wins, touched is OR-ed, and an entry that gave no
-	 * PASSWORD clause keeps the parent's password.
+	 * Roles: what this subtransaction gave wins, touched is OR-ed, and an
+	 * entry that gave no PASSWORD clause keeps the parent's password.
 	 */
 	if (old_table->role_table)
 	{
@@ -871,9 +974,20 @@ NeonXactCallback(XactEvent event, void *arg)
 	{
 		SendDeltasToControlPlane();
 	}
+
+	/*
+	 * A prepared transaction commits later, maybe in another session, where
+	 * nothing would forward its changes: refuse it while it has any.
+	 */
+	if (event == XACT_EVENT_PRE_PREPARE && ForwardDDL && ConsoleURL &&
+		(RoleIdentities || DbIdentities) && ConstructDeltaMessage() != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot PREPARE a transaction that changed roles or databases")));
 	RootTable.role_table = NULL;
 	RootTable.db_table = NULL;
 	RoleIdentities = NULL;		/* freed with TopTransactionContext */
+	DbIdentities = NULL;
 	Assert(CurrentDdlTable == &RootTable);
 }
 
@@ -885,130 +999,67 @@ IsPrivilegedRole(const char *role_name)
 	return strcmp(role_name, privileged_role_name) == 0;
 }
 
+/*
+ * Before CREATE DATABASE: the owner check. The database is recorded once it
+ * exists (HandleCreateDbDone), and sent with its owner from the catalog.
+ */
 static void
 HandleCreateDb(CreatedbStmt *stmt)
 {
-	DefElem    *downer = NULL;
 	ListCell   *option;
-	bool		found = false;
-	DbEntry    *entry;
-
-	InitDbTableIfNeeded();
 
 	foreach(option, stmt->options)
 	{
 		DefElem    *defel = lfirst(option);
 
-		if (strcmp(defel->defname, "owner") == 0)
-			downer = defel;
-	}
-
-	entry = hash_search(CurrentDdlTable->db_table,
-						stmt->dbname,
-						HASH_ENTER,
-						&found);
-	if (!found)
-		memset(entry->old_name, 0, sizeof(entry->old_name));
-
-	entry->type = Op_Set;
-	if (downer && downer->arg)
-	{
-		const char *owner_name = defGetString(downer);
-
-		if (IsPrivilegedRole(owner_name))
+		if (strcmp(defel->defname, "owner") == 0 && defel->arg &&
+			IsPrivilegedRole(defGetString(defel)))
 			elog(ERROR, "could not create a database with owner %s", privileged_role_name);
+	}
+}
 
-		entry->owner = get_role_oid(owner_name, false);
-	}
-	else
-	{
-		entry->owner = GetUserId();
-	}
+static void
+HandleCreateDbDone(CreatedbStmt *stmt)
+{
+	Oid			oid = get_database_oid(stmt->dbname, true);
+
+	if (!OidIsValid(oid))
+		return;
+	RecordCreated(&DbIdentities, oid);
+	DbAttrsFor(oid)->owner_set = true;
 }
 
 static void
 HandleAlterOwner(AlterOwnerStmt *stmt)
 {
-	const char *name;
-	bool		found = false;
-	DbEntry    *entry;
 	const char *new_owner;
+	Oid			oid;
 
 	if (stmt->objectType != OBJECT_DATABASE)
 		return;
-	InitDbTableIfNeeded();
-
-	name = strVal(stmt->object);
-	entry = hash_search(CurrentDdlTable->db_table,
-						name,
-						HASH_ENTER,
-						&found);
-	if (!found)
-		memset(entry->old_name, 0, sizeof(entry->old_name));
 
 	new_owner = get_rolespec_name(stmt->newowner);
 	if (IsPrivilegedRole(new_owner))
 		elog(ERROR, "could not alter owner to %s", privileged_role_name);
 
-	entry->owner = get_role_oid(new_owner, false);
-	entry->type = Op_Set;
+	oid = TouchExistingDb(strVal(stmt->object));
+	if (OidIsValid(oid))
+		DbAttrsFor(oid)->owner_set = true;
 }
 
+/* The name before the transaction is recorded; the new name is read at commit */
 static void
 HandleDbRename(RenameStmt *stmt)
 {
-	bool		found = false;
-	DbEntry    *entry;
-	DbEntry    *entry_for_new_name;
-
 	Assert(stmt->renameType == OBJECT_DATABASE);
-	InitDbTableIfNeeded();
-	entry = hash_search(CurrentDdlTable->db_table,
-						stmt->subname,
-						HASH_FIND,
-						&found);
-
-	entry_for_new_name = hash_search(CurrentDdlTable->db_table,
-									 stmt->newname,
-									 HASH_ENTER,
-									 NULL);
-	entry_for_new_name->type = Op_Set;
-
-	if (found)
-	{
-		if (entry->old_name[0] != '\0')
-			strlcpy(entry_for_new_name->old_name, entry->old_name, NAMEDATALEN);
-		else
-			strlcpy(entry_for_new_name->old_name, entry->name, NAMEDATALEN);
-		entry_for_new_name->owner = entry->owner;
-		hash_search(CurrentDdlTable->db_table,
-					stmt->subname,
-					HASH_REMOVE,
-					NULL);
-	}
-	else
-	{
-		strlcpy(entry_for_new_name->old_name, stmt->subname, NAMEDATALEN);
-		entry_for_new_name->owner = InvalidOid;
-	}
+	(void) TouchExistingDb(stmt->subname);
 }
 
+/* Likewise: a database from before the transaction that is gone at commit is a del */
 static void
 HandleDropDb(DropdbStmt *stmt)
 {
-	bool		found = false;
-	DbEntry    *entry;
-
-	InitDbTableIfNeeded();
-
-	entry = hash_search(CurrentDdlTable->db_table,
-						stmt->dbname,
-						HASH_ENTER,
-						&found);
-	entry->type = Op_Delete;
-	entry->owner = InvalidOid;
-	if (!found)
-		memset(entry->old_name, 0, sizeof(entry->old_name));
+	(void) TouchExistingDb(stmt->dbname);
 }
 
 /*
@@ -1094,14 +1145,10 @@ HandleCreateRoleDone(CreateRoleStmt *stmt)
 {
 	RoleOptions opts;
 	Oid			oid = get_role_oid(stmt->role, true);
-	bool		found = false;
-	RoleIdentity *id;
 
 	if (!OidIsValid(oid))
 		return;
-	id = RoleIdentityFor(oid, &found);
-	id->created = true;
-	id->orig_name[0] = '\0';
+	RecordCreated(&RoleIdentities, oid);
 	ParseRoleOptions(stmt->options, &opts);
 	SetRoleAttributes(RoleAttrsFor(oid), &opts);
 }
@@ -1799,9 +1846,11 @@ NeonProcessUtility(
 			qc);
 	}
 
-	/* A new role is tracked once it exists (by its OID) */
+	/* A new role or database is tracked once it exists (by its OID) */
 	if (IsA(parseTree, CreateRoleStmt))
 		HandleCreateRoleDone(castNode(CreateRoleStmt, parseTree));
+	else if (IsA(parseTree, CreatedbStmt))
+		HandleCreateDbDone(castNode(CreatedbStmt, parseTree));
 }
 
 /*

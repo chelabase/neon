@@ -311,6 +311,7 @@ class RoleBodies:
             [
                 f"neon.console_url=http://{host}:{port}{endpoint}",
                 "shared_preload_libraries = 'neon'",
+                "max_prepared_transactions = 2",
             ]
         )
 
@@ -338,6 +339,17 @@ class RoleBodies:
             cur.execute("COMMIT")
         assert len(self.received) == 1, self.received
         return sorted(self.received[0].get("roles", []), key=lambda r: r["name"])
+
+    def dbs_of(self, statements: list[str]) -> list[dict[str, Any]]:
+        """Like roles_of, for the body's databases."""
+        self.received.clear()
+        with self.pg.cursor() as cur:
+            cur.execute("BEGIN")
+            for stmt in statements:
+                cur.execute(stmt)
+            cur.execute("COMMIT")
+        assert len(self.received) == 1, self.received
+        return sorted(self.received[0].get("dbs", []), key=lambda d: d["name"])
 
 
 @pytest.fixture(scope="function")
@@ -796,6 +808,76 @@ def test_rename_chain_across_nested_savepoints(role_bodies: RoleBodies):
         {"op": "del", "name": "app"},
         {"op": "set", "name": "c", "password": None, "login": True},
     ]
+
+
+@pytest.mark.parametrize("password", ["PASSWORD NULL", "PASSWORD 'p9'"])
+def test_rolled_back_savepoint_below_a_released_one(role_bodies: RoleBodies, password: str):
+    # s2 is released into s1, then s1 is rolled back: nothing of s2 is left
+    assert role_bodies.roles_of(
+        [
+            "SAVEPOINT s1",
+            "SAVEPOINT s2",
+            f"ALTER ROLE app {password}",
+            "RELEASE SAVEPOINT s2",
+            "ROLLBACK TO SAVEPOINT s1",
+            "ALTER ROLE app NOLOGIN",
+        ]
+    ) == [{"op": "set", "name": "app", "login": False}]
+
+
+def test_database_renames_in_savepoints(role_bodies: RoleBodies):
+    role_bodies.pg.safe_psql("CREATE DATABASE p")
+    role_bodies.pg.safe_psql("CREATE DATABASE y")
+    # p -> x, then x and y swap in a released savepoint: p is now y, y is now x
+    assert role_bodies.dbs_of(
+        [
+            "ALTER DATABASE p RENAME TO x",
+            "SAVEPOINT s",
+            "ALTER DATABASE x RENAME TO t",
+            "ALTER DATABASE y RENAME TO x",
+            "ALTER DATABASE t RENAME TO y",
+            "RELEASE SAVEPOINT s",
+        ]
+    ) == [
+        {"op": "set", "name": "x", "old_name": "y"},
+        {"op": "set", "name": "y", "old_name": "p"},
+    ]
+    # A rename rolled back with its savepoint isn't sent; an owner change is, with the owner
+    assert role_bodies.dbs_of(
+        [
+            "SAVEPOINT s",
+            "ALTER DATABASE x RENAME TO z",
+            "ROLLBACK TO SAVEPOINT s",
+            "ALTER DATABASE x OWNER TO app",
+        ]
+    ) == [{"op": "set", "name": "x", "owner": "app"}]
+
+
+def test_database_owner_renamed(role_bodies: RoleBodies):
+    # The receiver keeps owners by name: the database is sent again with its owner's new name
+    role_bodies.pg.safe_psql("CREATE DATABASE o OWNER app")
+    assert role_bodies.dbs_of(["ALTER ROLE app RENAME TO app9"]) == [
+        {"op": "set", "name": "o", "owner": "app9"}
+    ]
+
+
+def test_prepare_refused_with_pending_changes(role_bodies: RoleBodies):
+    role_bodies.pg.safe_psql("CREATE DATABASE p")
+    with role_bodies.pg.cursor() as cur:
+        for stmt in ["ALTER ROLE app PASSWORD 'p2'", "ALTER DATABASE p RENAME TO q"]:
+            cur.execute("BEGIN")
+            cur.execute(stmt)
+            with pytest.raises(psycopg2.Error, match="cannot PREPARE"):
+                cur.execute("PREPARE TRANSACTION 'p1'")
+            cur.execute("ROLLBACK")
+        # Nothing pending: PREPARE works
+        cur.execute("BEGIN")
+        cur.execute("SELECT 1")
+        cur.execute("PREPARE TRANSACTION 'p2'")
+        cur.execute("COMMIT PREPARED 'p2'")
+        # The refused changes weren't made
+        cur.execute("SELECT count(*) FROM pg_database WHERE datname = 'p'")
+        assert cur.fetchone() == (1,)
 
 
 def test_valid_until_forwarded(role_bodies: RoleBodies):
