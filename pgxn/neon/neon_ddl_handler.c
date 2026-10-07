@@ -85,6 +85,13 @@ typedef struct
 	OpType		type;
 } DbEntry;
 
+typedef enum
+{
+	Login_Unset,				/* not given in this (sub)transaction */
+	Login_False,
+	Login_True,
+} LoginState;
+
 typedef struct
 {
 	char		name[NAMEDATALEN];
@@ -98,6 +105,31 @@ typedef struct
 	 * of the password.
 	 */
 	bool		password_null;
+
+	/*
+	 * True when this entry decides the password (CREATE, DROP, RENAME or a
+	 * PASSWORD clause). An entry made only by an attribute change or a GRANT
+	 * leaves the parent's password alone when its subtransaction commits.
+	 */
+	bool		password_set;
+
+	/* LOGIN / NOLOGIN; CREATE always sets it (the statement's default if absent) */
+	LoginState	login;
+	/* VALID UNTIL, as written; NULL when not given */
+	const char *valid_until;
+
+	/*
+	 * Another attribute (CREATEDB, CREATEROLE, INHERIT, REPLICATION,
+	 * BYPASSRLS, SUPERUSER, CONNECTION LIMIT) or a role membership changed:
+	 * the receiver resyncs the branch's roles from the catalog.
+	 */
+	bool		touched;
+
+	/*
+	 * Created in this (sub)transaction: when its subtransaction commits, the
+	 * parent's attributes for the name (from before a DROP) are forgotten.
+	 */
+	bool		created;
 	OpType		type;
 } RoleEntry;
 
@@ -146,6 +178,51 @@ PushKeyValue(JsonbParseState **state, char *key, char *value)
 	v.val.string.val = value;
 	pushJsonbValue(state, WJB_KEY, &k);
 	pushJsonbValue(state, WJB_VALUE, &v);
+}
+
+static void
+PushKeyBool(JsonbParseState **state, char *key, bool value)
+{
+	JsonbValue	k,
+				v;
+
+	k.type = jbvString;
+	k.val.string.len = strlen(key);
+	k.val.string.val = key;
+	v.type = jbvBool;
+	v.val.boolean = value;
+	pushJsonbValue(state, WJB_KEY, &k);
+	pushJsonbValue(state, WJB_VALUE, &v);
+}
+
+/* The entry carries a LOGIN, VALID UNTIL or touched key */
+static bool
+HasRoleAttributes(RoleEntry *entry)
+{
+	return entry->type == Op_Set &&
+		(entry->login != Login_Unset || entry->valid_until != NULL || entry->touched);
+}
+
+/* Forgets the role's attributes (for a new entry, a DROP or a CREATE) */
+static void
+ResetRoleAttributes(RoleEntry *entry)
+{
+	entry->login = Login_Unset;
+	entry->valid_until = NULL;
+	entry->touched = false;
+}
+
+/* A new entry that knows nothing yet: the parent's state stays */
+static void
+InitRoleEntry(RoleEntry *entry)
+{
+	memset(entry->old_name, 0, sizeof(entry->old_name));
+	entry->password = NULL;
+	entry->password_null = false;
+	entry->password_set = false;
+	ResetRoleAttributes(entry);
+	entry->created = false;
+	entry->type = Op_Set;
 }
 
 static char *
@@ -223,14 +300,28 @@ ConstructDeltaMessage()
 					elog(ERROR, "Failed to get encrypted password: %s", logdetail);
 				}
 			}
-			else if (entry->password_null && entry->old_name[0] != '\0')
+			else if (entry->password_null &&
+					 (entry->old_name[0] != '\0' || HasRoleAttributes(entry)))
 			{
-				/* Renamed, then PASSWORD NULL: an explicit null, no encrypted_password */
+				/*
+				 * Renamed, or attributes changed too, then PASSWORD NULL: an
+				 * explicit null, no encrypted_password. Without these, a
+				 * missing password key already means PASSWORD NULL.
+				 */
 				PushKeyNull(&state, "password");
 			}
 			if (entry->old_name[0] != '\0')
 			{
 				PushKeyValue(&state, "old_name", entry->old_name);
+			}
+			if (entry->type == Op_Set)
+			{
+				if (entry->login != Login_Unset)
+					PushKeyBool(&state, "login", entry->login == Login_True);
+				if (entry->valid_until)
+					PushKeyValue(&state, "valid_until", (char *) entry->valid_until);
+				if (entry->touched)
+					PushKeyBool(&state, "touched", true);
 			}
 			pushJsonbValue(&state, WJB_END_OBJECT, NULL);
 		}
@@ -540,10 +631,42 @@ MergeTable()
 											   &found_parent);
 
 			if (!found_parent)
-				memset(to_write->old_name, 0, sizeof(to_write->old_name));
+				InitRoleEntry(to_write);
 			to_write->type = entry->type;
-			to_write->password = entry->password;
-			to_write->password_null = entry->password_null;
+
+			/*
+			 * An entry made only by an attribute change or a GRANT keeps the
+			 * parent's password.
+			 */
+			if (entry->password_set)
+			{
+				to_write->password = entry->password;
+				to_write->password_null = entry->password_null;
+				to_write->password_set = true;
+			}
+
+			/*
+			 * Attributes: what this subtransaction set wins, touched is
+			 * OR-ed, and a DROP forgets them.
+			 */
+			if (entry->type == Op_Delete)
+			{
+				ResetRoleAttributes(to_write);
+				to_write->created = false;
+			}
+			else
+			{
+				if (entry->created)
+				{
+					ResetRoleAttributes(to_write);
+					to_write->created = true;
+				}
+				if (entry->login != Login_Unset)
+					to_write->login = entry->login;
+				if (entry->valid_until)
+					to_write->valid_until = entry->valid_until;
+				to_write->touched |= entry->touched;
+			}
 
 			/*
 			 * An entry without old_name (e.g. a PASSWORD change after a
@@ -572,6 +695,15 @@ MergeTable()
 			{
 				to_write->password = old->password;
 				to_write->password_null = old->password_null;
+			}
+			/* Likewise the attributes the parent recorded under the old name */
+			if (entry->type == Op_Set)
+			{
+				if (entry->login == Login_Unset)
+					to_write->login = old->login;
+				if (!entry->valid_until)
+					to_write->valid_until = old->valid_until;
+				to_write->touched |= old->touched;
 			}
 			hash_search(CurrentDdlTable->role_table,
 						entry->old_name,
@@ -762,36 +894,116 @@ HandleDropDb(DropdbStmt *stmt)
 		memset(entry->old_name, 0, sizeof(entry->old_name));
 }
 
+/*
+ * Role options (as CREATE ROLE and ALTER ROLE name them) that the receiver
+ * doesn't get as values: changing one marks the role touched. The last three
+ * are memberships (CREATE ROLE ... IN ROLE / ROLE / ADMIN, ALTER GROUP).
+ */
+static bool
+IsTouchingRoleOption(const char *defname)
+{
+	static const char *const touching[] = {
+		"createdb", "createrole", "inherit", "isreplication", "bypassrls",
+		"superuser", "connectionlimit",
+		"addroleto", "rolemembers", "adminmembers",
+	};
+
+	for (size_t i = 0; i < lengthof(touching); i++)
+	{
+		if (strcmp(defname, touching[i]) == 0)
+			return true;
+	}
+	return false;
+}
+
+/* The role options CREATE ROLE and ALTER ROLE share that this file tracks */
+typedef struct
+{
+	DefElem    *dpass;
+	DefElem    *dlogin;
+	DefElem    *dvalid_until;
+	bool		touched;
+} RoleOptions;
+
+/* Returns true when any tracked option is present */
+static bool
+ParseRoleOptions(List *options, RoleOptions *out)
+{
+	ListCell   *option;
+
+	memset(out, 0, sizeof(*out));
+	foreach(option, options)
+	{
+		DefElem    *defel = lfirst(option);
+
+		if (strcmp(defel->defname, "password") == 0)
+			out->dpass = defel;
+		else if (strcmp(defel->defname, "canlogin") == 0)
+			out->dlogin = defel;
+		else if (strcmp(defel->defname, "validUntil") == 0)
+			out->dvalid_until = defel;
+		else if (IsTouchingRoleOption(defel->defname))
+			out->touched = true;
+	}
+	return out->dpass || out->dlogin || out->dvalid_until || out->touched;
+}
+
+/* Records LOGIN, VALID UNTIL and touched from the statement's options */
+static void
+SetRoleAttributes(RoleEntry *entry, RoleOptions *opts)
+{
+	if (opts->dlogin)
+		entry->login = defGetBoolean(opts->dlogin) ? Login_True : Login_False;
+	if (opts->dvalid_until && opts->dvalid_until->arg)
+		entry->valid_until = MemoryContextStrdup(CurTransactionContext,
+												 strVal(opts->dvalid_until->arg));
+	if (opts->touched)
+		entry->touched = true;
+}
+
 static void
 HandleCreateRole(CreateRoleStmt *stmt)
 {
 	bool		found = false;
 	RoleEntry  *entry;
-	DefElem    *dpass;
-	ListCell   *option;
+	RoleOptions opts;
 
 	InitRoleTableIfNeeded();
 
-	dpass = NULL;
-	foreach(option, stmt->options)
-	{
-		DefElem    *defel = lfirst(option);
-
-		if (strcmp(defel->defname, "password") == 0)
-			dpass = defel;
-	}
+	ParseRoleOptions(stmt->options, &opts);
 
 	entry = hash_search(CurrentDdlTable->role_table,
 						stmt->role,
 						HASH_ENTER,
 						&found);
 	if (!found)
-		memset(entry->old_name, 0, sizeof(entry->old_name));
-	if (dpass && dpass->arg)
-		entry->password = MemoryContextStrdup(CurTransactionContext, strVal(dpass->arg));
+		InitRoleEntry(entry);
+	/*
+	 * A new role without a password is sent with an explicit null (beside
+	 * its login key): the receiver then drops any copy left under the name
+	 * (DROP and CREATE in one transaction merge into one set) and applies
+	 * its checks for reserved names.
+	 */
+	if (opts.dpass && opts.dpass->arg)
+	{
+		entry->password = MemoryContextStrdup(CurTransactionContext, strVal(opts.dpass->arg));
+		entry->password_null = false;
+	}
 	else
+	{
 		entry->password = NULL;
-	entry->password_null = false;
+		entry->password_null = true;
+	}
+	entry->password_set = true;
+
+	/*
+	 * A new role: forget anything recorded under its name, and always send
+	 * LOGIN (CREATE USER defaults to LOGIN, CREATE ROLE and GROUP to NOLOGIN).
+	 */
+	ResetRoleAttributes(entry);
+	entry->created = true;
+	entry->login = stmt->stmt_type == ROLESTMT_USER ? Login_True : Login_False;
+	SetRoleAttributes(entry, &opts);
 	entry->type = Op_Set;
 }
 
@@ -799,8 +1011,7 @@ static void
 HandleAlterRole(AlterRoleStmt *stmt)
 {
 	char	   *role_name;
-	DefElem    *dpass;
-	ListCell   *option;
+	RoleOptions opts;
 	bool		found = false;
 	RoleEntry  *entry;
 
@@ -810,17 +1021,8 @@ HandleAlterRole(AlterRoleStmt *stmt)
 	if (IsPrivilegedRole(role_name) && !superuser())
 		elog(ERROR, "could not ALTER %s", privileged_role_name);
 
-	dpass = NULL;
-	foreach(option, stmt->options)
-	{
-		DefElem    *defel = lfirst(option);
-
-		if (strcmp(defel->defname, "password") == 0)
-			dpass = defel;
-	}
-
-	/* We only care about updates to the password */
-	if (!dpass)
+	/* Return when nothing tracked is present */
+	if (!ParseRoleOptions(stmt->options, &opts))
 	{
 		pfree(role_name);
 		return;
@@ -831,12 +1033,17 @@ HandleAlterRole(AlterRoleStmt *stmt)
 						HASH_ENTER,
 						&found);
 	if (!found)
-		memset(entry->old_name, 0, sizeof(entry->old_name));
-	if (dpass->arg)
-		entry->password = MemoryContextStrdup(CurTransactionContext, strVal(dpass->arg));
-	else
-		entry->password = NULL;
-	entry->password_null = (dpass->arg == NULL);
+		InitRoleEntry(entry);
+	if (opts.dpass)
+	{
+		if (opts.dpass->arg)
+			entry->password = MemoryContextStrdup(CurTransactionContext, strVal(opts.dpass->arg));
+		else
+			entry->password = NULL;
+		entry->password_null = (opts.dpass->arg == NULL);
+		entry->password_set = true;
+	}
+	SetRoleAttributes(entry, &opts);
 	entry->type = Op_Set;
 
 	pfree(role_name);
@@ -871,6 +1078,10 @@ HandleRoleRename(RenameStmt *stmt)
 			strlcpy(entry_for_new_name->old_name, entry->name, NAMEDATALEN);
 		entry_for_new_name->password = entry->password;
 		entry_for_new_name->password_null = entry->password_null;
+		entry_for_new_name->login = entry->login;
+		entry_for_new_name->valid_until = entry->valid_until;
+		entry_for_new_name->touched = entry->touched;
+		entry_for_new_name->created = entry->created;
 		hash_search(
 					CurrentDdlTable->role_table,
 					entry->name,
@@ -882,7 +1093,10 @@ HandleRoleRename(RenameStmt *stmt)
 		strlcpy(entry_for_new_name->old_name, stmt->subname, NAMEDATALEN);
 		entry_for_new_name->password = NULL;
 		entry_for_new_name->password_null = false;
+		ResetRoleAttributes(entry_for_new_name);
+		entry_for_new_name->created = false;
 	}
+	entry_for_new_name->password_set = true;
 }
 
 static void
@@ -902,11 +1116,60 @@ HandleDropRole(DropRoleStmt *stmt)
 										HASH_ENTER,
 										&found);
 
+		if (!found)
+			InitRoleEntry(entry);
 		entry->type = Op_Delete;
 		entry->password = NULL;
 		entry->password_null = false;
-		if (!found)
-			memset(entry->old_name, 0, sizeof(entry->old_name));
+		entry->password_set = true;
+		ResetRoleAttributes(entry);
+		entry->created = false;
+	}
+}
+
+static void
+MarkRoleTouched(const char *role_name)
+{
+	bool		found = false;
+	RoleEntry  *entry = hash_search(CurrentDdlTable->role_table,
+									role_name,
+									HASH_ENTER,
+									&found);
+
+	if (!found)
+		InitRoleEntry(entry);
+	entry->touched = true;
+}
+
+/*
+ * GRANT / REVOKE of a role: every grantee and every granted role is marked
+ * touched (the receiver reads memberships from the catalog). PUBLIC isn't a
+ * role and is skipped; Postgres refuses it.
+ */
+static void
+HandleGrantRole(GrantRoleStmt *stmt)
+{
+	ListCell   *item;
+
+	InitRoleTableIfNeeded();
+
+	foreach(item, stmt->grantee_roles)
+	{
+		RoleSpec   *spec = lfirst(item);
+		char	   *name;
+
+		if (spec->roletype == ROLESPEC_PUBLIC)
+			continue;
+		name = get_rolespec_name(spec);
+		MarkRoleTouched(name);
+		pfree(name);
+	}
+	foreach(item, stmt->granted_roles)
+	{
+		AccessPriv *priv = lfirst(item);
+
+		if (priv->priv_name)
+			MarkRoleTouched(priv->priv_name);
 	}
 }
 
@@ -1482,6 +1745,9 @@ NeonProcessUtility(
 			break;
 		case T_DropRoleStmt:
 			HandleDropRole(castNode(DropRoleStmt, parseTree));
+			break;
+		case T_GrantRoleStmt:
+			HandleGrantRole(castNode(GrantRoleStmt, parseTree));
 			break;
 		case T_CreateTableSpaceStmt:
 			if (!RegressTestMode)

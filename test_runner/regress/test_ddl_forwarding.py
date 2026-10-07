@@ -39,9 +39,12 @@ def handle_role(dbs, roles, operation):
             for db, owner in dbs.items():
                 if owner == operation["old_name"]:
                     dbs[db] = operation["name"]
-        if "password" in operation:
+        if operation.get("password") is not None:
             roles[operation["name"]] = operation["password"]
             assert "encrypted_password" in operation
+        elif "password" in operation:
+            # An explicit null (PASSWORD NULL, or a CREATE without a password) drops the copy
+            roles.pop(operation["name"], None)
     elif operation["op"] == "del":
         if "old_name" in operation:
             roles.pop(operation["old_name"])
@@ -289,6 +292,234 @@ def test_ddl_forwarding(ddl: DdlForwardingContext):
         cur.execute("ALTER DATABASE trololobus OWNER TO neon_superuser")
 
     conn.close()
+
+
+SCRAM = "<scram-sha-256 hash>"
+
+
+class RoleBodies:
+    """Captures the role lists of the PATCH bodies the compute sends."""
+
+    def __init__(self, httpserver: HTTPServer, vanilla_pg: VanillaPostgres, host: str, port: int):
+        endpoint = "/test/roles_and_databases"
+        self.pg = vanilla_pg
+        self.received: list[Any] = []
+        httpserver.expect_request(endpoint, method="PATCH").respond_with_handler(self.handler)
+        self.pg.configure(
+            [
+                f"neon.console_url=http://{host}:{port}{endpoint}",
+                "shared_preload_libraries = 'neon'",
+            ]
+        )
+
+    def handler(self, request: Request) -> Response:
+        # The hash has a random salt: check its shape and replace it
+        body: Any = request.json
+        for role in body.get("roles", []):
+            if "encrypted_password" in role:
+                assert role["encrypted_password"].startswith("SCRAM-SHA-256$")
+                role["encrypted_password"] = SCRAM
+        self.received.append(body)
+        return Response(status=200)
+
+    def setup(self, query: str):
+        """Runs `query` without forwarding."""
+        self.pg.safe_psql(f"SET neon.forward_ddl = false; {query}")
+
+    def roles_of(self, statements: list[str]) -> list[dict[str, Any]]:
+        """Runs `statements` in one transaction; returns the one body's roles, sorted by name."""
+        self.received.clear()
+        with self.pg.cursor() as cur:
+            cur.execute("BEGIN")
+            for stmt in statements:
+                cur.execute(stmt)
+            cur.execute("COMMIT")
+        assert len(self.received) == 1, self.received
+        return sorted(self.received[0].get("roles", []), key=lambda r: r["name"])
+
+
+@pytest.fixture(scope="function")
+def role_bodies(
+    httpserver: HTTPServer, vanilla_pg: VanillaPostgres, httpserver_listen_address: ListenAddress
+):
+    (host, port) = httpserver_listen_address
+    bodies = RoleBodies(httpserver, vanilla_pg, host, port)
+    vanilla_pg.start()
+    bodies.setup("CREATE ROLE app LOGIN PASSWORD 'x'; CREATE ROLE grp")
+    yield bodies
+    vanilla_pg.stop()
+
+
+def test_alter_role_nologin_forwards_login_false(role_bodies: RoleBodies):
+    assert role_bodies.roles_of(["ALTER ROLE app NOLOGIN"]) == [
+        {"op": "set", "name": "app", "login": False}
+    ]
+    assert role_bodies.roles_of(["ALTER ROLE app LOGIN"]) == [
+        {"op": "set", "name": "app", "login": True}
+    ]
+    # The last statement wins
+    assert role_bodies.roles_of(["ALTER ROLE app NOLOGIN", "ALTER ROLE app LOGIN"]) == [
+        {"op": "set", "name": "app", "login": True}
+    ]
+    # CREATE sends the effective value: CREATE ROLE defaults to NOLOGIN, CREATE USER to LOGIN.
+    # A CREATE without a password sends an explicit null (the receiver drops any stale copy)
+    assert role_bodies.roles_of(
+        [
+            "CREATE ROLE r1",
+            "CREATE USER u1",
+            "CREATE ROLE r2 LOGIN PASSWORD 'p'",
+            "CREATE ROLE r3 PASSWORD 'p'",
+        ]
+    ) == [
+        {"op": "set", "name": "r1", "password": None, "login": False},
+        {
+            "op": "set",
+            "name": "r2",
+            "login": True,
+            "password": "p",
+            "encrypted_password": SCRAM,
+        },
+        {
+            "op": "set",
+            "name": "r3",
+            "login": False,
+            "password": "p",
+            "encrypted_password": SCRAM,
+        },
+        {"op": "set", "name": "u1", "password": None, "login": True},
+    ]
+    # CREATE ROLE ... IN ROLE is a membership: touched
+    assert role_bodies.roles_of(["CREATE ROLE r4 IN ROLE grp"]) == [
+        {"op": "set", "name": "r4", "password": None, "login": False, "touched": True}
+    ]
+
+
+def test_drop_then_create_sends_a_new_role(role_bodies: RoleBodies):
+    # One transaction: the DROP and the CREATE merge into one set without the old password
+    assert role_bodies.roles_of(["DROP ROLE app", "CREATE USER app"]) == [
+        {"op": "set", "name": "app", "password": None, "login": True}
+    ]
+    # A CREATE in a released savepoint forgets what the parent recorded before the DROP
+    role_bodies.setup("ALTER ROLE app PASSWORD 'x'")
+    assert role_bodies.roles_of(
+        [
+            "ALTER ROLE app VALID UNTIL 'infinity' CREATEDB",
+            "SAVEPOINT s",
+            "DROP ROLE app",
+            "CREATE ROLE app",
+            "RELEASE SAVEPOINT s",
+        ]
+    ) == [{"op": "set", "name": "app", "password": None, "login": False}]
+    # A created role renamed in the same transaction: a rename plus the explicit null
+    assert role_bodies.roles_of(["CREATE ROLE a", "ALTER ROLE a RENAME TO b"]) == [
+        {"op": "set", "name": "b", "old_name": "a", "password": None, "login": False}
+    ]
+
+
+def test_valid_until_forwarded(role_bodies: RoleBodies):
+    assert role_bodies.roles_of(["ALTER ROLE app VALID UNTIL '2030-01-01 00:00:00+00'"]) == [
+        {"op": "set", "name": "app", "valid_until": "2030-01-01 00:00:00+00"}
+    ]
+    assert role_bodies.roles_of(["ALTER ROLE app VALID UNTIL 'infinity'"]) == [
+        {"op": "set", "name": "app", "valid_until": "infinity"}
+    ]
+
+
+@pytest.mark.parametrize(
+    "attribute",
+    [
+        "CREATEDB",
+        "NOCREATEROLE",
+        "NOINHERIT",
+        "REPLICATION",
+        "BYPASSRLS",
+        "SUPERUSER",
+        "CONNECTION LIMIT 5",
+    ],
+)
+def test_createdb_marks_touched(role_bodies: RoleBodies, attribute: str):
+    assert role_bodies.roles_of([f"ALTER ROLE app {attribute}"]) == [
+        {"op": "set", "name": "app", "touched": True}
+    ]
+
+
+def test_grant_role_marks_grantee_touched(role_bodies: RoleBodies):
+    touched = [
+        {"op": "set", "name": "app", "touched": True},
+        {"op": "set", "name": "grp", "touched": True},
+    ]
+    assert role_bodies.roles_of(["GRANT grp TO app"]) == touched
+    assert role_bodies.roles_of(["REVOKE grp FROM app"]) == touched
+    # ALTER GROUP ... ADD USER is a grant too
+    assert role_bodies.roles_of(["ALTER GROUP grp ADD USER app"]) == [
+        {"op": "set", "name": "grp", "touched": True}
+    ]
+
+
+def test_savepoint_rollback_drops_attributes(role_bodies: RoleBodies):
+    # Rolled back: only the password set before the savepoint is sent
+    assert role_bodies.roles_of(
+        [
+            "ALTER ROLE app PASSWORD 'p2'",
+            "SAVEPOINT s",
+            "ALTER ROLE app NOLOGIN VALID UNTIL 'infinity' CREATEDB",
+            "GRANT grp TO app",
+            "ROLLBACK TO SAVEPOINT s",
+        ]
+    ) == [{"op": "set", "name": "app", "password": "p2", "encrypted_password": SCRAM}]
+    # A REVOKE rolled back with its savepoint isn't sent either
+    role_bodies.setup("GRANT grp TO app")
+    assert role_bodies.roles_of(
+        [
+            "ALTER ROLE app PASSWORD 'p4'",
+            "SAVEPOINT s",
+            "REVOKE grp FROM app",
+            "ROLLBACK TO SAVEPOINT s",
+        ]
+    ) == [{"op": "set", "name": "app", "password": "p4", "encrypted_password": SCRAM}]
+    # Released: the subtransaction's attributes merge in and keep the parent's password
+    assert role_bodies.roles_of(
+        [
+            "ALTER ROLE app PASSWORD 'p3'",
+            "SAVEPOINT s",
+            "ALTER ROLE app NOLOGIN VALID UNTIL 'infinity' CREATEDB",
+            "SAVEPOINT t",
+            "ALTER ROLE app LOGIN",
+            "RELEASE SAVEPOINT t",
+            "RELEASE SAVEPOINT s",
+        ]
+    ) == [
+        {
+            "op": "set",
+            "name": "app",
+            "password": "p3",
+            "encrypted_password": SCRAM,
+            "login": True,
+            "valid_until": "infinity",
+            "touched": True,
+        }
+    ]
+    # A rename in a subtransaction carries the parent's attributes to the new name
+    assert role_bodies.roles_of(
+        [
+            "ALTER ROLE app NOLOGIN CREATEDB",
+            "SAVEPOINT s",
+            "ALTER ROLE app RENAME TO app2",
+            "RELEASE SAVEPOINT s",
+        ]
+    ) == [{"op": "set", "name": "app2", "old_name": "app", "login": False, "touched": True}]
+
+
+def test_password_only_body_unchanged(role_bodies: RoleBodies):
+    assert role_bodies.roles_of(["ALTER ROLE app PASSWORD 'p'"]) == [
+        {"op": "set", "name": "app", "password": "p", "encrypted_password": SCRAM}
+    ]
+    assert role_bodies.roles_of(["ALTER ROLE app PASSWORD NULL"]) == [{"op": "set", "name": "app"}]
+    # PASSWORD NULL next to an attribute is sent as an explicit null, so the receiver can tell
+    # it from an attribute-only change
+    assert role_bodies.roles_of(["ALTER ROLE app PASSWORD NULL", "ALTER ROLE app CREATEDB"]) == [
+        {"op": "set", "name": "app", "password": None, "touched": True}
+    ]
 
 
 # Assert that specified database has a specific connlimit, throwing an AssertionError otherwise
