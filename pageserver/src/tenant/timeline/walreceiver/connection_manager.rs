@@ -400,6 +400,25 @@ pub struct ConnectionManagerStatus {
 }
 
 impl ConnectionManagerStatus {
+    /// The highest commit LSN the safekeepers are known to have, from the current connection and
+    /// the broker candidates. Zero (invalid) values mean "unknown" and are ignored.
+    /// `None` when nothing is known.
+    pub(crate) fn max_commit_lsn(&self) -> Option<Lsn> {
+        let from_connection = self
+            .existing_connection
+            .as_ref()
+            .and_then(|connection| connection.commit_lsn);
+        let from_candidates = self
+            .wal_stream_candidates
+            .values()
+            .map(|candidate| Lsn(candidate.timeline.commit_lsn));
+        from_connection
+            .into_iter()
+            .chain(from_candidates)
+            .filter(|lsn| *lsn != Lsn::INVALID)
+            .max()
+    }
+
     /// Generates a string, describing current connection status in a form, suitable for logging.
     pub fn to_human_readable_string(&self) -> String {
         let mut resulting_string = String::new();
@@ -1152,6 +1171,62 @@ mod tests {
             },
             latest_update,
         }
+    }
+
+    fn status_with(
+        connection_commit_lsn: Option<Lsn>,
+        candidate_commit_lsns: &[u64],
+    ) -> ConnectionManagerStatus {
+        let now = Utc::now().naive_utc();
+        ConnectionManagerStatus {
+            existing_connection: connection_commit_lsn.map(|commit_lsn| WalConnectionStatus {
+                is_connected: true,
+                has_processed_wal: true,
+                latest_connection_update: now,
+                latest_wal_update: now,
+                commit_lsn: Some(commit_lsn),
+                streaming_lsn: None,
+                node: NodeId(1),
+            }),
+            wal_stream_candidates: candidate_commit_lsns
+                .iter()
+                .enumerate()
+                .map(|(i, lsn)| {
+                    (
+                        NodeId(10 + i as u64),
+                        dummy_broker_sk_timeline(*lsn, "", now),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn max_commit_lsn_none_when_unknown() {
+        assert_eq!(status_with(None, &[]).max_commit_lsn(), None);
+    }
+
+    #[test]
+    fn max_commit_lsn_takes_connection_and_candidates_max() {
+        assert_eq!(
+            status_with(Some(Lsn(100)), &[50, 300, 200]).max_commit_lsn(),
+            Some(Lsn(300))
+        );
+        assert_eq!(
+            status_with(Some(Lsn(500)), &[50, 300]).max_commit_lsn(),
+            Some(Lsn(500))
+        );
+        assert_eq!(status_with(None, &[7, 9]).max_commit_lsn(), Some(Lsn(9)));
+    }
+
+    #[test]
+    fn max_commit_lsn_ignores_invalid() {
+        assert_eq!(status_with(None, &[0, 0]).max_commit_lsn(), None);
+        assert_eq!(
+            status_with(Some(Lsn::INVALID), &[0, 42]).max_commit_lsn(),
+            Some(Lsn(42))
+        );
+        assert_eq!(status_with(Some(Lsn::INVALID), &[]).max_commit_lsn(), None);
     }
 
     #[tokio::test]

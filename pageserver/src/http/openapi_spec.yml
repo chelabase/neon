@@ -1151,6 +1151,10 @@ components:
           format: hex
         last_received_msg_ts:
           type: integer
+        safekeeper_commit_lsn:
+          type: string
+          format: hex
+          description: Highest commit LSN reported by the safekeepers, if known.
         state:
           type: string
         min_readable_lsn:

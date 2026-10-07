@@ -524,6 +524,7 @@ async fn build_timeline_info_common(
         walreceiver_status,
         // HADRON
         image_consistent_lsn: None,
+        safekeeper_commit_lsn: timeline.safekeeper_commit_lsn(),
     };
     Ok(info)
 }

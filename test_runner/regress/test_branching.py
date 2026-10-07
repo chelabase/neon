@@ -12,7 +12,7 @@ from fixtures.log_helper import log
 from fixtures.pageserver.http import PageserverApiException
 from fixtures.pageserver.utils import wait_until_tenant_active
 from fixtures.safekeeper.http import MembershipConfiguration, TimelineCreateRequest
-from fixtures.utils import query_scalar
+from fixtures.utils import query_scalar, wait_until
 from performance.test_perf_pgbench import get_scales_matrix
 from requests import RequestException
 from requests.exceptions import RetryError
@@ -143,6 +143,50 @@ def test_branching_unnormalized_start_lsn(neon_simple_env: NeonEnv, pg_bin: PgBi
     endpoint1 = env.endpoints.create_start("b1")
 
     pg_bin.run_capture(["pgbench", "-i", endpoint1.connstr()])
+
+
+def test_branch_after_pageserver_restart_sees_last_write(neon_simple_env: NeonEnv):
+    """
+    Right after a pageserver restart, last_record_lsn lags the safekeepers' commit LSN until the
+    walreceiver catches up. A branch at the head must use max(last_record_lsn, safekeeper_commit_lsn)
+    to see the last committed write.
+    """
+    env = neon_simple_env
+    ps_http = env.pageserver.http_client()
+
+    timeline_id = env.create_branch("main2")
+    endpoint = env.endpoints.create_start("main2")
+    endpoint.safe_psql("CREATE TABLE t (x int)")
+    endpoint.safe_psql("INSERT INTO t VALUES (42)")
+    with endpoint.cursor() as cur:
+        written_lsn = Lsn(query_scalar(cur, "SELECT pg_current_wal_flush_lsn()"))
+    endpoint.stop()
+
+    env.pageserver.restart(immediate=True)
+
+    # Read at once: the walreceiver may not have caught up with the safekeepers yet.
+    detail = ps_http.timeline_detail(env.initial_tenant, timeline_id)
+    last_record_lsn = Lsn(detail["last_record_lsn"])
+    sk_commit = detail.get("safekeeper_commit_lsn")
+    if sk_commit is None:
+        # The broker has not told us yet; the walreceiver connects within a moment.
+        def has_commit_lsn():
+            d = ps_http.timeline_detail(env.initial_tenant, timeline_id)
+            assert d.get("safekeeper_commit_lsn") is not None
+
+        wait_until(has_commit_lsn)
+        sk_commit = ps_http.timeline_detail(env.initial_tenant, timeline_id)[
+            "safekeeper_commit_lsn"
+        ]
+        last_record_lsn = Lsn(
+            ps_http.timeline_detail(env.initial_tenant, timeline_id)["last_record_lsn"]
+        )
+    head = max(last_record_lsn, Lsn(sk_commit))
+    assert head >= written_lsn, f"head {head} is behind the last write {written_lsn}"
+
+    env.create_branch("child", ancestor_branch_name="main2", ancestor_start_lsn=head)
+    child = env.endpoints.create_start("child")
+    assert child.safe_psql("SELECT x FROM t") == [(42,)]
 
 
 def test_cannot_create_endpoint_on_non_uploaded_timeline(neon_env_builder: NeonEnvBuilder):

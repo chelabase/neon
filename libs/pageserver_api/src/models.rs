@@ -1627,6 +1627,12 @@ pub struct TimelineInfo {
     // HADRON: the largest LSN below which all page updates have been included in the image layers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_consistent_lsn: Option<Lsn>,
+
+    /// The highest commit LSN the safekeepers have reported to this pageserver (None when
+    /// unknown, e.g. the timeline is idle). Right after a restart it can be ahead of
+    /// `last_record_lsn`; the head of the timeline is the max of the two.
+    #[serde(default)]
+    pub safekeeper_commit_lsn: Option<Lsn>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1972,6 +1978,38 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn timeline_info_serde_with_and_without_safekeeper_commit_lsn() {
+        let mut value = json!({
+            "tenant_id": TenantShardId::unsharded(TenantId::generate()).to_string(),
+            "timeline_id": TimelineId::generate().to_string(),
+            "last_record_lsn": "0/16B3748",
+            "disk_consistent_lsn": "0/16B3748",
+            "remote_consistent_lsn": "0/16B3748",
+            "remote_consistent_lsn_visible": "0/16B3748",
+            "initdb_lsn": "0/16B3748",
+            "current_logical_size": 0,
+            "current_logical_size_is_accurate": true,
+            "directory_entries_counts": [],
+            "pitr_history_size": 0,
+            "within_ancestor_pitr": false,
+            "pg_version": 17,
+            "state": "Active",
+            "walreceiver_status": "",
+        });
+
+        // An older pageserver does not send the field: it is None.
+        let info: TimelineInfo = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(info.safekeeper_commit_lsn, None);
+
+        // With the field, it parses from Neon's string form and serializes back to it.
+        value["safekeeper_commit_lsn"] = json!("0/16B3748");
+        let info: TimelineInfo = serde_json::from_value(value).unwrap();
+        assert_eq!(info.safekeeper_commit_lsn, Some(Lsn(0x16B3748)));
+        let out = serde_json::to_value(&info).unwrap();
+        assert_eq!(out["safekeeper_commit_lsn"], json!("0/16B3748"));
+    }
 
     #[test]
     fn test_tenantinfo_serde() {

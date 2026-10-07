@@ -1906,6 +1906,13 @@ impl Timeline {
         }
     }
 
+    /// The highest commit LSN the safekeepers have reported to this pageserver, if known.
+    /// Right after a pageserver restart this can be ahead of `get_last_record_lsn()`.
+    pub(crate) fn safekeeper_commit_lsn(&self) -> Option<Lsn> {
+        let guard = self.walreceiver.lock().unwrap();
+        guard.as_ref()?.status()?.max_commit_lsn()
+    }
+
     pub(crate) fn walreceiver_status(&self) -> String {
         match &*self.walreceiver.lock().unwrap() {
             None => "stopping or stopped".to_string(),
