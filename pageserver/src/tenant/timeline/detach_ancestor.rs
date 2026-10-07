@@ -1,5 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use bytes::Bytes;
@@ -20,15 +21,15 @@ use utils::lsn::Lsn;
 use utils::sync::gate::GateError;
 
 use super::layer_manager::{LayerManager, LayerManagerLockHolder};
-use super::{FlushLayerError, Timeline};
+use super::{FlushLayerError, Timeline, WaitLsnError, WaitLsnTimeout, WaitLsnWaiter};
 use crate::context::{DownloadBehavior, RequestContext};
 use crate::task_mgr::TaskKind;
 use crate::tenant::TenantShard;
 use crate::tenant::remote_timeline_client::index::GcBlockingReason::DetachAncestor;
 use crate::tenant::storage_layer::layer::local_layer_path;
 use crate::tenant::storage_layer::{
-    AsLayerDesc as _, DeltaLayerWriter, ImageLayerWriter, IoConcurrency, Layer, ResidentLayer,
-    ValuesReconstructState,
+    AsLayerDesc as _, DeltaLayerName, DeltaLayerWriter, ImageLayerWriter, IoConcurrency, Layer,
+    LayerName, ResidentLayer, ValuesReconstructState,
 };
 use crate::tenant::timeline::VersionedKeySpaceQuery;
 use crate::virtual_file::{MaybeFatalIo, VirtualFile};
@@ -40,9 +41,6 @@ pub(crate) enum Error {
 
     #[error("too many ancestors")]
     TooManyAncestors,
-
-    #[error("ancestor is not empty")]
-    AncestorNotEmpty,
 
     #[error("shutting down, please retry later")]
     ShuttingDown,
@@ -70,6 +68,12 @@ pub(crate) enum Error {
 
     #[error("failpoint: {}", .0)]
     Failpoint(&'static str),
+
+    #[error("ancestor {ancestor} has not caught up to {lsn} yet, please retry later")]
+    AncestorLsnTimeout { ancestor: TimelineId, lsn: Lsn },
+
+    #[error("two ancestor levels have a layer named {layer}")]
+    LayerNameCollision { layer: String },
 }
 
 impl Error {
@@ -101,12 +105,12 @@ impl From<Error> for ApiError {
     fn from(value: Error) -> Self {
         match value {
             Error::NoAncestor => ApiError::Conflict(value.to_string()),
-            Error::TooManyAncestors | Error::AncestorNotEmpty => {
-                ApiError::BadRequest(anyhow::anyhow!("{value}"))
-            }
+            Error::TooManyAncestors => ApiError::BadRequest(anyhow::anyhow!("{value}")),
             Error::ShuttingDown => ApiError::ShuttingDown,
             Error::Archived(_) => ApiError::BadRequest(anyhow::anyhow!("{value}")),
-            Error::OtherTimelineDetachOngoing(_) | Error::FailedToReparentAll => {
+            Error::OtherTimelineDetachOngoing(_)
+            | Error::FailedToReparentAll
+            | Error::AncestorLsnTimeout { .. } => {
                 ApiError::ResourceUnavailable(value.to_string().into())
             }
             Error::NotFound(e) => ApiError::from(e),
@@ -114,7 +118,8 @@ impl From<Error> for ApiError {
             Error::Prepare(_)
             | Error::DetachReparent(_)
             | Error::Complete(_)
-            | Error::Failpoint(_) => ApiError::InternalServerError(value.into()),
+            | Error::Failpoint(_)
+            | Error::LayerNameCollision { .. } => ApiError::InternalServerError(value.into()),
         }
     }
 }
@@ -140,6 +145,10 @@ pub(crate) enum Progress {
 pub(crate) struct PreparedTimelineDetach {
     layers: Vec<Layer>,
 }
+
+/// How long a detach waits for each ancestor to ingest its WAL up to the cut before giving up
+/// with a retryable [`Error::AncestorLsnTimeout`].
+const ANCESTOR_WAIT_LSN_TIMEOUT: Duration = Duration::from_secs(30);
 
 // TODO: this should be part of PageserverConf because we cannot easily modify cplane arguments.
 #[derive(Debug)]
@@ -178,26 +187,24 @@ impl Attempt {
     }
 }
 
+/// Writes one image layer at `image_lsn` (the detached timeline's branch point) with a tombstone
+/// for every non-inherited key that any level of `chain` holds at its cut: those keys never
+/// descend into ancestors, so the copied layers must not expose them.
 pub(crate) async fn generate_tombstone_image_layer(
     detached: &Arc<Timeline>,
-    ancestor: &Arc<Timeline>,
-    ancestor_lsn: Lsn,
-    historic_layers_to_copy: &Vec<Layer>,
+    chain: &[(Arc<Timeline>, Lsn)],
+    image_lsn: Lsn,
+    historic_layers_to_copy: &[Layer],
     ctx: &RequestContext,
 ) -> Result<Option<ResidentLayer>, Error> {
     tracing::info!(
         "removing non-inherited keys by writing an image layer with tombstones at the detach LSN"
     );
-    let io_concurrency = IoConcurrency::spawn_from_conf(
-        detached.conf.get_vectored_concurrent_io,
-        detached.gate.enter().map_err(|_| Error::ShuttingDown)?,
-    );
-    let mut reconstruct_state = ValuesReconstructState::new(io_concurrency);
     // Directly use `get_vectored_impl` to skip the max_vectored_read_key limit check. Note that the keyspace should
     // not contain too many keys, otherwise this takes a lot of memory. Currently we limit it to 10k keys in the compute.
     let key_range = Key::sparse_non_inherited_keyspace();
-    // avoid generating a "future layer" which will then be removed
-    let image_lsn = ancestor_lsn;
+    // `image_lsn` is the detached timeline's ancestor LSN: this avoids generating a "future
+    // layer" which will then be removed
 
     {
         for layer in historic_layers_to_copy {
@@ -231,13 +238,22 @@ pub(crate) async fn generate_tombstone_image_layer(
         }
     }
 
-    let query = VersionedKeySpaceQuery::uniform(KeySpace::single(key_range.clone()), image_lsn);
-    let data = ancestor
-        .get_vectored_impl(query, &mut reconstruct_state, ctx)
-        .await
-        .context("failed to retrieve aux keys")
-        .map_err(|e| Error::launder(e, Error::Prepare))?;
-    if !data.is_empty() {
+    let mut keys = BTreeSet::new();
+    for (level, cut) in chain {
+        let io_concurrency = IoConcurrency::spawn_from_conf(
+            detached.conf.get_vectored_concurrent_io,
+            detached.gate.enter().map_err(|_| Error::ShuttingDown)?,
+        );
+        let mut reconstruct_state = ValuesReconstructState::new(io_concurrency);
+        let query = VersionedKeySpaceQuery::uniform(KeySpace::single(key_range.clone()), *cut);
+        let data = level
+            .get_vectored_impl(query, &mut reconstruct_state, ctx)
+            .await
+            .context("failed to retrieve aux keys")
+            .map_err(|e| Error::launder(e, Error::Prepare))?;
+        keys.extend(data.into_keys());
+    }
+    if !keys.is_empty() {
         // TODO: is it possible that we can have an image at `image_lsn`? Unlikely because image layers are only generated
         // upon compaction but theoretically possible.
         let mut image_layer_writer = ImageLayerWriter::new(
@@ -253,9 +269,9 @@ pub(crate) async fn generate_tombstone_image_layer(
         .await
         .context("failed to create image layer writer")
         .map_err(Error::Prepare)?;
-        for key in data.keys() {
+        for key in keys {
             image_layer_writer
-                .put_image(*key, Bytes::new(), ctx)
+                .put_image(key, Bytes::new(), ctx)
                 .await
                 .context("failed to write key")
                 .map_err(|e| Error::launder(e, Error::Prepare))?;
@@ -290,7 +306,7 @@ pub(super) async fn prepare(
 ) -> Result<Progress, Error> {
     use Error::*;
 
-    let Some((mut ancestor, mut ancestor_lsn)) = detached
+    let Some((ancestor, ancestor_lsn)) = detached
         .ancestor_timeline
         .as_ref()
         .map(|tl| (tl.clone(), detached.ancestor_lsn))
@@ -347,40 +363,50 @@ pub(super) async fn prepare(
 
     check_no_archived_children_of_ancestor(tenant, detached, &ancestor, ancestor_lsn, behavior)?;
 
-    if let DetachBehavior::MultiLevelAndNoReparent = behavior {
-        // If the ancestor has an ancestor, we might be able to fast-path detach it if the current ancestor does not have any data written/used by the detaching timeline.
-        while let Some(ancestor_of_ancestor) = ancestor.ancestor_timeline.clone() {
-            if ancestor_lsn != ancestor.ancestor_lsn {
-                // non-technical requirement; we could flatten still if ancestor LSN does not match but that needs
-                // us to copy and cut more layers.
-                return Err(AncestorNotEmpty);
-            }
-            // Use the ancestor of the ancestor as the new ancestor (only when the ancestor LSNs are the same)
-            ancestor_lsn = ancestor.ancestor_lsn; // Get the LSN first before resetting the `ancestor` variable
-            ancestor = ancestor_of_ancestor;
-            // TODO: do we still need to check if we don't want to reparent?
-            check_no_archived_children_of_ancestor(
-                tenant,
-                detached,
-                &ancestor,
-                ancestor_lsn,
-                behavior,
-            )?;
-        }
-    } else if ancestor.ancestor_timeline.is_some() {
-        // non-technical requirement; we could flatten N ancestors just as easily but we chose
-        // not to, at least initially
-        return Err(TooManyAncestors);
+    // [(parent, detached.ancestor_lsn), (grandparent, parent.ancestor_lsn), ...]
+    let chain = detach_chain(
+        (ancestor, ancestor_lsn),
+        |level: &Arc<Timeline>| {
+            level
+                .ancestor_timeline
+                .clone()
+                .map(|next| (next, level.ancestor_lsn))
+        },
+        behavior,
+    )?;
+
+    for (level, cut) in chain.iter().skip(1) {
+        // TODO: do we still need to check if we don't want to reparent?
+        check_no_archived_children_of_ancestor(tenant, detached, level, *cut, behavior)?;
     }
 
+    let root = &chain.last().expect("never empty").0;
+
     tracing::info!(
-        "attempt to detach the timeline from the ancestor: {}@{}, behavior={:?}",
-        ancestor.timeline_id,
+        "attempt to detach the timeline from the ancestor: {}@{}, behavior={:?}, levels={}",
+        root.timeline_id,
         ancestor_lsn,
-        behavior
+        behavior,
+        chain.len(),
     );
 
-    let attempt = start_new_attempt(detached, tenant, ancestor.timeline_id, ancestor_lsn).await?;
+    // An ancestor reloaded since its last flush only has its WAL up to its disk consistent LSN
+    // until its walreceiver catches up; copying before that would lose the writes in between.
+    // Wait before taking the attempt and the gc block, so that a timeout holds neither.
+    for (level, cut) in &chain {
+        level
+            .wait_lsn(
+                *cut,
+                WaitLsnWaiter::Timeline(detached),
+                WaitLsnTimeout::Custom(ANCESTOR_WAIT_LSN_TIMEOUT),
+                ctx,
+            )
+            .await
+            .map_err(|e| ancestor_wait_error(e, level.timeline_id, *cut))?;
+    }
+
+    // The lineage records the root at the detached timeline's own ancestor LSN.
+    let attempt = start_new_attempt(detached, tenant, root.timeline_id, ancestor_lsn).await?;
 
     utils::pausable_failpoint!("timeline-detach-ancestor::before_starting_after_locking-pausable");
 
@@ -391,81 +417,64 @@ pub(super) async fn prepare(
         ))
     );
 
-    if ancestor_lsn >= ancestor.get_disk_consistent_lsn() {
-        let span =
-            tracing::info_span!("freeze_and_flush", ancestor_timeline_id=%ancestor.timeline_id);
-        async {
-            let started_at = std::time::Instant::now();
-            let freeze_and_flush = ancestor.freeze_and_flush0();
-            let mut freeze_and_flush = std::pin::pin!(freeze_and_flush);
+    // Every level contributes its layers up to its cut: straddling deltas are rewritten to end
+    // at `cut + 1`, the rest is copied as is. A level whose cut equals its own branch point
+    // contributes nothing (all of its layers start after the cut).
+    let mut straddling_branchpoint: Vec<(Layer, Lsn)> = Vec::new();
+    let mut rest_of_historic: Vec<Layer> = Vec::new();
+    let mut layer_names = HashSet::new();
 
-            let res =
-                tokio::time::timeout(std::time::Duration::from_secs(1), &mut freeze_and_flush)
-                    .await;
+    for (level, cut) in &chain {
+        if *cut >= level.get_disk_consistent_lsn() {
+            freeze_and_flush_ancestor(level).await?;
+        }
 
-            let res = match res {
-                Ok(res) => res,
-                Err(_elapsed) => {
-                    tracing::info!("freezing and flushing ancestor is still ongoing");
-                    freeze_and_flush.await
+        let end_lsn = *cut + 1;
+
+        let (filtered_layers, straddling, rest) = {
+            // we do not need to start from our layers, because they can only be layers that come
+            // *after* ancestor_lsn
+            let layers = tokio::select! {
+                guard = level.layers.read(LayerManagerLockHolder::DetachAncestor) => guard,
+                _ = detached.cancel.cancelled() => {
+                    return Err(ShuttingDown);
+                }
+                _ = level.cancel.cancelled() => {
+                    return Err(ShuttingDown);
                 }
             };
 
-            res.map_err(|e| {
-                use FlushLayerError::*;
-                match e {
-                    Cancelled | NotRunning(_) => {
-                        // FIXME(#6424): technically statically unreachable right now, given how we never
-                        // drop the sender
-                        Error::ShuttingDown
-                    }
-                    CreateImageLayersError(_) | Other(_) => Error::Prepare(e.into()),
-                }
-            })?;
-
-            // we do not need to wait for uploads to complete but we do need `struct Layer`,
-            // copying delta prefix is unsupported currently for `InMemoryLayer`.
-            tracing::info!(
-                elapsed_ms = started_at.elapsed().as_millis(),
-                "froze and flushed the ancestor"
-            );
-            Ok::<_, Error>(())
-        }
-        .instrument(span)
-        .await?;
-    }
-
-    let end_lsn = ancestor_lsn + 1;
-
-    let (filtered_layers, straddling_branchpoint, rest_of_historic) = {
-        // we do not need to start from our layers, because they can only be layers that come
-        // *after* ancestor_lsn
-        let layers = tokio::select! {
-            guard = ancestor.layers.read(LayerManagerLockHolder::DetachAncestor) => guard,
-            _ = detached.cancel.cancelled() => {
-                return Err(ShuttingDown);
-            }
-            _ = ancestor.cancel.cancelled() => {
-                return Err(ShuttingDown);
-            }
+            // between retries, these can change if compaction or gc ran in between. this will mean
+            // we have to redo work.
+            partition_work(*cut, &layers)?
         };
 
-        // between retries, these can change if compaction or gc ran in between. this will mean
-        // we have to redo work.
-        partition_work(ancestor_lsn, &layers)?
-    };
+        // TODO: layers are already sorted by something: use that to determine how much of remote
+        // copies are already done -- gc is blocked, but a compaction could had happened on ancestor,
+        // which is something to keep in mind if copy skipping is implemented.
+        tracing::info!(ancestor=%level.timeline_id, %cut, filtered=%filtered_layers, to_rewrite = straddling.len(), historic=%rest.len(), "collected layers");
 
-    // TODO: layers are already sorted by something: use that to determine how much of remote
-    // copies are already done -- gc is blocked, but a compaction could had happened on ancestor,
-    // which is something to keep in mind if copy skipping is implemented.
-    tracing::info!(filtered=%filtered_layers, to_rewrite = straddling_branchpoint.len(), historic=%rest_of_historic.len(), "collected layers");
+        // Refuse before copying anything if two levels would produce the same layer name.
+        for layer in &straddling {
+            check_layer_name_unique(&mut layer_names, &rewritten_layer_name(layer, end_lsn))?;
+        }
+        for layer in &rest {
+            check_layer_name_unique(
+                &mut layer_names,
+                &layer.layer_desc().layer_name().to_string(),
+            )?;
+        }
+
+        straddling_branchpoint.extend(straddling.into_iter().map(|layer| (layer, end_lsn)));
+        rest_of_historic.extend(rest);
+    }
 
     // TODO: copying and lsn prefix copying could be done at the same time with a single fsync after
     let mut new_layers: Vec<Layer> =
         Vec::with_capacity(straddling_branchpoint.len() + rest_of_historic.len() + 1);
 
     if let Some(tombstone_layer) =
-        generate_tombstone_image_layer(detached, &ancestor, ancestor_lsn, &rest_of_historic, ctx)
+        generate_tombstone_image_layer(detached, &chain, ancestor_lsn, &rest_of_historic, ctx)
             .await?
     {
         new_layers.push(tombstone_layer.into());
@@ -480,7 +489,7 @@ pub(super) async fn prepare(
 
         let limiter = Arc::new(Semaphore::new(options.rewrite_concurrency.get()));
 
-        for layer in straddling_branchpoint {
+        for (layer, end_lsn) in straddling_branchpoint {
             let limiter = limiter.clone();
             let timeline = detached.clone();
             let ctx = ctx.detached_child(TaskKind::DetachAncestor, DownloadBehavior::Download);
@@ -605,6 +614,101 @@ pub(super) async fn prepare(
     let prepared = PreparedTimelineDetach { layers: new_layers };
 
     Ok(Progress::Prepared(attempt, prepared))
+}
+
+/// The ancestor chain to copy from, nearest first: `[(parent, cut), (grandparent, cut), ...]`,
+/// where each cut is the LSN the level's child branched at. `parent_of` returns a level's own
+/// ancestor and its ancestor LSN. The default behavior refuses a chain longer than one.
+fn detach_chain<T>(
+    first: (T, Lsn),
+    parent_of: impl Fn(&T) -> Option<(T, Lsn)>,
+    behavior: DetachBehavior,
+) -> Result<Vec<(T, Lsn)>, Error> {
+    let mut chain = vec![first];
+    while let Some(next) = parent_of(&chain.last().expect("never empty").0) {
+        if let DetachBehavior::NoAncestorAndReparent = behavior {
+            // non-technical requirement; we could flatten N ancestors just as easily but we chose
+            // not to, at least initially
+            return Err(Error::TooManyAncestors);
+        }
+        chain.push(next);
+    }
+    Ok(chain)
+}
+
+/// Maps a failed wait for an ancestor's WAL: cancellation is a shutdown, anything else a
+/// retryable timeout.
+fn ancestor_wait_error(e: WaitLsnError, ancestor: TimelineId, lsn: Lsn) -> Error {
+    if e.is_cancel() {
+        Error::ShuttingDown
+    } else {
+        Error::AncestorLsnTimeout { ancestor, lsn }
+    }
+}
+
+/// Layer file names carry no timeline id, so two levels could yield the same name.
+fn check_layer_name_unique(seen: &mut HashSet<String>, name: &str) -> Result<(), Error> {
+    if seen.insert(name.to_owned()) {
+        Ok(())
+    } else {
+        Err(Error::LayerNameCollision {
+            layer: name.to_owned(),
+        })
+    }
+}
+
+/// The name [`copy_lsn_prefix`] gives the rewritten prefix of `layer` ending at `end_lsn`.
+fn rewritten_layer_name(layer: &Layer, end_lsn: Lsn) -> String {
+    let desc = layer.layer_desc();
+    LayerName::Delta(DeltaLayerName {
+        key_range: desc.key_range.clone(),
+        lsn_range: desc.lsn_range.start..end_lsn,
+    })
+    .to_string()
+}
+
+/// Freezes and flushes an ancestor's open layer: copying a delta prefix is unsupported for
+/// `InMemoryLayer`, so the layers up to the cut must be on disk.
+async fn freeze_and_flush_ancestor(ancestor: &Arc<Timeline>) -> Result<(), Error> {
+    let span = tracing::info_span!("freeze_and_flush", ancestor_timeline_id=%ancestor.timeline_id);
+    async {
+        let started_at = std::time::Instant::now();
+        let freeze_and_flush = ancestor.freeze_and_flush0();
+        let mut freeze_and_flush = std::pin::pin!(freeze_and_flush);
+
+        let res =
+            tokio::time::timeout(std::time::Duration::from_secs(1), &mut freeze_and_flush).await;
+
+        let res = match res {
+            Ok(res) => res,
+            Err(_elapsed) => {
+                tracing::info!("freezing and flushing ancestor is still ongoing");
+                freeze_and_flush.await
+            }
+        };
+
+        res.map_err(|e| {
+            use FlushLayerError::*;
+            match e {
+                Cancelled | NotRunning(_) => {
+                    // FIXME(#6424): technically statically unreachable right now, given how we never
+                    // drop the sender
+                    Error::ShuttingDown
+                }
+                CreateImageLayersError(_) | Other(_) => Error::Prepare(e.into()),
+            }
+        })?;
+
+        // we do not need to wait for uploads to complete but we do need `struct Layer`,
+        // copying delta prefix is unsupported currently for `InMemoryLayer`.
+        tracing::info!(
+            elapsed_ms = started_at.elapsed().as_millis(),
+            "froze and flushed the ancestor"
+        );
+        Ok::<_, Error>(())
+    }
+    .instrument(span)
+    .await
 }
 
 async fn start_new_attempt(
@@ -977,7 +1081,8 @@ pub(super) async fn detach_and_reparent(
     tenant: &TenantShard,
     prepared: PreparedTimelineDetach,
     ancestor_timeline_id: TimelineId,
-    ancestor_lsn: Lsn,
+    // the attempt's LSN; no longer checked against the chain, whose levels may differ
+    _ancestor_lsn: Lsn,
     behavior: DetachBehavior,
     _ctx: &RequestContext,
 ) -> Result<DetachingAndReparenting, Error> {
@@ -1008,14 +1113,11 @@ pub(super) async fn detach_and_reparent(
 
     let ancestor_to_detach = match detached.ancestor_timeline.as_ref() {
         Some(mut ancestor) => {
+            // multi-level detach: the levels may have been branched at different LSNs, all of
+            // them were copied in `prepare`
             while ancestor.timeline_id != ancestor_timeline_id {
                 match ancestor.ancestor_timeline.as_ref() {
                     Some(found) => {
-                        if ancestor_lsn != ancestor.ancestor_lsn {
-                            return Err(Error::DetachReparent(anyhow::anyhow!(
-                                "cannot find the ancestor timeline to detach from: wrong ancestor lsn"
-                            )));
-                        }
                         ancestor = found;
                     }
                     None => {
@@ -1338,4 +1440,115 @@ async fn fsync_timeline_dir(timeline: &Timeline, ctx: &RequestContext) {
         .sync_all()
         .await
         .fatal_err("VirtualFile::sync_all timeline dir");
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use pageserver_api::models::TimelineState;
+
+    use super::*;
+
+    /// `child -> (ancestor, ancestor_lsn)` for a toy timeline tree.
+    fn tree(
+        edges: &[(&'static str, &'static str, u64)],
+    ) -> HashMap<&'static str, (&'static str, Lsn)> {
+        edges
+            .iter()
+            .map(|(child, ancestor, lsn)| (*child, (*ancestor, Lsn(*lsn))))
+            .collect()
+    }
+
+    fn chain(
+        tree: &HashMap<&'static str, (&'static str, Lsn)>,
+        detached: &'static str,
+        behavior: DetachBehavior,
+    ) -> Result<Vec<(&'static str, Lsn)>, Error> {
+        detach_chain(tree[detached], |tl| tree.get(tl).copied(), behavior)
+    }
+
+    #[test]
+    fn detach_chain_single_level() {
+        let tree = tree(&[("child", "root", 10)]);
+        for behavior in [
+            DetachBehavior::NoAncestorAndReparent,
+            DetachBehavior::MultiLevelAndNoReparent,
+        ] {
+            let levels = chain(&tree, "child", behavior).unwrap();
+            assert_eq!(levels, vec![("root", Lsn(10))], "{behavior:?}");
+        }
+    }
+
+    #[test]
+    fn detach_chain_multi_level_cuts() {
+        let tree = tree(&[
+            ("child", "parent", 30),
+            ("parent", "grandparent", 20),
+            ("grandparent", "root", 20),
+        ]);
+        let levels = chain(&tree, "child", DetachBehavior::MultiLevelAndNoReparent).unwrap();
+        assert_eq!(
+            levels,
+            vec![
+                ("parent", Lsn(30)),
+                ("grandparent", Lsn(20)),
+                ("root", Lsn(20)),
+            ]
+        );
+    }
+
+    #[test]
+    fn detach_chain_default_behavior_refuses_depth_two() {
+        let tree = tree(&[("child", "parent", 30), ("parent", "root", 20)]);
+        let err = chain(&tree, "child", DetachBehavior::NoAncestorAndReparent).unwrap_err();
+        assert!(matches!(err, Error::TooManyAncestors), "{err:?}");
+    }
+
+    #[test]
+    fn layer_name_collision_detected() {
+        let mut seen = HashSet::new();
+        check_layer_name_unique(&mut seen, "a").unwrap();
+        check_layer_name_unique(&mut seen, "b").unwrap();
+        let err = check_layer_name_unique(&mut seen, "a").unwrap_err();
+        assert!(
+            matches!(&err, Error::LayerNameCollision { layer } if layer == "a"),
+            "{err:?}"
+        );
+        assert!(matches!(
+            ApiError::from(err),
+            ApiError::InternalServerError(_)
+        ));
+    }
+
+    #[test]
+    fn ancestor_lsn_timeout_maps_to_503() {
+        let ancestor = TimelineId::generate();
+        for e in [
+            WaitLsnError::Timeout("timed out".to_string()),
+            WaitLsnError::BadState(TimelineState::Loading),
+        ] {
+            let err = ancestor_wait_error(e, ancestor, Lsn(42));
+            assert!(
+                matches!(err, Error::AncestorLsnTimeout { ancestor: a, lsn } if a == ancestor && lsn == Lsn(42)),
+                "{err:?}"
+            );
+            assert!(
+                matches!(ApiError::from(err), ApiError::ResourceUnavailable(_)),
+                "must be a retryable 503"
+            );
+        }
+    }
+
+    #[test]
+    fn wait_lsn_cancel_maps_to_shutting_down() {
+        let ancestor = TimelineId::generate();
+        for e in [
+            WaitLsnError::Shutdown,
+            WaitLsnError::BadState(TimelineState::Stopping),
+        ] {
+            let err = ancestor_wait_error(e, ancestor, Lsn(42));
+            assert!(matches!(err, Error::ShuttingDown), "{err:?}");
+        }
+    }
 }
