@@ -132,13 +132,15 @@ typedef struct
 	bool		created;
 
 	/*
-	 * Created while a DROP of the same name was pending in this top-level
-	 * transaction (in this subtransaction or an enclosing one): the new role
-	 * replaces an old one. Sent as "recreated": true (with "touched": the old
-	 * role's members lost their membership), so the receiver checks the old
-	 * role as it checks a DROP. Implies created. A later ALTER keeps it, and
-	 * so does a rename: the receiver applies renames first, so the row it
-	 * then checks is the dropped role's, moved to the new name.
+	 * Created after this top-level transaction dropped a role of the same
+	 * name (in this subtransaction, an enclosing one or a released one; see
+	 * DdlHashTable.dropped_roles): the new role replaces an old one. Sent as
+	 * "recreated": true (with "touched": the old role's members lost their
+	 * membership), so the receiver checks the old role's data keys as it
+	 * checks a DROP. Implies created. A later ALTER keeps it, and so does a
+	 * rename: the receiver applies renames first and moves the data keys
+	 * with every rename it accepts, so under the new name it sees the
+	 * dropped role's keys.
 	 */
 	bool		recreated;
 	OpType		type;
@@ -155,6 +157,13 @@ typedef struct DdlHashTable
 	size_t		subtrans_level;
 	HTAB	   *db_table;
 	HTAB	   *role_table;
+
+	/*
+	 * The role names this (sub)transaction dropped. Kept apart from
+	 * role_table, whose entry for a name a later rename can overwrite or move
+	 * away: a CREATE of a name in any of these sets is a recreation.
+	 */
+	HTAB	   *dropped_roles;
 } DdlHashTable;
 
 static DdlHashTable RootTable;
@@ -507,6 +516,7 @@ InitCurrentDdlTableIfNeeded()
 		new_table->subtrans_level = SubtransLevel;
 		new_table->role_table = NULL;
 		new_table->db_table = NULL;
+		new_table->dropped_roles = NULL;
 		CurrentDdlTable = new_table;
 	}
 }
@@ -546,6 +556,25 @@ InitRoleTableIfNeeded()
 												  4,
 												  &role_ctl,
 												  HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
+	}
+}
+
+static void
+InitDroppedRolesIfNeeded()
+{
+	InitCurrentDdlTableIfNeeded();
+	if (!CurrentDdlTable->dropped_roles)
+	{
+		HASHCTL		dropped_ctl = {};
+
+		dropped_ctl.keysize = NAMEDATALEN;
+		dropped_ctl.entrysize = NAMEDATALEN;
+		dropped_ctl.hcxt = CurTransactionContext;
+		CurrentDdlTable->dropped_roles = hash_create(
+													 "Roles Dropped",
+													 4,
+													 &dropped_ctl,
+													 HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
 	}
 }
 
@@ -776,6 +805,19 @@ MergeTable()
 		pfree(found_olds);
 		hash_destroy(old_table->role_table);
 	}
+
+	/* The dropped names join the parent's */
+	if (old_table->dropped_roles)
+	{
+		char	   *name;
+		HASH_SEQ_STATUS status;
+
+		InitDroppedRolesIfNeeded();
+		hash_seq_init(&status, old_table->dropped_roles);
+		while ((name = hash_seq_search(&status)) != NULL)
+			hash_search(CurrentDdlTable->dropped_roles, name, HASH_ENTER, NULL);
+		hash_destroy(old_table->dropped_roles);
+	}
 }
 
 static void
@@ -821,6 +863,7 @@ NeonXactCallback(XactEvent event, void *arg)
 	}
 	RootTable.role_table = NULL;
 	RootTable.db_table = NULL;
+	RootTable.dropped_roles = NULL;
 	Assert(CurrentDdlTable == &RootTable);
 }
 
@@ -1026,24 +1069,20 @@ SetRoleAttributes(RoleEntry *entry, RoleOptions *opts)
 }
 
 /*
- * The role's pending entry in this subtransaction or, failing that, the
- * nearest enclosing one that has one (NULL when the transaction hasn't touched
- * the name).
+ * True when this top-level transaction dropped a role of this name, in this
+ * subtransaction, an enclosing one or a released one (whatever renames did to
+ * the name's entry since).
  */
-static RoleEntry *
-FindPendingRole(const char *role_name)
+static bool
+RoleDroppedInTransaction(const char *role_name)
 {
 	for (DdlHashTable *table = CurrentDdlTable; table != NULL; table = table->prev_table)
 	{
-		RoleEntry  *entry;
-
-		if (!table->role_table)
-			continue;
-		entry = hash_search(table->role_table, role_name, HASH_FIND, NULL);
-		if (entry)
-			return entry;
+		if (table->dropped_roles &&
+			hash_search(table->dropped_roles, role_name, HASH_FIND, NULL) != NULL)
+			return true;
 	}
-	return NULL;
+	return false;
 }
 
 static void
@@ -1051,7 +1090,6 @@ HandleCreateRole(CreateRoleStmt *stmt)
 {
 	bool		found = false;
 	RoleEntry  *entry;
-	RoleEntry  *pending;
 	RoleOptions opts;
 	bool		recreated;
 
@@ -1059,9 +1097,11 @@ HandleCreateRole(CreateRoleStmt *stmt)
 
 	ParseRoleOptions(stmt->options, &opts);
 
-	/* A DROP of the name is pending: this role replaces the dropped one */
-	pending = FindPendingRole(stmt->role);
-	recreated = pending != NULL && pending->type == Op_Delete;
+	/*
+	 * The transaction dropped a role of this name: this one replaces it. A
+	 * name freed only by a rename isn't a recreation.
+	 */
+	recreated = RoleDroppedInTransaction(stmt->role);
 
 	entry = hash_search(CurrentDdlTable->role_table,
 						stmt->role,
@@ -1201,6 +1241,7 @@ HandleDropRole(DropRoleStmt *stmt)
 	ListCell   *item;
 
 	InitRoleTableIfNeeded();
+	InitDroppedRolesIfNeeded();
 
 	foreach(item, stmt->roles)
 	{
@@ -1214,6 +1255,7 @@ HandleDropRole(DropRoleStmt *stmt)
 
 		if (!found)
 			InitRoleEntry(entry);
+		hash_search(CurrentDdlTable->dropped_roles, spec->rolename, HASH_ENTER, NULL);
 		entry->type = Op_Delete;
 		entry->password = NULL;
 		entry->password_null = false;
