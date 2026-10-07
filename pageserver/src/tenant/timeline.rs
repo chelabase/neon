@@ -5265,7 +5265,7 @@ impl Timeline {
                     .extend(metadata_partition.into_dense().parts);
             }
 
-            let mut layers_to_upload = Vec::new();
+            let layers_to_upload = Vec::new();
             let (generated_image_layers, is_complete) = self
                 .create_image_layers(
                     &partitions,
@@ -5282,7 +5282,9 @@ impl Timeline {
                 matches!(is_complete, LastImageLayerCreationStatus::Complete),
                 "init image generation mode must fully cover the keyspace"
             );
-            layers_to_upload.extend(generated_image_layers);
+            // `create_image_layers` already scheduled their uploads; the metadata update below
+            // uploads the index.
+            drop(generated_image_layers);
 
             (layers_to_upload, None)
         } else {
@@ -6154,13 +6156,24 @@ impl Timeline {
 
         let mut guard = self.layers.write(LayerManagerLockHolder::Compaction).await;
 
-        // FIXME: we could add the images to be uploaded *before* returning from here, but right
-        // now they are being scheduled outside of write lock; current way is inconsistent with
-        // compaction lock order.
+        // Schedule the uploads under the same write lock that makes the layers visible, as every
+        // other layer-map update does: whoever sees a layer in the map (a detach copying layers
+        // remote to remote after an upload barrier) can rely on its upload being queued. Only
+        // the layer uploads: the callers schedule the index upload (the initial flush does it
+        // with its metadata update).
         guard
             .open_mut()?
             .track_new_image_layers(&image_layers, &self.metrics);
+        for layer in &image_layers {
+            self.remote_client
+                .schedule_layer_file_upload(layer.clone())
+                .map_err(|_| CreateImageLayersError::Cancelled)?;
+        }
         drop_layer_manager_wlock(guard);
+        // Holds a compaction right after its new image layers became visible in the layer map.
+        if !image_layers.is_empty() {
+            pausable_failpoint!("create-image-layers-after-layer-map-update-pausable");
+        }
         let duration = timer.stop_and_record();
 
         // Creating image layers may have caused some previously visible layers to be covered
@@ -6607,6 +6620,12 @@ impl Timeline {
             .open_mut()?
             .finish_compact_l0(&remove_layers, &insert_layers, &self.metrics);
 
+        // Under the lock that made them visible (see `create_image_layers`); the compaction
+        // update below uploads the index.
+        for layer in new_images {
+            self.remote_client
+                .schedule_layer_file_upload(layer.clone())?;
+        }
         self.remote_client
             .schedule_compaction_update(&remove_layers, new_deltas)?;
 
@@ -6639,14 +6658,11 @@ impl Timeline {
         Ok(())
     }
 
-    /// Schedules the uploads of the given image layers
-    fn upload_new_image_layers(
+    /// Schedules the index upload after new image layers, whose layer uploads
+    /// `create_image_layers` already scheduled under the layer-map lock.
+    fn upload_index_for_new_image_layers(
         self: &Arc<Self>,
-        new_images: impl IntoIterator<Item = ResidentLayer>,
     ) -> Result<(), super::upload_queue::NotInitialized> {
-        for layer in new_images {
-            self.remote_client.schedule_layer_file_upload(layer)?;
-        }
         // should any new image layer been created, not uploading index_part will
         // result in a mismatch between remote_physical_size and layermap calculated
         // size, which will fail some tests, but should not be an issue otherwise.

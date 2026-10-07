@@ -1043,11 +1043,12 @@ impl ChunkProcessingJob {
             }
         }
 
-        crate::tenant::timeline::drop_layer_manager_wlock(guard);
-
+        // Under the lock that made the layer visible (see `Timeline::create_image_layers`).
         timeline
             .remote_client
             .schedule_layer_file_upload(resident_layer)?;
+
+        crate::tenant::timeline::drop_layer_manager_wlock(guard);
 
         Ok(())
     }

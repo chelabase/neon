@@ -482,14 +482,12 @@ pub(super) async fn prepare(
         rest_of_historic.extend(rest);
     }
 
-    // Layers in `rest_of_historic` are copied remote to remote, so each should already be in
+    // Layers in `rest_of_historic` are copied remote to remote, so each must already be in
     // remote storage. The HTTP handler drained the upload queues before `prepare`, but layers
-    // flushed since (during the catch-up waits, or by the flushes above) may still be uploading:
-    // wait for every level's queued uploads before copying. This covers what is scheduled by
-    // now, so selected layers are normally uploaded. A just-compacted image layer can still be
-    // in flight: compaction adds it to the layer map and schedules its upload only after
-    // releasing the layer lock (the FIXME in `create_image_layers`), so the barrier can come
-    // first; its remote copy then retries (`copy_timeline_layer`'s backoff) until it lands.
+    // flushed or compacted since (during the catch-up waits, or by the flushes above) may still
+    // be uploading: wait for every level's queued uploads before copying. Every layer-map
+    // update schedules its uploads under the same write lock that makes the layers visible,
+    // so each layer selected above already has its upload queued, and the barrier covers it.
     // Like the handler's own drain, the wait has no timeout: a stuck upload queue (remote
     // storage down) holds the detach until shutdown or cancellation.
     for (level, _) in &chain {

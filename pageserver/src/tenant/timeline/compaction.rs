@@ -1404,7 +1404,9 @@ impl Timeline {
                 self.last_image_layer_creation_status
                     .store(Arc::new(outcome.clone()));
 
-                self.upload_new_image_layers(image_layers)?;
+                // `create_image_layers` scheduled the layer uploads under the layer-map lock.
+                drop(image_layers);
+                self.upload_index_for_new_image_layers()?;
                 if let LastImageLayerCreationStatus::Incomplete { .. } = outcome {
                     // Yield and do not do any other kind of compaction.
                     info!(
@@ -4099,6 +4101,28 @@ impl Timeline {
             )));
         }
 
+        // If a layer gets rewritten throughout gc-compaction, we need to keep that layer only in `compact_to` instead
+        // of `compact_from`.
+        let compact_from = {
+            let mut compact_from = Vec::new();
+            let mut compact_to_set = HashMap::new();
+            for layer in &compact_to {
+                compact_to_set.insert(layer.layer_desc().key(), layer);
+            }
+            for layer in &layer_selection {
+                if let Some(to) = compact_to_set.get(&layer.layer_desc().key()) {
+                    tracing::info!(
+                        "skipping delete {} because found same layer key at different generation {}",
+                        layer,
+                        to
+                    );
+                } else {
+                    compact_from.push(layer.clone());
+                }
+            }
+            compact_from
+        };
+
         // Between the sanity check and this compaction update, there could be new layers being flushed, but it should be fine because we only
         // operate on L1 layers.
         {
@@ -4144,39 +4168,21 @@ impl Timeline {
                 .open_mut()?
                 .finish_gc_compaction(&layer_selection, &compact_to, &self.metrics);
             drop(update_guard); // Allow new reads to start ONLY after we finished updating the layer map.
-        };
 
-        // Schedule an index-only upload to update the `latest_gc_cutoff` in the index_part.json.
-        // Otherwise, after restart, the index_part only contains the old `latest_gc_cutoff` and
-        // find_gc_cutoffs will try accessing things below the cutoff. TODO: ideally, this should
-        // be batched into `schedule_compaction_update`.
-        let disk_consistent_lsn = self.disk_consistent_lsn.load();
-        self.schedule_uploads(disk_consistent_lsn, None)
-            .context("failed to schedule uploads")
-            .map_err(CompactionError::Other)?;
-        // If a layer gets rewritten throughout gc-compaction, we need to keep that layer only in `compact_to` instead
-        // of `compact_from`.
-        let compact_from = {
-            let mut compact_from = Vec::new();
-            let mut compact_to_set = HashMap::new();
-            for layer in &compact_to {
-                compact_to_set.insert(layer.layer_desc().key(), layer);
-            }
-            for layer in &layer_selection {
-                if let Some(to) = compact_to_set.get(&layer.layer_desc().key()) {
-                    tracing::info!(
-                        "skipping delete {} because found same layer key at different generation {}",
-                        layer,
-                        to
-                    );
-                } else {
-                    compact_from.push(layer.clone());
-                }
-            }
-            compact_from
+            // Schedule the uploads while still holding the layer-map lock that made the new
+            // layers visible (see `create_image_layers`).
+            //
+            // First an index-only upload to update the `latest_gc_cutoff` in the index_part.json.
+            // Otherwise, after restart, the index_part only contains the old `latest_gc_cutoff` and
+            // find_gc_cutoffs will try accessing things below the cutoff. TODO: ideally, this should
+            // be batched into `schedule_compaction_update`.
+            let disk_consistent_lsn = self.disk_consistent_lsn.load();
+            self.schedule_uploads(disk_consistent_lsn, None)
+                .context("failed to schedule uploads")
+                .map_err(CompactionError::Other)?;
+            self.remote_client
+                .schedule_compaction_update(&compact_from, &compact_to)?;
         };
-        self.remote_client
-            .schedule_compaction_update(&compact_from, &compact_to)?;
 
         drop(gc_lock);
 
@@ -4221,9 +4227,8 @@ impl TimelineAdaptor {
             .finish_compact_batch(&self.new_deltas, &self.new_images, &layers_to_delete)
             .await?;
 
-        self.timeline
-            .upload_new_image_layers(std::mem::take(&mut self.new_images))?;
-
+        // `finish_compact_batch` scheduled the image uploads and the index upload.
+        self.new_images.clear();
         self.new_deltas.clear();
         self.layers_to_delete.clear();
         Ok(())

@@ -2320,6 +2320,84 @@ def test_multi_level_detach_waits_for_ancestor_uploads(neon_env_builder: NeonEnv
     assert _values(env, "child") == ["A", "C", "C2"]
 
 
+def test_multi_level_detach_copies_just_compacted_image_layer(neon_env_builder: NeonEnvBuilder):
+    """
+    A compaction on the parent is held right after its new image layer (below the child's branch
+    point) entered the layer map. The image's upload must already be scheduled by then, so the
+    detach copies it by reference from remote storage without a failed copy, while the
+    compaction is still held.
+    """
+    env = neon_env_builder.init_start()
+    env.pageserver.allowed_errors.extend(SHUTDOWN_ALLOWED_ERRORS)
+    # The held compaction, cancelled by the detach's tenant reset.
+    env.pageserver.allowed_errors.append(
+        ".*/compact.*Error processing HTTP request: InternalServerError\\(The timeline or pageserver is shutting down.*"
+    )
+    ps = env.pageserver
+    tenant = env.initial_tenant
+    client = ps.http_client()
+    no_retries = client.without_status_retrying()
+    copy_failed = ".*copy timeline layer failed.*"
+    hold = "create-image-layers-after-layer-map-update-pausable"
+
+    with env.endpoints.create_start("main", tenant_id=tenant) as ep:
+        ep.safe_psql("CREATE TABLE t (v text)")
+        ep.safe_psql("INSERT INTO t VALUES ('A')")
+        parent_at = wait_for_last_flush_lsn(env, ep, tenant, env.initial_timeline)
+        ep.safe_psql("INSERT INTO t VALUES ('B')")
+        wait_for_last_flush_lsn(env, ep, tenant, env.initial_timeline)
+        client.timeline_checkpoint(tenant, env.initial_timeline, wait_until_uploaded=True)
+
+    parent = env.create_branch("parent", ancestor_branch_name="main", ancestor_start_lsn=parent_at)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        try:
+            with env.endpoints.create_start("parent", tenant_id=tenant) as ep:
+                ep.safe_psql("INSERT INTO t VALUES ('C')")
+                wait_for_last_flush_lsn(env, ep, tenant, parent)
+                client.timeline_checkpoint(tenant, parent, compact=False, wait_until_uploaded=True)
+                client.configure_failpoints((hold, "pause"))
+                compaction = pool.submit(
+                    client.timeline_compact,
+                    tenant,
+                    parent,
+                    force_repartition=True,
+                    force_image_layer_creation=True,
+                )
+                wait_until(lambda: ps.assert_log_contains(f"at failpoint {hold}"))
+                ep.safe_psql("INSERT INTO t VALUES ('C2')")
+                child_at = wait_for_last_flush_lsn(env, ep, tenant, parent)
+                ep.safe_psql("INSERT INTO t VALUES ('D')")
+                wait_for_last_flush_lsn(env, ep, tenant, parent)
+
+            images = [
+                layer
+                for layer in client.layer_map_info(tenant, parent).historic_layers
+                if layer.kind == "Image" and Lsn(layer.lsn_start) <= child_at
+            ]
+            assert len(images) > 0, "the held compaction created no image layer below child_at"
+
+            child = env.create_branch(
+                "child", ancestor_branch_name="parent", ancestor_start_lsn=child_at
+            )
+            detach = pool.submit(
+                no_retries.detach_ancestor, env.initial_tenant, child, detach_behavior="v2"
+            )
+            # Completes while the compaction is still held.
+            assert detach.result(timeout=120) == set()
+            assert not compaction.done()
+        finally:
+            client.configure_failpoints((hold, "off"))
+        # The detach's tenant reset cancels the held compaction.
+        with pytest.raises(PageserverApiException, match="shutting down"):
+            compaction.result(timeout=60)
+
+    assert ps.log_contains(copy_failed) is None
+    assert _ancestor(env, child) is None
+    assert {layer.layer_file_name for layer in images} <= _index_layer_names(env, child)
+    assert _values(env, "child") == ["A", "C", "C2"]
+
+
 # TODO:
 # - branch near existing L1 boundary, image layers?
 # - investigate: why are layers started at uneven lsn? not just after branching, but in general.
