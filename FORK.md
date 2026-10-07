@@ -48,7 +48,7 @@ GitHub CI is manual-only, as standing policy: `pr.yml` is `workflow_dispatch` on
 
 Neon's pytest regression suite is opt-in and required for no PR: `ci-local.sh --regress [-k <expr>] [-n <workers>]` runs it for a targeted check, for example to debug one test. When an image changes, chelabase's own e2e covers the parts we use. The regression run deselects `test_runner/known_failures.txt` (fails on GitHub's runners too) and `test_runner/known_failures.local.txt` (fails only in the local run); both use the `<nodeid>  # <reason>` format and may only shrink.
 
-Quick mode, for patch work: `ci-local.sh --only build,rust-tests,regress` runs just the listed steps (in pipeline order, lint skipped; `regress` implies `--regress`), and `--test-filter <nextest expr>` (needs `rust-tests` in `--only`) narrows `cargo nextest run` with `-E`, ANDed with the quarantine filter. `CHELA_NEON_VOLUME_SUFFIX=<suffix>` (`^[a-z0-9-]+$`) switches to the volumes `chela-neon-cargo-<suffix>` and `chela-neon-target-<suffix>`, so parallel clones keep separate build state and stamps.
+Quick mode, for patch work: `ci-local.sh --only build,rust-tests,regress` runs just the listed steps (in pipeline order, lint skipped; the last `--only` decides, and `regress` in it implies `--regress`), and `--test-filter <nextest expr>` (needs `rust-tests` in `--only`) narrows `cargo nextest run` with `-E`, ANDed with the quarantine filter (no newlines; a filtered run skips `cargo test --doc`, which `-E` can't narrow). `CHELA_NEON_VOLUME_SUFFIX=<suffix>` (`^[a-z0-9-]+$`) switches to the volumes `chela-neon-cargo-<suffix>` and `chela-neon-target-<suffix>`, so parallel clones keep separate build state and stamps.
 
 ## Publishing dev images
 

@@ -161,10 +161,42 @@ for bad in "--only lint" "--only" "--only build,foo" "--only ," "--test-filter x
     fi
 done
 expect "--test-filter with rust-tests" "rust-tests regress=0" "$(steps --only rust-tests --test-filter 'test(foo)')"
-nx="$(TEST_FILTER='test(foo)' nextest_expr)"
-expect "--test-filter reaches the nextest expression" \
-    "(not (package(remote_storage) and binary(test_real_gcs))) and (test(foo))" "$nx"
-expect "nextest expression without a filter" "not (package(remote_storage) and binary(test_real_gcs))" "$(TEST_FILTER='' nextest_expr)"
+expect "--only regress then --only build: the last wins completely" "build regress=0" "$(steps --only regress --only build)"
+expect "--regress then --only build: regress does not run" "build regress=0" "$(steps --regress --only build)"
+expect "--only build then --only regress" "regress regress=1" "$(steps --only build --only regress)"
+if steps --only rust-tests --test-filter $'a\nb' >/dev/null 2>&1; then
+    echo "FAIL: a --test-filter with a newline must be rejected"
+    failures=$((failures + 1))
+else
+    echo "ok: a --test-filter with a newline is rejected"
+fi
+
+# The real nextest argument list (one per line), as the rust-tests step runs it.
+nextest_line() {
+    (
+        BUILD_TYPE=release
+        inside_env
+        TEST_FILTER="$1"
+        nextest_args | paste -sd'|' -
+    )
+}
+base_expr='not (package(remote_storage) and binary(test_real_gcs))'
+common='run|--locked|--features|testing|--release|--no-fail-fast|-E'
+expect "nextest args with a filter" "$common|($base_expr) and (test(foo))" "$(nextest_line 'test(foo)')"
+expect "nextest args without a filter" "$common|$base_expr" "$(nextest_line '')"
+# nextest's -E filter can't narrow `cargo test --doc`, so a filtered run skips it.
+if (TEST_FILTER=x doc_tests_enabled); then
+    echo "FAIL: doc tests must be skipped with a --test-filter"
+    failures=$((failures + 1))
+else
+    echo "ok: doc tests are skipped with a --test-filter"
+fi
+if (TEST_FILTER='' doc_tests_enabled); then
+    echo "ok: doc tests run without a --test-filter"
+else
+    echo "FAIL: doc tests must run without a --test-filter"
+    failures=$((failures + 1))
+fi
 if [[ "$(TEST_FILTER=x docker_args /r v17 release rust-tests | paste -sd' ' -)" == *"TEST_FILTER=x"* ]]; then
     echo "ok: docker args pass TEST_FILTER"
 else

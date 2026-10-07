@@ -18,7 +18,8 @@
 #   --only STEPS  comma list of build, rust-tests, regress: run just those, in
 #                 pipeline order, skipping lint (regress implies --regress)
 #   --test-filter EXPR  cargo nextest -E filter, ANDed with the quarantine
-#                 (needs --only with rust-tests)
+#                 (needs --only with rust-tests; no newlines; skips the doc tests,
+#                 which nextest can't narrow)
 #
 # Env CHELA_NEON_VOLUME_SUFFIX=<suffix> (^[a-z0-9-]+$) uses the volumes
 # chela-neon-cargo-<suffix> and chela-neon-target-<suffix>, so parallel clones
@@ -64,7 +65,7 @@ parse_args() {
     WORKERS=6
     ONLY_STEPS=()
     TEST_FILTER=""
-    local k_given=0 n_given=0
+    local k_given=0 n_given=0 s
     while (($# > 0)); do
         case "$1" in
         --pg)
@@ -102,14 +103,13 @@ parse_args() {
             ;;
         --only)
             [[ $# -ge 2 ]] || { echo "ci-local.sh: --only needs a value" >&2; return 1; }
-            local s
             ONLY_STEPS=()
             IFS=, read -r -a ONLY_STEPS <<<"$2"
             ((${#ONLY_STEPS[@]} > 0)) || { echo "ci-local.sh: --only needs at least one step" >&2; return 1; }
             for s in "${ONLY_STEPS[@]}"; do
                 case "$s" in
                 build | rust-tests) ;;
-                regress) REGRESS=1 ;;
+                regress) ;;
                 *) echo "ci-local.sh: --only steps are build, rust-tests, regress; not '$s'" >&2; return 1 ;;
                 esac
             done
@@ -118,6 +118,7 @@ parse_args() {
         --test-filter)
             [[ $# -ge 2 ]] || { echo "ci-local.sh: --test-filter needs a value" >&2; return 1; }
             [[ -n "$2" ]] || { echo "ci-local.sh: --test-filter needs a non-empty expression" >&2; return 1; }
+            [[ "$2" != *$'\n'* ]] || { echo "ci-local.sh: --test-filter must not contain a newline" >&2; return 1; }
             TEST_FILTER="$2"
             shift 2
             ;;
@@ -131,12 +132,17 @@ parse_args() {
             ;;
         esac
     done
+    if ((${#ONLY_STEPS[@]} > 0)); then
+        # --only decides whether regress runs, whatever --regress or an earlier --only said.
+        REGRESS=0
+        for s in "${ONLY_STEPS[@]}"; do [[ "$s" == regress ]] && REGRESS=1; done
+    fi
     if ((REGRESS == 0 && (k_given || n_given))); then
         echo "ci-local.sh: -k and -n only apply with --regress" >&2
         return 1
     fi
     if [[ -n "$TEST_FILTER" ]]; then
-        local s found=0
+        local found=0
         for s in "${ONLY_STEPS[@]}"; do [[ "$s" == rust-tests ]] && found=1; done
         ((found)) || { echo "ci-local.sh: --test-filter needs --only with rust-tests" >&2; return 1; }
     fi
@@ -181,6 +187,21 @@ nextest_expr() {
     else
         echo "$base"
     fi
+}
+
+# nextest_args: the arguments of the rust-tests step's `cargo nextest` (one per
+# line). Needs inside_env's CARGO_FLAGS and RELEASE_FLAG.
+nextest_args() {
+    local flags=()
+    # shellcheck disable=SC2086
+    flags=($CARGO_FLAGS $RELEASE_FLAG)
+    printf '%s\n' run "${flags[@]}" --no-fail-fast -E "$(nextest_expr)"
+}
+
+# doc_tests_enabled: nextest's -E can't narrow `cargo test --doc`, so a
+# --test-filter run skips the doc tests (a filtered run is for quick iteration).
+doc_tests_enabled() {
+    [[ -z "${TEST_FILTER:-}" ]]
 }
 
 # image_name <repo root>: computed exactly as pr.yml and build-tools.yml do.
@@ -331,14 +352,18 @@ step_rust_tests() {
     start=$(date +%s)
     export NEXTEST_RETRIES=3
     export LD_LIBRARY_PATH="$PWD/pg_install/$PG_VERSION/lib"
-    # shellcheck disable=SC2086
-    mold -run cargo test --doc $CARGO_FLAGS $RELEASE_FLAG
+    if doc_tests_enabled; then
+        # shellcheck disable=SC2086
+        mold -run cargo test --doc $CARGO_FLAGS $RELEASE_FLAG
+    else
+        echo "doc tests skipped: --test-filter doesn't narrow them"
+    fi
     # Quarantined Rust tests, each with its reason:
     # - binary(test_real_gcs): needs a real GCS bucket (GCS_TEST_BUCKET); unlike
     #   the S3 and Azure suites it doesn't skip itself when unconfigured.
-    # shellcheck disable=SC2086
-    mold -run cargo nextest run $CARGO_FLAGS $RELEASE_FLAG --no-fail-fast \
-        -E "$(nextest_expr)"
+    local nx_args
+    mapfile -t nx_args < <(nextest_args)
+    mold -run cargo nextest "${nx_args[@]}"
     echo "rust tests took $(($(date +%s) - start))s"
 }
 
