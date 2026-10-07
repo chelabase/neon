@@ -124,6 +124,12 @@ typedef struct
 	 * the receiver resyncs the branch's roles from the catalog.
 	 */
 	bool		touched;
+
+	/*
+	 * Created in this (sub)transaction: when its subtransaction commits, the
+	 * parent's attributes for the name (from before a DROP) are forgotten.
+	 */
+	bool		created;
 	OpType		type;
 } RoleEntry;
 
@@ -215,6 +221,7 @@ InitRoleEntry(RoleEntry *entry)
 	entry->password_null = false;
 	entry->password_set = false;
 	ResetRoleAttributes(entry);
+	entry->created = false;
 	entry->type = Op_Set;
 }
 
@@ -643,9 +650,17 @@ MergeTable()
 			 * OR-ed, and a DROP forgets them.
 			 */
 			if (entry->type == Op_Delete)
+			{
 				ResetRoleAttributes(to_write);
+				to_write->created = false;
+			}
 			else
 			{
+				if (entry->created)
+				{
+					ResetRoleAttributes(to_write);
+					to_write->created = true;
+				}
 				if (entry->login != Login_Unset)
 					to_write->login = entry->login;
 				if (entry->valid_until)
@@ -963,11 +978,22 @@ HandleCreateRole(CreateRoleStmt *stmt)
 						&found);
 	if (!found)
 		InitRoleEntry(entry);
+	/*
+	 * A new role without a password is sent with an explicit null (beside
+	 * its login key): the receiver then drops any copy left under the name
+	 * (DROP and CREATE in one transaction merge into one set) and applies
+	 * its checks for reserved names.
+	 */
 	if (opts.dpass && opts.dpass->arg)
+	{
 		entry->password = MemoryContextStrdup(CurTransactionContext, strVal(opts.dpass->arg));
+		entry->password_null = false;
+	}
 	else
+	{
 		entry->password = NULL;
-	entry->password_null = false;
+		entry->password_null = true;
+	}
 	entry->password_set = true;
 
 	/*
@@ -975,6 +1001,7 @@ HandleCreateRole(CreateRoleStmt *stmt)
 	 * LOGIN (CREATE USER defaults to LOGIN, CREATE ROLE and GROUP to NOLOGIN).
 	 */
 	ResetRoleAttributes(entry);
+	entry->created = true;
 	entry->login = stmt->stmt_type == ROLESTMT_USER ? Login_True : Login_False;
 	SetRoleAttributes(entry, &opts);
 	entry->type = Op_Set;
@@ -1054,6 +1081,7 @@ HandleRoleRename(RenameStmt *stmt)
 		entry_for_new_name->login = entry->login;
 		entry_for_new_name->valid_until = entry->valid_until;
 		entry_for_new_name->touched = entry->touched;
+		entry_for_new_name->created = entry->created;
 		hash_search(
 					CurrentDdlTable->role_table,
 					entry->name,
@@ -1066,6 +1094,7 @@ HandleRoleRename(RenameStmt *stmt)
 		entry_for_new_name->password = NULL;
 		entry_for_new_name->password_null = false;
 		ResetRoleAttributes(entry_for_new_name);
+		entry_for_new_name->created = false;
 	}
 	entry_for_new_name->password_set = true;
 }
@@ -1094,6 +1123,7 @@ HandleDropRole(DropRoleStmt *stmt)
 		entry->password_null = false;
 		entry->password_set = true;
 		ResetRoleAttributes(entry);
+		entry->created = false;
 	}
 }
 

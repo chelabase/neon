@@ -39,9 +39,12 @@ def handle_role(dbs, roles, operation):
             for db, owner in dbs.items():
                 if owner == operation["old_name"]:
                     dbs[db] = operation["name"]
-        if "password" in operation:
+        if operation.get("password") is not None:
             roles[operation["name"]] = operation["password"]
             assert "encrypted_password" in operation
+        elif "password" in operation:
+            # An explicit null (PASSWORD NULL, or a CREATE without a password) drops the copy
+            roles.pop(operation["name"], None)
     elif operation["op"] == "del":
         if "old_name" in operation:
             roles.pop(operation["old_name"])
@@ -358,11 +361,17 @@ def test_alter_role_nologin_forwards_login_false(role_bodies: RoleBodies):
     assert role_bodies.roles_of(["ALTER ROLE app NOLOGIN", "ALTER ROLE app LOGIN"]) == [
         {"op": "set", "name": "app", "login": True}
     ]
-    # CREATE sends the effective value: CREATE ROLE defaults to NOLOGIN, CREATE USER to LOGIN
+    # CREATE sends the effective value: CREATE ROLE defaults to NOLOGIN, CREATE USER to LOGIN.
+    # A CREATE without a password sends an explicit null (the receiver drops any stale copy)
     assert role_bodies.roles_of(
-        ["CREATE ROLE r1", "CREATE USER u1", "CREATE ROLE r2 LOGIN PASSWORD 'p'"]
+        [
+            "CREATE ROLE r1",
+            "CREATE USER u1",
+            "CREATE ROLE r2 LOGIN PASSWORD 'p'",
+            "CREATE ROLE r3 PASSWORD 'p'",
+        ]
     ) == [
-        {"op": "set", "name": "r1", "login": False},
+        {"op": "set", "name": "r1", "password": None, "login": False},
         {
             "op": "set",
             "name": "r2",
@@ -370,7 +379,40 @@ def test_alter_role_nologin_forwards_login_false(role_bodies: RoleBodies):
             "password": "p",
             "encrypted_password": SCRAM,
         },
-        {"op": "set", "name": "u1", "login": True},
+        {
+            "op": "set",
+            "name": "r3",
+            "login": False,
+            "password": "p",
+            "encrypted_password": SCRAM,
+        },
+        {"op": "set", "name": "u1", "password": None, "login": True},
+    ]
+    # CREATE ROLE ... IN ROLE is a membership: touched
+    assert role_bodies.roles_of(["CREATE ROLE r4 IN ROLE grp"]) == [
+        {"op": "set", "name": "r4", "password": None, "login": False, "touched": True}
+    ]
+
+
+def test_drop_then_create_sends_a_new_role(role_bodies: RoleBodies):
+    # One transaction: the DROP and the CREATE merge into one set without the old password
+    assert role_bodies.roles_of(["DROP ROLE app", "CREATE USER app"]) == [
+        {"op": "set", "name": "app", "password": None, "login": True}
+    ]
+    # A CREATE in a released savepoint forgets what the parent recorded before the DROP
+    role_bodies.setup("ALTER ROLE app PASSWORD 'x'")
+    assert role_bodies.roles_of(
+        [
+            "ALTER ROLE app VALID UNTIL 'infinity' CREATEDB",
+            "SAVEPOINT s",
+            "DROP ROLE app",
+            "CREATE ROLE app",
+            "RELEASE SAVEPOINT s",
+        ]
+    ) == [{"op": "set", "name": "app", "password": None, "login": False}]
+    # A created role renamed in the same transaction: a rename plus the explicit null
+    assert role_bodies.roles_of(["CREATE ROLE a", "ALTER ROLE a RENAME TO b"]) == [
+        {"op": "set", "name": "b", "old_name": "a", "password": None, "login": False}
     ]
 
 
@@ -391,6 +433,7 @@ def test_valid_until_forwarded(role_bodies: RoleBodies):
         "NOINHERIT",
         "REPLICATION",
         "BYPASSRLS",
+        "SUPERUSER",
         "CONNECTION LIMIT 5",
     ],
 )
@@ -424,6 +467,16 @@ def test_savepoint_rollback_drops_attributes(role_bodies: RoleBodies):
             "ROLLBACK TO SAVEPOINT s",
         ]
     ) == [{"op": "set", "name": "app", "password": "p2", "encrypted_password": SCRAM}]
+    # A REVOKE rolled back with its savepoint isn't sent either
+    role_bodies.setup("GRANT grp TO app")
+    assert role_bodies.roles_of(
+        [
+            "ALTER ROLE app PASSWORD 'p4'",
+            "SAVEPOINT s",
+            "REVOKE grp FROM app",
+            "ROLLBACK TO SAVEPOINT s",
+        ]
+    ) == [{"op": "set", "name": "app", "password": "p4", "encrypted_password": SCRAM}]
     # Released: the subtransaction's attributes merge in and keep the parent's password
     assert role_bodies.roles_of(
         [
