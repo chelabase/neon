@@ -93,9 +93,7 @@ def test_multixact_ingest(neon_env_builder: NeonEnvBuilder, test_output_dir: Pat
 
     multixacts = mx_end - mx_start
     wal_mb = (end_lsn - start_lsn) / (1024 * 1024)
-    lines = [
-        f"MXPERF workload multixacts={multixacts} wal_mb={wal_mb:.1f} gen_secs={gen_secs:.1f}"
-    ]
+    lines = [f"MXPERF workload multixacts={multixacts} wal_mb={wal_mb:.1f} gen_secs={gen_secs:.1f}"]
 
     for r in range(RECOVERIES):
         status = env.storage_controller.inspect(tenant_shard_id=tenant)
