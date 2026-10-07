@@ -295,6 +295,8 @@ def test_ddl_forwarding(ddl: DdlForwardingContext):
 
 
 SCRAM = "<scram-sha-256 hash>"
+# A role dropped and created again in one transaction
+RECREATED = {"touched": True, "recreated": True}
 
 
 class RoleBodies:
@@ -395,9 +397,10 @@ def test_alter_role_nologin_forwards_login_false(role_bodies: RoleBodies):
 
 
 def test_drop_then_create_sends_a_new_role(role_bodies: RoleBodies):
-    # One transaction: the DROP and the CREATE merge into one set without the old password
+    # One transaction: the DROP and the CREATE merge into one set without the old password,
+    # marked recreated (and touched: the old role's members lost their membership)
     assert role_bodies.roles_of(["DROP ROLE app", "CREATE USER app"]) == [
-        {"op": "set", "name": "app", "password": None, "login": True}
+        {"op": "set", "name": "app", "password": None, "login": True, **RECREATED}
     ]
     # A CREATE in a released savepoint forgets what the parent recorded before the DROP
     role_bodies.setup("ALTER ROLE app PASSWORD 'x'")
@@ -409,10 +412,185 @@ def test_drop_then_create_sends_a_new_role(role_bodies: RoleBodies):
             "CREATE ROLE app",
             "RELEASE SAVEPOINT s",
         ]
-    ) == [{"op": "set", "name": "app", "password": None, "login": False}]
+    ) == [{"op": "set", "name": "app", "password": None, "login": False, **RECREATED}]
     # A created role renamed in the same transaction: a rename plus the explicit null
     assert role_bodies.roles_of(["CREATE ROLE a", "ALTER ROLE a RENAME TO b"]) == [
         {"op": "set", "name": "b", "old_name": "a", "password": None, "login": False}
+    ]
+
+
+def test_drop_then_create_marks_recreated(role_bodies: RoleBodies):
+    # With a password: the receiver must still treat it as a DROP for the old role's data keys
+    assert role_bodies.roles_of(["DROP ROLE app", "CREATE USER app PASSWORD 'y'"]) == [
+        {
+            "op": "set",
+            "name": "app",
+            "password": "y",
+            "encrypted_password": SCRAM,
+            "login": True,
+            **RECREATED,
+        }
+    ]
+    # Without a password
+    assert role_bodies.roles_of(["DROP ROLE app", "CREATE USER app"]) == [
+        {"op": "set", "name": "app", "password": None, "login": True, **RECREATED}
+    ]
+    # CREATE GROUP
+    assert role_bodies.roles_of(["DROP ROLE grp", "CREATE GROUP grp"]) == [
+        {"op": "set", "name": "grp", "password": None, "login": False, **RECREATED}
+    ]
+    # A plain CREATE with no DROP before it isn't recreated
+    assert role_bodies.roles_of(["CREATE USER fresh PASSWORD 'p'"]) == [
+        {"op": "set", "name": "fresh", "password": "p", "encrypted_password": SCRAM, "login": True}
+    ]
+    # A DROP rolled back with its savepoint doesn't count
+    assert role_bodies.roles_of(
+        [
+            "SAVEPOINT s",
+            "DROP ROLE fresh",
+            "CREATE USER fresh",
+            "ROLLBACK TO SAVEPOINT s",
+            "ALTER ROLE fresh NOLOGIN",
+        ]
+    ) == [{"op": "set", "name": "fresh", "login": False}]
+
+
+def test_recreated_across_savepoints(role_bodies: RoleBodies):
+    # DROP in the parent, CREATE in a released savepoint
+    assert role_bodies.roles_of(
+        ["DROP ROLE app", "SAVEPOINT s", "CREATE USER app PASSWORD 'y'", "RELEASE SAVEPOINT s"]
+    ) == [
+        {
+            "op": "set",
+            "name": "app",
+            "password": "y",
+            "encrypted_password": SCRAM,
+            "login": True,
+            **RECREATED,
+        }
+    ]
+    # DROP in a released savepoint, CREATE in the parent
+    assert role_bodies.roles_of(
+        ["SAVEPOINT s", "DROP ROLE app", "RELEASE SAVEPOINT s", "CREATE USER app"]
+    ) == [{"op": "set", "name": "app", "password": None, "login": True, **RECREATED}]
+    # DROP in the parent, CREATE two savepoints down
+    assert role_bodies.roles_of(
+        [
+            "DROP ROLE grp",
+            "SAVEPOINT s",
+            "SAVEPOINT t",
+            "CREATE GROUP grp",
+            "RELEASE SAVEPOINT t",
+            "RELEASE SAVEPOINT s",
+        ]
+    ) == [{"op": "set", "name": "grp", "password": None, "login": False, **RECREATED}]
+
+
+def test_recreated_survives_alter_and_rename(role_bodies: RoleBodies):
+    # A later ALTER, in the same transaction or a released savepoint, keeps the flag
+    assert role_bodies.roles_of(
+        [
+            "DROP ROLE app",
+            "CREATE USER app",
+            "ALTER ROLE app PASSWORD 'z'",
+            "SAVEPOINT s",
+            "ALTER ROLE app NOLOGIN",
+            "RELEASE SAVEPOINT s",
+        ]
+    ) == [
+        {
+            "op": "set",
+            "name": "app",
+            "password": "z",
+            "encrypted_password": SCRAM,
+            "login": False,
+            **RECREATED,
+        }
+    ]
+    # A rename keeps it too: the receiver renames the old row first, so the row it checks is
+    # the dropped role's, now under the new name
+    assert role_bodies.roles_of(
+        ["DROP ROLE app", "CREATE USER app", "ALTER ROLE app RENAME TO app2"]
+    ) == [
+        {
+            "op": "set",
+            "name": "app2",
+            "old_name": "app",
+            "password": None,
+            "login": True,
+            **RECREATED,
+        }
+    ]
+    role_bodies.setup("ALTER ROLE app2 RENAME TO app")
+    assert role_bodies.roles_of(
+        [
+            "DROP ROLE app",
+            "CREATE USER app",
+            "SAVEPOINT s",
+            "ALTER ROLE app RENAME TO app2",
+            "RELEASE SAVEPOINT s",
+        ]
+    ) == [
+        {
+            "op": "set",
+            "name": "app2",
+            "old_name": "app",
+            "password": None,
+            "login": True,
+            **RECREATED,
+        }
+    ]
+
+
+@pytest.mark.parametrize("new_name", ["app2", "b", "c", "renamed", "zz"])
+def test_recreated_rename_then_create_in_savepoint(role_bodies: RoleBodies, new_name: str):
+    # The savepoint holds both the rename away from `app` and a new `app`: merging it must
+    # not depend on which of the two entries comes first
+    assert role_bodies.roles_of(
+        [
+            "DROP ROLE app",
+            "CREATE USER app PASSWORD 'y'",
+            "SAVEPOINT s",
+            f"ALTER ROLE app RENAME TO {new_name}",
+            "CREATE ROLE app",
+            "RELEASE SAVEPOINT s",
+        ]
+    ) == [
+        # Every new_name sorts after "app"
+        {"op": "set", "name": "app", "password": None, "login": False},
+        {
+            "op": "set",
+            "name": new_name,
+            "old_name": "app",
+            "password": "y",
+            "encrypted_password": SCRAM,
+            "login": True,
+            **RECREATED,
+        },
+    ]
+
+
+def test_role_created_in_savepoint_ignores_old_name_state(role_bodies: RoleBodies):
+    # m1: a role created (and renamed) in a savepoint doesn't inherit what the parent recorded
+    # under the name it was created with
+    assert role_bodies.roles_of(
+        [
+            "ALTER ROLE app VALID UNTIL 'infinity'",
+            "SAVEPOINT s",
+            "DROP ROLE app",
+            "CREATE ROLE app",
+            "ALTER ROLE app RENAME TO app2",
+            "RELEASE SAVEPOINT s",
+        ]
+    ) == [
+        {
+            "op": "set",
+            "name": "app2",
+            "old_name": "app",
+            "password": None,
+            "login": False,
+            **RECREATED,
+        }
     ]
 
 

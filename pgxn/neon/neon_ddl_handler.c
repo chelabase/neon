@@ -130,6 +130,17 @@ typedef struct
 	 * parent's attributes for the name (from before a DROP) are forgotten.
 	 */
 	bool		created;
+
+	/*
+	 * Created while a DROP of the same name was pending in this top-level
+	 * transaction (in this subtransaction or an enclosing one): the new role
+	 * replaces an old one. Sent as "recreated": true (with "touched": the old
+	 * role's members lost their membership), so the receiver checks the old
+	 * role as it checks a DROP. Implies created. A later ALTER keeps it, and
+	 * so does a rename: the receiver applies renames first, so the row it
+	 * then checks is the dropped role's, moved to the new name.
+	 */
+	bool		recreated;
 	OpType		type;
 } RoleEntry;
 
@@ -200,7 +211,8 @@ static bool
 HasRoleAttributes(RoleEntry *entry)
 {
 	return entry->type == Op_Set &&
-		(entry->login != Login_Unset || entry->valid_until != NULL || entry->touched);
+		(entry->login != Login_Unset || entry->valid_until != NULL || entry->touched ||
+		 entry->recreated);
 }
 
 /* Forgets the role's attributes (for a new entry, a DROP or a CREATE) */
@@ -222,6 +234,7 @@ InitRoleEntry(RoleEntry *entry)
 	entry->password_set = false;
 	ResetRoleAttributes(entry);
 	entry->created = false;
+	entry->recreated = false;
 	entry->type = Op_Set;
 }
 
@@ -320,8 +333,10 @@ ConstructDeltaMessage()
 					PushKeyBool(&state, "login", entry->login == Login_True);
 				if (entry->valid_until)
 					PushKeyValue(&state, "valid_until", (char *) entry->valid_until);
-				if (entry->touched)
+				if (entry->touched || entry->recreated)
 					PushKeyBool(&state, "touched", true);
+				if (entry->recreated)
+					PushKeyBool(&state, "recreated", true);
 			}
 			pushJsonbValue(&state, WJB_END_OBJECT, NULL);
 		}
@@ -615,14 +630,56 @@ MergeTable()
 	{
 		RoleEntry  *entry;
 		HASH_SEQ_STATUS status;
+		long		count = hash_get_num_entries(old_table->role_table);
+		RoleEntry  *olds = palloc0(sizeof(RoleEntry) * Max(count, 1));
+		bool	   *found_olds = palloc0(sizeof(bool) * Max(count, 1));
+		long		i;
 
 		InitRoleTableIfNeeded();
 
+		/*
+		 * Renames first copy what the parent knew about their old names, and
+		 * those parent entries go (they belong to the renamed roles); only then
+		 * are this subtransaction's entries written. So no rename reads an entry
+		 * this merge just wrote, whatever the hash order: e.g. a new role
+		 * created under a name renamed away in the same subtransaction, or a
+		 * swap of two names. The subtransaction's table isn't changed here, so
+		 * the three scans visit its entries in the same order.
+		 */
+		i = 0;
 		hash_seq_init(&status, old_table->role_table);
 		while ((entry = hash_seq_search(&status)) != NULL)
 		{
-			RoleEntry  *old;
-			bool		found_old = false;
+			if (entry->old_name[0] != '\0')
+			{
+				RoleEntry  *old = hash_search(CurrentDdlTable->role_table,
+											  entry->old_name,
+											  HASH_FIND,
+											  NULL);
+
+				if (old)
+				{
+					olds[i] = *old;
+					found_olds[i] = true;
+				}
+			}
+			i++;
+		}
+		hash_seq_init(&status, old_table->role_table);
+		while ((entry = hash_seq_search(&status)) != NULL)
+		{
+			if (entry->old_name[0] != '\0')
+				hash_search(CurrentDdlTable->role_table,
+							entry->old_name,
+							HASH_REMOVE,
+							NULL);
+		}
+
+		i = 0;
+		hash_seq_init(&status, old_table->role_table);
+		while ((entry = hash_seq_search(&status)) != NULL)
+		{
+			RoleEntry  *old = found_olds[i] ? &olds[i] : NULL;
 			bool		found_parent = false;
 			RoleEntry  *to_write = hash_search(
 											   CurrentDdlTable->role_table,
@@ -630,6 +687,7 @@ MergeTable()
 											   HASH_ENTER,
 											   &found_parent);
 
+			i++;
 			if (!found_parent)
 				InitRoleEntry(to_write);
 			to_write->type = entry->type;
@@ -653,6 +711,7 @@ MergeTable()
 			{
 				ResetRoleAttributes(to_write);
 				to_write->created = false;
+				to_write->recreated = false;
 			}
 			else
 			{
@@ -660,6 +719,7 @@ MergeTable()
 				{
 					ResetRoleAttributes(to_write);
 					to_write->created = true;
+					to_write->recreated = entry->recreated;
 				}
 				if (entry->login != Login_Unset)
 					to_write->login = entry->login;
@@ -682,15 +742,18 @@ MergeTable()
 			 * chain, and its password), unless this subtransaction set a
 			 * password itself.
 			 */
-			old = hash_search(
-							  CurrentDdlTable->role_table,
-							  entry->old_name,
-							  HASH_FIND,
-							  &found_old);
-			if (!found_old)
+			if (!old)
 				continue;
 			if (old->old_name[0] != '\0')
 				strlcpy(to_write->old_name, old->old_name, NAMEDATALEN);
+
+			/*
+			 * A role created in this subtransaction (then renamed) is a new
+			 * role: what the parent recorded under the name it was created
+			 * with belongs to the role dropped before it.
+			 */
+			if (entry->created)
+				continue;
 			if (!entry->password && !entry->password_null)
 			{
 				to_write->password = old->password;
@@ -704,12 +767,13 @@ MergeTable()
 				if (!entry->valid_until)
 					to_write->valid_until = old->valid_until;
 				to_write->touched |= old->touched;
+				/* A rename keeps the role created (or recreated) */
+				to_write->created |= old->created;
+				to_write->recreated |= old->recreated;
 			}
-			hash_search(CurrentDdlTable->role_table,
-						entry->old_name,
-						HASH_REMOVE,
-						NULL);
 		}
+		pfree(olds);
+		pfree(found_olds);
 		hash_destroy(old_table->role_table);
 	}
 }
@@ -961,16 +1025,43 @@ SetRoleAttributes(RoleEntry *entry, RoleOptions *opts)
 		entry->touched = true;
 }
 
+/*
+ * The role's pending entry in this subtransaction or, failing that, the
+ * nearest enclosing one that has one (NULL when the transaction hasn't touched
+ * the name).
+ */
+static RoleEntry *
+FindPendingRole(const char *role_name)
+{
+	for (DdlHashTable *table = CurrentDdlTable; table != NULL; table = table->prev_table)
+	{
+		RoleEntry  *entry;
+
+		if (!table->role_table)
+			continue;
+		entry = hash_search(table->role_table, role_name, HASH_FIND, NULL);
+		if (entry)
+			return entry;
+	}
+	return NULL;
+}
+
 static void
 HandleCreateRole(CreateRoleStmt *stmt)
 {
 	bool		found = false;
 	RoleEntry  *entry;
+	RoleEntry  *pending;
 	RoleOptions opts;
+	bool		recreated;
 
 	InitRoleTableIfNeeded();
 
 	ParseRoleOptions(stmt->options, &opts);
+
+	/* A DROP of the name is pending: this role replaces the dropped one */
+	pending = FindPendingRole(stmt->role);
+	recreated = pending != NULL && pending->type == Op_Delete;
 
 	entry = hash_search(CurrentDdlTable->role_table,
 						stmt->role,
@@ -1004,6 +1095,9 @@ HandleCreateRole(CreateRoleStmt *stmt)
 	entry->created = true;
 	entry->login = stmt->stmt_type == ROLESTMT_USER ? Login_True : Login_False;
 	SetRoleAttributes(entry, &opts);
+	entry->recreated = recreated;
+	if (recreated)
+		entry->touched = true;
 	entry->type = Op_Set;
 }
 
@@ -1082,6 +1176,7 @@ HandleRoleRename(RenameStmt *stmt)
 		entry_for_new_name->valid_until = entry->valid_until;
 		entry_for_new_name->touched = entry->touched;
 		entry_for_new_name->created = entry->created;
+		entry_for_new_name->recreated = entry->recreated;
 		hash_search(
 					CurrentDdlTable->role_table,
 					entry->name,
@@ -1095,6 +1190,7 @@ HandleRoleRename(RenameStmt *stmt)
 		entry_for_new_name->password_null = false;
 		ResetRoleAttributes(entry_for_new_name);
 		entry_for_new_name->created = false;
+		entry_for_new_name->recreated = false;
 	}
 	entry_for_new_name->password_set = true;
 }
@@ -1124,6 +1220,7 @@ HandleDropRole(DropRoleStmt *stmt)
 		entry->password_set = true;
 		ResetRoleAttributes(entry);
 		entry->created = false;
+		entry->recreated = false;
 	}
 }
 
