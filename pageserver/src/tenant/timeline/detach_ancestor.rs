@@ -482,6 +482,27 @@ pub(super) async fn prepare(
         rest_of_historic.extend(rest);
     }
 
+    // Layers in `rest_of_historic` are copied remote to remote, so each must already be in
+    // remote storage. The HTTP handler drained the upload queues before `prepare`, but layers
+    // flushed or compacted since (during the catch-up waits, or by the flushes above) may still
+    // be uploading: wait for every level's queued uploads before copying. Every layer-map
+    // update schedules its uploads under the same write lock that makes the layers visible,
+    // so each layer selected above already has its upload queued, and the barrier covers it.
+    // Like the handler's own drain, the wait has no timeout: a stuck upload queue (remote
+    // storage down) holds the detach until shutdown or cancellation.
+    for (level, _) in &chain {
+        tokio::select! {
+            res = level.remote_client.wait_completion() => {
+                // The level's upload queue is stopped or not (yet, or any more) initialized:
+                // shutdown or deletion, retryable as for a cancelled level (`Error::launder`
+                // maps `WaitCompletionError` the same way).
+                res.map_err(|_| ShuttingDown)?;
+            }
+            _ = detached.cancel.cancelled() => return Err(ShuttingDown),
+            _ = level.cancel.cancelled() => return Err(ShuttingDown),
+        }
+    }
+
     // TODO: copying and lsn prefix copying could be done at the same time with a single fsync after
     let mut new_layers: Vec<Layer> =
         Vec::with_capacity(straddling_branchpoint.len() + rest_of_historic.len() + 1);

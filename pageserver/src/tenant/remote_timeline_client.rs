@@ -2203,6 +2203,9 @@ impl RemoteTimelineClient {
                             }
                         }
                     }
+                    // Holds queued layer uploads only (not `upload_layer_file`), so a test can
+                    // keep an ancestor's upload in flight while a detach copies its layers.
+                    pausable_failpoint!("upload-queue-layer-upload-pausable");
                     let local_path = layer.local_path();
 
                     // We should only be uploading layers created by this `Tenant`'s lifetime, so

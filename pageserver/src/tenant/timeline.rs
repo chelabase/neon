@@ -2001,27 +2001,19 @@ impl Timeline {
         _ctx: &RequestContext,
     ) -> anyhow::Result<LsnLease> {
         let lease = {
-            let requested = lsn;
-            // Normalize the requested LSN to be aligned, and move to the first record
-            // if it points to the beginning of the page (header).
-            let normalized = xlog_utils::normalize_lsn(lsn, WAL_SEGMENT_SIZE);
-
             // The check and the insert below share this write lock, so a child dropped in
             // between can't leave a lease at a point GC no longer keeps.
             let mut gc_info = self.gc_info.write().unwrap();
             let planned_cutoff = gc_info.min_cutoff();
             let latest_gc_cutoff_lsn = *self.get_applied_gc_cutoff_lsn();
 
-            // Below a cutoff, a lease is granted only at a point GC keeps whole (a child's
-            // branch point or another lease; `GcInfo::lsn_is_retained`), and it is keyed at the
-            // exact requested LSN when that is the kept point: gc-compaction keeps only exact
-            // points, so a key normalized past the point would not keep the point's history.
-            let below_a_cutoff = requested < latest_gc_cutoff_lsn.max(planned_cutoff);
-            let lsn = if below_a_cutoff && gc_info.lsn_is_retained(requested) {
-                requested
-            } else {
-                normalized
-            };
+            // A lease is keyed at the exact requested LSN, never normalized: gc-compaction keeps
+            // only the image at a kept point, so a key normalized past a page header would not
+            // keep the page start the compute reads at once the cutoff passes it. A read matches
+            // the lease when its LSN is equal to the key, or the same point past the page header
+            // (`GcInfo::lsn_is_retained`). Below a cutoff, a lease is granted only when the
+            // requested LSN is equal to a kept point (a child's branch point or another lease),
+            // or the same point past the page header.
             let retained = gc_info.lsn_is_retained(lsn);
 
             let valid_until = SystemTime::now() + length;
@@ -5273,7 +5265,6 @@ impl Timeline {
                     .extend(metadata_partition.into_dense().parts);
             }
 
-            let mut layers_to_upload = Vec::new();
             let (generated_image_layers, is_complete) = self
                 .create_image_layers(
                     &partitions,
@@ -5290,9 +5281,11 @@ impl Timeline {
                 matches!(is_complete, LastImageLayerCreationStatus::Complete),
                 "init image generation mode must fully cover the keyspace"
             );
-            layers_to_upload.extend(generated_image_layers);
+            // `create_image_layers` already scheduled their uploads; the metadata update below
+            // uploads the index.
+            drop(generated_image_layers);
 
-            (layers_to_upload, None)
+            (Vec::new(), None)
         } else {
             // Normal case, write out a L0 delta layer file.
             // `create_delta_layer` will not modify the layer map.
@@ -6162,13 +6155,33 @@ impl Timeline {
 
         let mut guard = self.layers.write(LayerManagerLockHolder::Compaction).await;
 
-        // FIXME: we could add the images to be uploaded *before* returning from here, but right
-        // now they are being scheduled outside of write lock; current way is inconsistent with
-        // compaction lock order.
+        // Schedule the uploads under the same write lock that makes the layers visible, as every
+        // other layer-map update does: whoever sees a layer in the map (a detach copying layers
+        // remote to remote after an upload barrier) can rely on its upload being queued. Only
+        // the layer uploads: the callers schedule the index upload (the initial flush does it
+        // with its metadata update).
         guard
             .open_mut()?
             .track_new_image_layers(&image_layers, &self.metrics);
+        for layer in &image_layers {
+            self.remote_client
+                .schedule_layer_file_upload(layer.clone())
+                .map_err(|e| match e {
+                    // as `From<NotInitialized> for CompactionError` does
+                    super::upload_queue::NotInitialized::ShuttingDown
+                    | super::upload_queue::NotInitialized::Stopped => {
+                        CreateImageLayersError::Cancelled
+                    }
+                    super::upload_queue::NotInitialized::Uninitialized => {
+                        CreateImageLayersError::Other(anyhow::anyhow!(e))
+                    }
+                })?;
+        }
         drop_layer_manager_wlock(guard);
+        // Holds a compaction right after its new image layers became visible in the layer map.
+        if !image_layers.is_empty() {
+            pausable_failpoint!("create-image-layers-after-layer-map-update-pausable");
+        }
         let duration = timer.stop_and_record();
 
         // Creating image layers may have caused some previously visible layers to be covered
@@ -6615,6 +6628,12 @@ impl Timeline {
             .open_mut()?
             .finish_compact_l0(&remove_layers, &insert_layers, &self.metrics);
 
+        // Under the lock that made them visible (see `create_image_layers`); the compaction
+        // update below uploads the index.
+        for layer in new_images {
+            self.remote_client
+                .schedule_layer_file_upload(layer.clone())?;
+        }
         self.remote_client
             .schedule_compaction_update(&remove_layers, new_deltas)?;
 
@@ -6647,14 +6666,11 @@ impl Timeline {
         Ok(())
     }
 
-    /// Schedules the uploads of the given image layers
-    fn upload_new_image_layers(
+    /// Schedules the index upload after new image layers, whose layer uploads
+    /// `create_image_layers` already scheduled under the layer-map lock.
+    fn upload_index_for_new_image_layers(
         self: &Arc<Self>,
-        new_images: impl IntoIterator<Item = ResidentLayer>,
     ) -> Result<(), super::upload_queue::NotInitialized> {
-        for layer in new_images {
-            self.remote_client.schedule_layer_file_upload(layer)?;
-        }
         // should any new image layer been created, not uploading index_part will
         // result in a mismatch between remote_physical_size and layermap calculated
         // size, which will fail some tests, but should not be an issue otherwise.
