@@ -9,7 +9,8 @@ from fixtures.common_types import Lsn, TimelineId
 from fixtures.log_helper import log
 from fixtures.neon_fixtures import wait_for_last_flush_lsn
 from fixtures.pageserver.http import TimelineCreate406
-from fixtures.utils import query_scalar, skip_in_debug_build
+from fixtures.pageserver.utils import timeline_delete_wait_completed
+from fixtures.utils import query_scalar, skip_in_debug_build, wait_until
 
 if TYPE_CHECKING:
     from fixtures.neon_fixtures import NeonEnv
@@ -203,7 +204,8 @@ def test_read_at_retained_lsn_below_gc_cutoff(neon_simple_env: NeonEnv, grpc: bo
     A child's branch point stays readable on the parent after GC moved the applied cutoff
     past it: the parent keeps the data at that exact LSN for the child, so a static compute
     (basebackup and get_page) and a new branch there both work. An LSN below the cutoff that
-    nothing retains is still refused.
+    nothing retains is still refused. The static compute leases the point (D19), so it keeps
+    reading there after both children are deleted and GC and gc-compaction ran.
     """
     env = neon_simple_env
     ps_http = env.pageserver.http_client()
@@ -211,7 +213,7 @@ def test_read_at_retained_lsn_below_gc_cutoff(neon_simple_env: NeonEnv, grpc: bo
     env.pageserver.allowed_errors.extend(
         [
             refused_basebackup,
-            # The static compute's own lease request; a new lease below the cutoff stays refused.
+            # The unretained static compute's own lease request.
             ".*tried to request an lsn lease for an lsn below the latest gc cutoff.*",
         ]
     )
@@ -222,7 +224,9 @@ def test_read_at_retained_lsn_below_gc_cutoff(neon_simple_env: NeonEnv, grpc: bo
             "gc_period": "0s",
             "compaction_period": "0s",
             "pitr_interval": "0s",
-            "lsn_lease_length": "0s",
+            # Long enough for compute_ctl to renew the static compute's lease; GC waits this
+            # long after attach (the lease deadline) before it runs.
+            "lsn_lease_length": "20s",
         }
     )
     ep_main = env.endpoints.create_start("main", tenant_id=tenant, grpc=grpc)
@@ -231,7 +235,7 @@ def test_read_at_retained_lsn_below_gc_cutoff(neon_simple_env: NeonEnv, grpc: bo
         cur.execute("INSERT INTO t SELECT generate_series(1, 100)")
         retained = Lsn(query_scalar(cur, "SELECT pg_current_wal_insert_lsn()"))
     wait_for_last_flush_lsn(env, ep_main, tenant, main)
-    env.create_branch(
+    child = env.create_branch(
         "child", ancestor_branch_name="main", ancestor_start_lsn=retained, tenant_id=tenant
     )
 
@@ -241,28 +245,32 @@ def test_read_at_retained_lsn_below_gc_cutoff(neon_simple_env: NeonEnv, grpc: bo
         cur.execute("INSERT INTO t SELECT generate_series(201, 300)")
     wait_for_last_flush_lsn(env, ep_main, tenant, main)
     ps_http.timeline_checkpoint(tenant, main)
-    ps_http.timeline_gc(tenant, main, 0)
-    cutoff = Lsn(ps_http.timeline_detail(tenant, main)["applied_gc_cutoff_lsn"])
+
+    def gc_moved_cutoff_past(lsn: Lsn) -> Lsn:
+        ps_http.timeline_gc(tenant, main, 0)
+        cutoff = Lsn(ps_http.timeline_detail(tenant, main)["applied_gc_cutoff_lsn"])
+        assert cutoff > lsn, f"GC cutoff {cutoff} not past {lsn} yet (lease deadline)"
+        return cutoff
+
+    cutoff = wait_until(lambda: gc_moved_cutoff_past(unretained), timeout=60)
     log.info(f"{retained=} {unretained=} {cutoff=}")
     assert retained < unretained < cutoff
 
-    # A static compute at the retained LSN. `pageserver_id` skips neon_local's lease request,
-    # which would be refused below the cutoff (out of scope).
+    # A static compute at the retained LSN; neon_local and compute_ctl lease it (D19: a lease
+    # below the cutoff is granted at a point GC keeps whole).
     ep_static = env.endpoints.create_start(
         "main",
         endpoint_id="ep-retained",
         tenant_id=tenant,
         lsn=retained,
         grpc=grpc,
-        pageserver_id=env.pageserver.id,
     )
     with ep_static.cursor() as cur:
         assert query_scalar(cur, "SELECT count(*) FROM t") == 100
-    ep_static.stop()
     assert env.pageserver.log_contains(refused_basebackup) is None
 
     # A new branch at the retained LSN, with a writable compute on it.
-    env.create_branch(
+    child2 = env.create_branch(
         "child2", ancestor_branch_name="main", ancestor_start_lsn=retained, tenant_id=tenant
     )
     ep_child2 = env.endpoints.create_start("child2", tenant_id=tenant, grpc=grpc)
@@ -271,6 +279,23 @@ def test_read_at_retained_lsn_below_gc_cutoff(neon_simple_env: NeonEnv, grpc: bo
         cur.execute("INSERT INTO t VALUES (0)")
         assert query_scalar(cur, "SELECT count(*) FROM t") == 101
     ep_child2.stop()
+
+    # The children go away; the static compute's lease keeps the point through GC and
+    # gc-compaction, and a fresh start there (basebackup and get_page) still reads it.
+    for timeline in (child, child2):
+        timeline_delete_wait_completed(env.storage_controller.pageserver_api(), tenant, timeline)
+    with ep_main.cursor() as cur:
+        cur.execute("INSERT INTO t SELECT generate_series(301, 400)")
+    wait_for_last_flush_lsn(env, ep_main, tenant, main)
+    ps_http.timeline_checkpoint(tenant, main)
+    ps_http.timeline_gc(tenant, main, 0)
+    ps_http.timeline_compact(tenant, main, enhanced_gc_bottom_most_compaction=True)
+    ep_static.stop()
+    ep_static.start()
+    with ep_static.cursor() as cur:
+        assert query_scalar(cur, "SELECT count(*) FROM t") == 100
+    ep_static.stop()
+    assert env.pageserver.log_contains(refused_basebackup) is None
 
     # An unretained LSN below the cutoff is still refused.
     with pytest.raises(Exception, match="failed to get basebackup"):
