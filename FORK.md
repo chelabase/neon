@@ -8,11 +8,11 @@ Apache License 2.0, unchanged. NOTICE file and upstream copyright are retained.
 
 ## Policy
 
-We do not rewrite the core engine (pageserver, safekeepers, or Neon's PostgreSQL patches). We replace specific components only when our needs genuinely differ from upstream. Performance improvements must have supporting profiling evidence.
+This is a hard fork: all of the code, the core engine included (pageserver, safekeepers, the PostgreSQL patches), is ours to change, and we change it whenever that is the right fix. Where code came from, how invasive a change is, or how far it moves us from the original base is never a reason to leave a bug or document a gap instead of fixing it. Performance changes need supporting profiling evidence.
 
 ## Pageserver changes
 
-The policy above keeps the engine as upstream left it; these are the changes we made to it, each fixing a bug Chelabase hit.
+The changes we made to the pageserver, each fixing a bug Chelabase hit.
 
 - **Detach waits for its ancestors' WAL.** Before copying anything, `detach_ancestor` waits for every ancestor level to ingest its WAL up to the cut (an ancestor reloaded since its last flush only has its WAL up to its disk consistent LSN until its walreceiver catches up). Each wait is up to 30 s, one level after the other, so the worst case is 30 s × the chain's depth; a timeout returns 503 ("not caught up yet, retry later"), a broken ancestor 500.
 - **Multi-level detach copies every ancestor's layers.** Under `DetachBehavior::MultiLevelAndNoReparent` the detached timeline gets each level's layers up to that level's cut (straddling deltas rewritten, the rest copied by reference). Before copying, it waits for every level's queued uploads to finish, so a layer copied by reference is already in remote storage (a stopped upload queue answers 503, shutting down). This holds because every layer-map update (flush, compaction and its image layers, gc-compaction, import) schedules its uploads under the same layer-map write lock that makes the new layers visible. Like the HTTP handler's own drain, the wait has no timeout: a stuck upload queue holds the detach until shutdown. Nothing is reparented.
