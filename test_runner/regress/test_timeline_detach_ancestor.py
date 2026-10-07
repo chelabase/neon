@@ -2172,7 +2172,10 @@ def test_multi_level_detach_leaves_siblings_attached(neon_env_builder: NeonEnvBu
 
     parent, _, child_at = _two_level_chain(env)
     child = env.create_branch("child", ancestor_branch_name="parent", ancestor_start_lsn=child_at)
-    sibling = env.create_branch("sibling", ancestor_branch_name="parent")
+    # At the child's branch point: the default detach would reparent it.
+    sibling = env.create_branch(
+        "sibling", ancestor_branch_name="parent", ancestor_start_lsn=child_at
+    )
 
     assert client.detach_ancestor(env.initial_tenant, child, detach_behavior="v2") == set()
 
@@ -2181,8 +2184,140 @@ def test_multi_level_detach_leaves_siblings_attached(neon_env_builder: NeonEnvBu
     assert _ancestor(env, child) is None
     assert _ancestor(env, sibling) == parent
     assert _ancestor(env, parent) == env.initial_timeline
-    assert _values(env, "sibling") == ["A", "C", "D"]
+    assert _values(env, "sibling") == ["A", "C"]
     assert _values(env, "child") == ["A", "C"]
+
+
+def _two_level_chain_parent_layer_below_cut(
+    env: NeonEnv, hold_parent_flush: bool = False
+) -> tuple[TimelineId, TimelineId, Lsn]:
+    """
+    main: A, | parent branches here |, B  (checkpointed and uploaded)
+    parent: C, (freeze), C2, | child branches here |, D
+    The layer frozen after C ends below the child's branch point, so a detach of the child
+    copies it by reference instead of rewriting it. With `hold_parent_flush`, that layer stays
+    frozen in memory (flushes paused) until the caller releases
+    `flush-layer-cancel-after-writing-layer-out-pausable`.
+    Returns (parent, child, child_at).
+    """
+    tenant = env.initial_tenant
+    client = env.pageserver.http_client()
+
+    with env.endpoints.create_start("main", tenant_id=tenant) as ep:
+        ep.safe_psql("CREATE TABLE t (v text)")
+        ep.safe_psql("INSERT INTO t VALUES ('A')")
+        parent_at = wait_for_last_flush_lsn(env, ep, tenant, env.initial_timeline)
+        ep.safe_psql("INSERT INTO t VALUES ('B')")
+        wait_for_last_flush_lsn(env, ep, tenant, env.initial_timeline)
+        client.timeline_checkpoint(tenant, env.initial_timeline, wait_until_uploaded=True)
+
+    parent = env.create_branch("parent", ancestor_branch_name="main", ancestor_start_lsn=parent_at)
+
+    with env.endpoints.create_start("parent", tenant_id=tenant) as ep:
+        ep.safe_psql("INSERT INTO t VALUES ('C')")
+        wait_for_last_flush_lsn(env, ep, tenant, parent)
+        if hold_parent_flush:
+            client.configure_failpoints(
+                ("flush-layer-cancel-after-writing-layer-out-pausable", "pause")
+            )
+        client.timeline_checkpoint(
+            tenant, parent, compact=False, wait_until_flushed=not hold_parent_flush
+        )
+        ep.safe_psql("INSERT INTO t VALUES ('C2')")
+        child_at = wait_for_last_flush_lsn(env, ep, tenant, parent)
+        ep.safe_psql("INSERT INTO t VALUES ('D')")
+        wait_for_last_flush_lsn(env, ep, tenant, parent)
+
+    child = env.create_branch("child", ancestor_branch_name="parent", ancestor_start_lsn=child_at)
+    return parent, child, child_at
+
+
+def _layers_ending_at_or_below(env: NeonEnv, timeline_id: TimelineId, lsn: Lsn) -> set[str]:
+    """Names of the timeline's layers a detach at `lsn` copies by reference."""
+    layers = env.pageserver.http_client().layer_map_info(env.initial_tenant, timeline_id)
+    return {
+        layer.layer_file_name
+        for layer in layers.historic_layers
+        if layer.lsn_end is not None and Lsn(layer.lsn_end) <= lsn
+    }
+
+
+def _index_layer_names(env: NeonEnv, timeline_id: TimelineId) -> set[str]:
+    assert isinstance(env.pageserver_remote_storage, LocalFsStorage)
+    index = env.pageserver_remote_storage.index_content(env.initial_tenant, timeline_id)
+    return set(index["layer_metadata"].keys())
+
+
+def test_multi_level_detach_copies_parent_layer_by_reference(neon_env_builder: NeonEnvBuilder):
+    """
+    A parent layer that ends below the child's branch point is copied as is (same layer name in
+    the detached child's index), not rewritten, and the child reads the right data.
+    """
+    env = neon_env_builder.init_start()
+    env.pageserver.allowed_errors.extend(SHUTDOWN_ALLOWED_ERRORS)
+    client = env.pageserver.http_client()
+
+    parent, child, child_at = _two_level_chain_parent_layer_below_cut(env)
+    by_reference = _layers_ending_at_or_below(env, parent, child_at)
+    assert len(by_reference) > 0
+
+    assert client.detach_ancestor(env.initial_tenant, child, detach_behavior="v2") == set()
+    assert _ancestor(env, child) is None
+    assert by_reference <= _index_layer_names(env, child)
+
+    env.pageserver.restart()
+
+    assert _values(env, "child") == ["A", "C", "C2"]
+    assert _values(env, "parent") == ["A", "C", "C2", "D"]
+
+
+def test_multi_level_detach_waits_for_ancestor_uploads(neon_env_builder: NeonEnvBuilder):
+    """
+    The detach's own flush of the parent writes out a layer that ends below the child's branch
+    point after the HTTP handler drained the upload queues, and its upload stays in flight:
+    the detach waits for the parent's uploads to finish instead of trying (and retrying) a
+    remote copy of a layer that isn't in remote storage yet.
+    """
+    env = neon_env_builder.init_start()
+    env.pageserver.allowed_errors.extend(SHUTDOWN_ALLOWED_ERRORS)
+    ps = env.pageserver
+    client = ps.http_client().without_status_retrying()
+    copy_failed = ".*copy timeline layer failed.*"
+
+    parent, child, child_at = _two_level_chain_parent_layer_below_cut(env, hold_parent_flush=True)
+
+    released = [
+        ("upload-queue-layer-upload-pausable", "off"),
+        ("flush-layer-cancel-after-writing-layer-out-pausable", "off"),
+    ]
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        try:
+            detach = pool.submit(
+                client.detach_ancestor, env.initial_tenant, child, detach_behavior="v2"
+            )
+            wait_until(lambda: ps.assert_log_contains("all timeline upload queues are drained"))
+            client.configure_failpoints(
+                [
+                    ("upload-queue-layer-upload-pausable", "pause"),
+                    ("flush-layer-cancel-after-writing-layer-out-pausable", "off"),
+                ]
+            )
+            time.sleep(3)
+            assert not detach.done(), "detach finished while the parent's upload was paused"
+            assert ps.log_contains(copy_failed) is None, (
+                "detach copied a parent layer before its upload finished"
+            )
+        finally:
+            # Never leave the pageserver paused: its shutdown would hang.
+            client.configure_failpoints(released)
+        assert detach.result(timeout=60) == set()
+
+    assert ps.log_contains(copy_failed) is None
+    assert _ancestor(env, child) is None
+    by_reference = _layers_ending_at_or_below(env, parent, child_at)
+    assert len(by_reference) > 0
+    assert by_reference <= _index_layer_names(env, child)
+    assert _values(env, "child") == ["A", "C", "C2"]
 
 
 # TODO:

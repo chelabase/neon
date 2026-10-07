@@ -2001,27 +2001,18 @@ impl Timeline {
         _ctx: &RequestContext,
     ) -> anyhow::Result<LsnLease> {
         let lease = {
-            let requested = lsn;
-            // Normalize the requested LSN to be aligned, and move to the first record
-            // if it points to the beginning of the page (header).
-            let normalized = xlog_utils::normalize_lsn(lsn, WAL_SEGMENT_SIZE);
-
             // The check and the insert below share this write lock, so a child dropped in
             // between can't leave a lease at a point GC no longer keeps.
             let mut gc_info = self.gc_info.write().unwrap();
             let planned_cutoff = gc_info.min_cutoff();
             let latest_gc_cutoff_lsn = *self.get_applied_gc_cutoff_lsn();
 
-            // Below a cutoff, a lease is granted only at a point GC keeps whole (a child's
-            // branch point or another lease; `GcInfo::lsn_is_retained`), and it is keyed at the
-            // exact requested LSN when that is the kept point: gc-compaction keeps only exact
-            // points, so a key normalized past the point would not keep the point's history.
-            let below_a_cutoff = requested < latest_gc_cutoff_lsn.max(planned_cutoff);
-            let lsn = if below_a_cutoff && gc_info.lsn_is_retained(requested) {
-                requested
-            } else {
-                normalized
-            };
+            // A lease is keyed at the exact requested LSN, never normalized: gc-compaction keeps
+            // only the image at a kept point, so a key normalized past a page header would not
+            // keep the page start the compute reads at once the cutoff passes it. Reads at the
+            // normalized LSN still match (`GcInfo::lsn_is_retained`). Below a cutoff, a lease is
+            // granted only when the requested LSN itself is kept whole (a child's branch point
+            // or another lease).
             let retained = gc_info.lsn_is_retained(lsn);
 
             let valid_until = SystemTime::now() + length;
