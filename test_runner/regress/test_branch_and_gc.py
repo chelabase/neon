@@ -195,3 +195,92 @@ def test_branch_creation_before_gc(neon_simple_env: NeonEnv):
         pageserver_http_client.timeline_create(env.pg_version, tenant, new_timeline_id, b0, lsn)
 
     thread.join()
+
+
+@pytest.mark.parametrize("grpc", [False, True])
+def test_read_at_retained_lsn_below_gc_cutoff(neon_simple_env: NeonEnv, grpc: bool):
+    """
+    A child's branch point stays readable on the parent after GC moved the applied cutoff
+    past it: the parent keeps the data at that exact LSN for the child, so a static compute
+    (basebackup and get_page) and a new branch there both work. An LSN below the cutoff that
+    nothing retains is still refused.
+    """
+    env = neon_simple_env
+    ps_http = env.pageserver.http_client()
+    refused_basebackup = ".*invalid basebackup (lsn|LSN).*"
+    env.pageserver.allowed_errors.extend(
+        [
+            refused_basebackup,
+            # The static compute's own lease request; a new lease below the cutoff stays refused.
+            ".*tried to request an lsn lease for an lsn below the latest gc cutoff.*",
+        ]
+    )
+
+    tenant, main = env.create_tenant(
+        conf={
+            # GC is triggered by hand
+            "gc_period": "0s",
+            "compaction_period": "0s",
+            "pitr_interval": "0s",
+            "lsn_lease_length": "0s",
+        }
+    )
+    ep_main = env.endpoints.create_start("main", tenant_id=tenant, grpc=grpc)
+    with ep_main.cursor() as cur:
+        cur.execute("CREATE TABLE t(x int)")
+        cur.execute("INSERT INTO t SELECT generate_series(1, 100)")
+        retained = Lsn(query_scalar(cur, "SELECT pg_current_wal_insert_lsn()"))
+    wait_for_last_flush_lsn(env, ep_main, tenant, main)
+    env.create_branch(
+        "child", ancestor_branch_name="main", ancestor_start_lsn=retained, tenant_id=tenant
+    )
+
+    with ep_main.cursor() as cur:
+        cur.execute("INSERT INTO t SELECT generate_series(101, 200)")
+        unretained = Lsn(query_scalar(cur, "SELECT pg_current_wal_insert_lsn()"))
+        cur.execute("INSERT INTO t SELECT generate_series(201, 300)")
+    wait_for_last_flush_lsn(env, ep_main, tenant, main)
+    ps_http.timeline_checkpoint(tenant, main)
+    ps_http.timeline_gc(tenant, main, 0)
+    cutoff = Lsn(ps_http.timeline_detail(tenant, main)["applied_gc_cutoff_lsn"])
+    log.info(f"{retained=} {unretained=} {cutoff=}")
+    assert retained < unretained < cutoff
+
+    # A static compute at the retained LSN. `pageserver_id` skips neon_local's lease request,
+    # which would be refused below the cutoff (out of scope).
+    ep_static = env.endpoints.create_start(
+        "main",
+        endpoint_id="ep-retained",
+        tenant_id=tenant,
+        lsn=retained,
+        grpc=grpc,
+        pageserver_id=env.pageserver.id,
+    )
+    with ep_static.cursor() as cur:
+        assert query_scalar(cur, "SELECT count(*) FROM t") == 100
+    ep_static.stop()
+    assert env.pageserver.log_contains(refused_basebackup) is None
+
+    # A new branch at the retained LSN, with a writable compute on it.
+    env.create_branch(
+        "child2", ancestor_branch_name="main", ancestor_start_lsn=retained, tenant_id=tenant
+    )
+    ep_child2 = env.endpoints.create_start("child2", tenant_id=tenant, grpc=grpc)
+    with ep_child2.cursor() as cur:
+        assert query_scalar(cur, "SELECT count(*) FROM t") == 100
+        cur.execute("INSERT INTO t VALUES (0)")
+        assert query_scalar(cur, "SELECT count(*) FROM t") == 101
+    ep_child2.stop()
+
+    # An unretained LSN below the cutoff is still refused.
+    with pytest.raises(Exception, match="failed to get basebackup"):
+        env.endpoints.create_start(
+            "main",
+            endpoint_id="ep-unretained",
+            tenant_id=tenant,
+            lsn=unretained,
+            grpc=grpc,
+            pageserver_id=env.pageserver.id,
+            basebackup_request_tries=1,
+        )
+    env.pageserver.assert_log_contains(refused_basebackup)

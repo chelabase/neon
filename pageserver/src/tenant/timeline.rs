@@ -543,6 +543,17 @@ impl GcInfo {
     pub(crate) fn lsn_covered_by_lease(&self, lsn: Lsn) -> bool {
         self.leases.contains_key(&lsn)
     }
+
+    /// Whether GC keeps `lsn` readable whole: a child's branch point or a lease. An exact match
+    /// after `normalize_lsn` (no WAL record lies between an LSN and its normalized form); no
+    /// ranges, since gc-compaction keeps only those exact points below the cutoff.
+    pub(crate) fn lsn_is_retained(&self, lsn: Lsn) -> bool {
+        let lsn = xlog_utils::normalize_lsn(lsn, WAL_SEGMENT_SIZE);
+        self.retain_lsns
+            .iter()
+            .any(|(retained, _, _)| xlog_utils::normalize_lsn(*retained, WAL_SEGMENT_SIZE) == lsn)
+            || self.leases.contains_key(&lsn)
+    }
 }
 
 /// The `GcInfo` component describing which Lsns need to be retained.  Functionally, this
@@ -1916,14 +1927,17 @@ impl Timeline {
         }
     }
 
-    /// Check that it is valid to request operations with that lsn.
+    /// Check that it is valid to request operations with that lsn: at or above the applied GC
+    /// cutoff, or below it at a point GC keeps whole ([`GcInfo::lsn_is_retained`]).
+    ///
+    /// Takes `gc_info`'s lock briefly: never call it while holding that lock.
     pub(crate) fn check_lsn_is_in_scope(
         &self,
         lsn: Lsn,
         latest_gc_cutoff_lsn: &RcuReadGuard<Lsn>,
     ) -> anyhow::Result<()> {
         ensure!(
-            lsn >= **latest_gc_cutoff_lsn,
+            lsn >= **latest_gc_cutoff_lsn || self.gc_info.read().unwrap().lsn_is_retained(lsn),
             "LSN {} is earlier than latest GC cutoff {} (we might've already garbage collected needed data)",
             lsn,
             **latest_gc_cutoff_lsn,

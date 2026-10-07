@@ -2261,13 +2261,14 @@ impl PageServerHandler {
             ));
         }
 
-        // Clients should only read from recent LSNs on their timeline, or from locations holding an LSN lease.
+        // Clients should only read from recent LSNs on their timeline, or from locations holding an LSN lease
+        // or a child's branch point (GC keeps both whole).
         //
         // We may have older data available, but we make a best effort to detect this case and return an error,
         // to distinguish a misbehaving client (asking for old LSN) from a storage issue (data missing at a legitimate LSN).
         if request_lsn < **latest_gc_cutoff_lsn && !timeline.is_gc_blocked_by_lsn_lease_deadline() {
             let gc_info = &timeline.gc_info.read().unwrap();
-            if !gc_info.lsn_covered_by_lease(request_lsn) {
+            if !gc_info.lsn_covered_by_lease(request_lsn) && !gc_info.lsn_is_retained(request_lsn) {
                 return Err(
                     PageStreamError::BadRequest(format!(
                         "tried to request a page version that was garbage collected. requested at {} gc cutoff {}",
@@ -4426,6 +4427,23 @@ impl From<WaitedForLsn> for Lsn {
     fn from(WaitedForLsn(lsn): WaitedForLsn) -> Self {
         lsn
     }
+}
+
+/// The get_page LSN check, for unit tests outside this module (the error as text).
+#[cfg(test)]
+pub(crate) fn effective_request_lsn_for_test(
+    timeline: &Timeline,
+    request_lsn: Lsn,
+    latest_gc_cutoff_lsn: &RcuReadGuard<Lsn>,
+) -> Result<Lsn, String> {
+    PageServerHandler::effective_request_lsn(
+        timeline,
+        timeline.get_last_record_lsn(),
+        request_lsn,
+        request_lsn,
+        latest_gc_cutoff_lsn,
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
