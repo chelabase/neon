@@ -85,37 +85,45 @@ typedef struct
 	OpType		type;
 } DbEntry;
 
-typedef enum
+/*
+ * Roles are tracked by OID, never by name: a transaction can drop a role,
+ * rename another one onto its name, create a third under it and rename that
+ * one away, and keying by name mixed those roles' state (lost DROPs, data
+ * keys passed to a new role, a dropped role's attributes sent for another).
+ *
+ * RoleIdentities (the whole top-level transaction, never rolled back) holds,
+ * for every role a statement touched, its name before the transaction (the
+ * name at its first touch: any rename is a touch) or that the transaction
+ * created it. A subtransaction's rollback needs no undo: at commit the
+ * catalog, looked up by OID, says which roles exist and under which names.
+ *
+ * The per-(sub)transaction role tables hold what only the statements know
+ * (the password as typed, which options were given), by OID, and follow the
+ * subtransactions: a released one's merge into its parent, a rolled-back
+ * one's are dropped.
+ */
+typedef struct
 {
-	Login_Unset,				/* not given in this (sub)transaction */
-	Login_False,
-	Login_True,
-} LoginState;
+	Oid			oid;			/* hash key */
+	/* The name before the transaction; unused when created */
+	char		orig_name[NAMEDATALEN];
+	bool		created;
+} RoleIdentity;
 
 typedef struct
 {
-	char		name[NAMEDATALEN];
-	char		old_name[NAMEDATALEN];
+	Oid			oid;			/* hash key */
+
+	/*
+	 * The last PASSWORD clause (of CREATE or ALTER) decides: its text, or
+	 * NULL for PASSWORD NULL. Whether the role has a password at commit comes
+	 * from the catalog.
+	 */
 	const char *password;
-
-	/*
-	 * True when the transaction ran ALTER ROLE ... PASSWORD NULL on this role
-	 * (and set no password afterwards). Only forwarded, as an explicit JSON
-	 * null, when the role was also renamed: the receiver then drops its copy
-	 * of the password.
-	 */
-	bool		password_null;
-
-	/*
-	 * True when this entry decides the password (CREATE, DROP, RENAME or a
-	 * PASSWORD clause). An entry made only by an attribute change or a GRANT
-	 * leaves the parent's password alone when its subtransaction commits.
-	 */
 	bool		password_set;
-
-	/* LOGIN / NOLOGIN; CREATE always sets it (the statement's default if absent) */
-	LoginState	login;
-	/* VALID UNTIL, as written; NULL when not given */
+	/* LOGIN or NOLOGIN was given; the value sent is the catalog's at commit */
+	bool		login_set;
+	/* VALID UNTIL, as written (the last one given); NULL when not given */
 	const char *valid_until;
 
 	/*
@@ -124,27 +132,7 @@ typedef struct
 	 * the receiver resyncs the branch's roles from the catalog.
 	 */
 	bool		touched;
-
-	/*
-	 * Created in this (sub)transaction: when its subtransaction commits, the
-	 * parent's attributes for the name (from before a DROP) are forgotten.
-	 */
-	bool		created;
-
-	/*
-	 * Created after this top-level transaction dropped a role of the same
-	 * name (in this subtransaction, an enclosing one or a released one; see
-	 * DdlHashTable.dropped_roles): the new role replaces an old one. Sent as
-	 * "recreated": true (with "touched": the old role's members lost their
-	 * membership), so the receiver checks the old role's data keys as it
-	 * checks a DROP. Implies created. A later ALTER keeps it, and so does a
-	 * rename: the receiver applies renames first and moves the data keys
-	 * with every rename it accepts, so under the new name it sees the
-	 * dropped role's keys.
-	 */
-	bool		recreated;
-	OpType		type;
-} RoleEntry;
+} RoleAttrs;
 
 /*
  * We keep one of these for each subtransaction in a stack. When a subtransaction
@@ -156,19 +144,13 @@ typedef struct DdlHashTable
 	struct DdlHashTable *prev_table;
 	size_t		subtrans_level;
 	HTAB	   *db_table;
-	HTAB	   *role_table;
-
-	/*
-	 * The role names this (sub)transaction dropped. Kept apart from
-	 * role_table, whose entry for a name a later rename can overwrite or move
-	 * away: a CREATE of a name in any of these sets is a recreation.
-	 */
-	HTAB	   *dropped_roles;
+	HTAB	   *role_table;		/* RoleAttrs by OID */
 } DdlHashTable;
 
 static DdlHashTable RootTable;
 static DdlHashTable *CurrentDdlTable = &RootTable;
 static int SubtransLevel; /* current nesting level of subtransactions */
+static HTAB *RoleIdentities;	/* RoleIdentity by OID, in TopTransactionContext */
 
 static void
 PushKeyNull(JsonbParseState **state, char *key)
@@ -215,42 +197,213 @@ PushKeyBool(JsonbParseState **state, char *key, bool value)
 	pushJsonbValue(state, WJB_VALUE, &v);
 }
 
-/* The entry carries a LOGIN, VALID UNTIL or touched key */
-static bool
-HasRoleAttributes(RoleEntry *entry)
-{
-	return entry->type == Op_Set &&
-		(entry->login != Login_Unset || entry->valid_until != NULL || entry->touched ||
-		 entry->recreated);
-}
-
-/* Forgets the role's attributes (for a new entry, a DROP or a CREATE) */
-static void
-ResetRoleAttributes(RoleEntry *entry)
-{
-	entry->login = Login_Unset;
-	entry->valid_until = NULL;
-	entry->touched = false;
-}
-
 /* A new entry that knows nothing yet: the parent's state stays */
 static void
-InitRoleEntry(RoleEntry *entry)
+InitRoleAttrs(RoleAttrs *attrs)
 {
-	memset(entry->old_name, 0, sizeof(entry->old_name));
-	entry->password = NULL;
-	entry->password_null = false;
-	entry->password_set = false;
-	ResetRoleAttributes(entry);
-	entry->created = false;
-	entry->recreated = false;
-	entry->type = Op_Set;
+	attrs->password = NULL;
+	attrs->password_set = false;
+	attrs->login_set = false;
+	attrs->valid_until = NULL;
+	attrs->touched = false;
 }
 
+/* What became of a role the transaction touched, read from the catalog at commit */
+typedef struct
+{
+	Oid			oid;
+	const char *orig_name;		/* NULL when created */
+	bool		exists;
+	char		name[NAMEDATALEN];	/* the name at commit, when it exists */
+	bool		canlogin;
+	bool		has_password;
+	RoleAttrs  *attrs;			/* NULL when no option was given */
+} RoleOutcome;
+
+/* A role that exists at commit has this name */
+static bool
+NameTaken(RoleOutcome *outcomes, int count, const char *name)
+{
+	for (int i = 0; i < count; i++)
+	{
+		if (outcomes[i].exists && strcmp(outcomes[i].name, name) == 0)
+			return true;
+	}
+	return false;
+}
+
+/* A role that held this name before the transaction is gone */
+static bool
+NameOfDroppedRole(RoleOutcome *outcomes, int count, const char *name)
+{
+	for (int i = 0; i < count; i++)
+	{
+		if (!outcomes[i].exists && outcomes[i].orig_name != NULL &&
+			strcmp(outcomes[i].orig_name, name) == 0)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * The roles' outcomes, one per touched role, from the catalog. Returns the
+ * count; *out is palloc'd.
+ */
+static int
+RoleOutcomes(RoleOutcome **out)
+{
+	HASH_SEQ_STATUS status;
+	RoleIdentity *id;
+	RoleOutcome *outcomes;
+	int			count = 0;
+
+	if (!RoleIdentities)
+	{
+		*out = NULL;
+		return 0;
+	}
+	outcomes = palloc0(sizeof(RoleOutcome) * Max(hash_get_num_entries(RoleIdentities), 1));
+	hash_seq_init(&status, RoleIdentities);
+	while ((id = hash_seq_search(&status)) != NULL)
+	{
+		RoleOutcome *o = &outcomes[count++];
+		HeapTuple	tuple = SearchSysCache1(AUTHOID, ObjectIdGetDatum(id->oid));
+
+		o->oid = id->oid;
+		o->orig_name = id->created ? NULL : id->orig_name;
+		if (HeapTupleIsValid(tuple))
+		{
+			Form_pg_authid form = (Form_pg_authid) GETSTRUCT(tuple);
+			bool		isnull;
+
+			o->exists = true;
+			strlcpy(o->name, NameStr(form->rolname), NAMEDATALEN);
+			o->canlogin = form->rolcanlogin;
+			(void) SysCacheGetAttr(AUTHOID, tuple, Anum_pg_authid_rolpassword, &isnull);
+			o->has_password = !isnull;
+			ReleaseSysCache(tuple);
+		}
+		if (RootTable.role_table)
+			o->attrs = hash_search(RootTable.role_table, &id->oid, HASH_FIND, NULL);
+	}
+	*out = outcomes;
+	return count;
+}
+
+/*
+ * Pushes the role's entry, if it has one. Returns whether it did (with
+ * state NULL it only tells).
+ *
+ * - A role created in the transaction that exists at commit: a set under its
+ *   name, never an old_name (no receiver row is its own), with its password
+ *   (or an explicit null) and its login, and "recreated" (with "touched")
+ *   when a role that held the name before the transaction is gone.
+ * - A role from before the transaction that exists at commit: a set with its
+ *   old_name when renamed, the password when a PASSWORD clause was given,
+ *   login (the catalog's) when LOGIN or NOLOGIN was given, valid_until, and
+ *   "touched" for other options and memberships, or when it took the name
+ *   of a role that is gone (whose members lost their membership).
+ * - A role from before the transaction that is gone: a del under its name
+ *   before the transaction, unless a role now has that name (a set with
+ *   recreated, or a rename onto it, which the receiver refuses or replaces
+ *   when it moves its rows).
+ */
+static bool
+PushRoleEntry(JsonbParseState **state, RoleOutcome *outcomes, int count, RoleOutcome *o)
+{
+	RoleAttrs  *attrs = o->attrs;
+	bool		created = o->orig_name == NULL;
+	bool		renamed;
+	bool		replaces_dropped;
+	bool		password_set;
+	bool		login;
+	bool		touched;
+
+	if (!o->exists)
+	{
+		if (created || NameTaken(outcomes, count, o->orig_name))
+			return false;
+		if (state)
+		{
+			pushJsonbValue(state, WJB_BEGIN_OBJECT, NULL);
+			PushKeyValue(state, "op", "del");
+			PushKeyValue(state, "name", (char *) o->orig_name);
+			pushJsonbValue(state, WJB_END_OBJECT, NULL);
+		}
+		return true;
+	}
+
+	renamed = !created && strcmp(o->orig_name, o->name) != 0;
+	replaces_dropped = NameOfDroppedRole(outcomes, count, o->name);
+	password_set = created || (attrs && attrs->password_set);
+	login = created || (attrs && attrs->login_set);
+	touched = (attrs && attrs->touched) || replaces_dropped;
+	if (!created && !renamed && !password_set && !login &&
+		!(attrs && attrs->valid_until) && !touched)
+		return false;
+	if (!state)
+		return true;
+
+	pushJsonbValue(state, WJB_BEGIN_OBJECT, NULL);
+	PushKeyValue(state, "op", "set");
+	PushKeyValue(state, "name", o->name);
+	if (password_set)
+	{
+		const char *plain = attrs ? attrs->password : NULL;
+
+		if (o->has_password && plain)
+		{
+#if PG_MAJORVERSION_NUM == 14
+			char	   *logdetail;
+#else
+			const char *logdetail;
+#endif
+			char	   *encrypted_password = get_role_password(o->name, &logdetail);
+
+			if (!encrypted_password)
+				elog(ERROR, "Failed to get encrypted password: %s", logdetail);
+			PushKeyValue(state, "password", (char *) plain);
+			PushKeyValue(state, "encrypted_password", encrypted_password);
+		}
+		else if (created || renamed || login || (attrs && attrs->valid_until) || touched)
+		{
+			/*
+			 * No password (or none whose text this transaction typed): an
+			 * explicit null. A plain PASSWORD NULL with nothing else is the
+			 * entry without a password key, as before.
+			 */
+			if (o->has_password)
+				elog(LOG, "role \"%s\" has a password this transaction didn't set", o->name);
+			PushKeyNull(state, "password");
+		}
+	}
+	if (renamed)
+		PushKeyValue(state, "old_name", (char *) o->orig_name);
+	if (login)
+		PushKeyBool(state, "login", o->canlogin);
+	if (attrs && attrs->valid_until)
+		PushKeyValue(state, "valid_until", (char *) attrs->valid_until);
+	if (touched)
+		PushKeyBool(state, "touched", true);
+	if (created && replaces_dropped)
+		PushKeyBool(state, "recreated", true);
+	pushJsonbValue(state, WJB_END_OBJECT, NULL);
+	return true;
+}
+
+/* NULL when there is nothing to send */
 static char *
 ConstructDeltaMessage()
 {
 	JsonbParseState *state = NULL;
+	RoleOutcome *outcomes;
+	int			count = RoleOutcomes(&outcomes);
+	bool		any_role = false;
+
+	for (int i = 0; i < count && !any_role; i++)
+		any_role = PushRoleEntry(NULL, outcomes, count, &outcomes[i]);
+	if (!RootTable.db_table && !any_role)
+		return NULL;
 
 	pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
 	if (RootTable.db_table)
@@ -284,71 +437,17 @@ ConstructDeltaMessage()
 		pushJsonbValue(&state, WJB_END_ARRAY, NULL);
 	}
 
-	if (RootTable.role_table)
+	if (any_role)
 	{
 		JsonbValue	roles;
-		HASH_SEQ_STATUS status;
-		RoleEntry  *entry;
 
 		roles.type = jbvString;
 		roles.val.string.val = "roles";
 		roles.val.string.len = strlen(roles.val.string.val);
 		pushJsonbValue(&state, WJB_KEY, &roles);
 		pushJsonbValue(&state, WJB_BEGIN_ARRAY, NULL);
-
-		hash_seq_init(&status, RootTable.role_table);
-		while ((entry = hash_seq_search(&status)) != NULL)
-		{
-			pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
-			PushKeyValue(&state, "op", entry->type == Op_Set ? "set" : "del");
-			PushKeyValue(&state, "name", entry->name);
-			if (entry->password)
-			{
-#if PG_MAJORVERSION_NUM == 14
-				char	   *logdetail;
-#else
-				const char *logdetail;
-#endif
-				char	   *encrypted_password;
-				PushKeyValue(&state, "password", (char *) entry->password);
-				encrypted_password = get_role_password(entry->name, &logdetail);
-
-				if (encrypted_password)
-				{
-					PushKeyValue(&state, "encrypted_password", encrypted_password);
-				}
-				else
-				{
-					elog(ERROR, "Failed to get encrypted password: %s", logdetail);
-				}
-			}
-			else if (entry->password_null &&
-					 (entry->old_name[0] != '\0' || HasRoleAttributes(entry)))
-			{
-				/*
-				 * Renamed, or attributes changed too, then PASSWORD NULL: an
-				 * explicit null, no encrypted_password. Without these, a
-				 * missing password key already means PASSWORD NULL.
-				 */
-				PushKeyNull(&state, "password");
-			}
-			if (entry->old_name[0] != '\0')
-			{
-				PushKeyValue(&state, "old_name", entry->old_name);
-			}
-			if (entry->type == Op_Set)
-			{
-				if (entry->login != Login_Unset)
-					PushKeyBool(&state, "login", entry->login == Login_True);
-				if (entry->valid_until)
-					PushKeyValue(&state, "valid_until", (char *) entry->valid_until);
-				if (entry->touched || entry->recreated)
-					PushKeyBool(&state, "touched", true);
-				if (entry->recreated)
-					PushKeyBool(&state, "recreated", true);
-			}
-			pushJsonbValue(&state, WJB_END_OBJECT, NULL);
-		}
+		for (int i = 0; i < count; i++)
+			PushRoleEntry(&state, outcomes, count, &outcomes[i]);
 		pushJsonbValue(&state, WJB_END_ARRAY, NULL);
 	}
 	{
@@ -399,7 +498,9 @@ SendDeltasToControlPlane()
 {
 	static CURL		*handle = NULL;
 
-	if (!RootTable.db_table && !RootTable.role_table)
+	char	   *message;
+
+	if (!RootTable.db_table && !RoleIdentities)
 		return;
 	if (!ConsoleURL)
 	{
@@ -407,6 +508,9 @@ SendDeltasToControlPlane()
 		return;
 	}
 	if (!ForwardDDL)
+		return;
+	message = ConstructDeltaMessage();
+	if (!message)
 		return;
 
 	if (handle == NULL)
@@ -442,7 +546,6 @@ SendDeltasToControlPlane()
 	}
 
 	{
-		char	   *message = ConstructDeltaMessage();
 		ErrorString str;
 		const int	num_retries = 5;
 		CURLcode	curl_status;
@@ -516,7 +619,6 @@ InitCurrentDdlTableIfNeeded()
 		new_table->subtrans_level = SubtransLevel;
 		new_table->role_table = NULL;
 		new_table->db_table = NULL;
-		new_table->dropped_roles = NULL;
 		CurrentDdlTable = new_table;
 	}
 }
@@ -548,34 +650,71 @@ InitRoleTableIfNeeded()
 	{
 		HASHCTL		role_ctl = {};
 
-		role_ctl.keysize = NAMEDATALEN;
-		role_ctl.entrysize = sizeof(RoleEntry);
+		role_ctl.keysize = sizeof(Oid);
+		role_ctl.entrysize = sizeof(RoleAttrs);
 		role_ctl.hcxt = CurTransactionContext;
 		CurrentDdlTable->role_table = hash_create(
-												  "Roles Created",
+												  "Role Options",
 												  4,
 												  &role_ctl,
-												  HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
+												  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	}
 }
 
-static void
-InitDroppedRolesIfNeeded()
+/* The role's options entry in the current (sub)transaction's table */
+static RoleAttrs *
+RoleAttrsFor(Oid oid)
 {
-	InitCurrentDdlTableIfNeeded();
-	if (!CurrentDdlTable->dropped_roles)
-	{
-		HASHCTL		dropped_ctl = {};
+	bool		found = false;
+	RoleAttrs  *attrs;
 
-		dropped_ctl.keysize = NAMEDATALEN;
-		dropped_ctl.entrysize = NAMEDATALEN;
-		dropped_ctl.hcxt = CurTransactionContext;
-		CurrentDdlTable->dropped_roles = hash_create(
-													 "Roles Dropped",
-													 4,
-													 &dropped_ctl,
-													 HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
+	InitRoleTableIfNeeded();
+	attrs = hash_search(CurrentDdlTable->role_table, &oid, HASH_ENTER, &found);
+	if (!found)
+		InitRoleAttrs(attrs);
+	return attrs;
+}
+
+/* The role's identity entry, made when missing (found tells whether it was there) */
+static RoleIdentity *
+RoleIdentityFor(Oid oid, bool *found)
+{
+	if (!RoleIdentities)
+	{
+		HASHCTL		ctl = {};
+
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(RoleIdentity);
+		ctl.hcxt = TopTransactionContext;
+		RoleIdentities = hash_create("Role Identities", 8, &ctl,
+									 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	}
+	return hash_search(RoleIdentities, &oid, HASH_ENTER, found);
+}
+
+/*
+ * Called before a statement that changes, renames, drops or grants an
+ * existing role: at the role's first touch in the transaction its current
+ * name is its name before the transaction. Returns the OID, or InvalidOid
+ * when there is no such role (the statement then fails, or does nothing with
+ * IF EXISTS).
+ */
+static Oid
+TouchExistingRole(const char *role_name)
+{
+	Oid			oid = get_role_oid(role_name, true);
+	bool		found = false;
+	RoleIdentity *id;
+
+	if (!OidIsValid(oid))
+		return InvalidOid;
+	id = RoleIdentityFor(oid, &found);
+	if (!found)
+	{
+		strlcpy(id->orig_name, role_name, NAMEDATALEN);
+		id->created = false;
+	}
+	return oid;
 }
 
 static void
@@ -655,168 +794,39 @@ MergeTable()
 		hash_destroy(old_table->db_table);
 	}
 
+	/*
+	 * Role options are by OID, so a rename needs nothing here: what this
+	 * subtransaction gave wins, touched is OR-ed, and an entry that gave no
+	 * PASSWORD clause keeps the parent's password.
+	 */
 	if (old_table->role_table)
 	{
-		RoleEntry  *entry;
+		RoleAttrs  *entry;
 		HASH_SEQ_STATUS status;
-		long		count = hash_get_num_entries(old_table->role_table);
-		RoleEntry  *olds = palloc0(sizeof(RoleEntry) * Max(count, 1));
-		bool	   *found_olds = palloc0(sizeof(bool) * Max(count, 1));
-		long		i;
 
 		InitRoleTableIfNeeded();
-
-		/*
-		 * Renames first copy what the parent knew about their old names, and
-		 * those parent entries go (they belong to the renamed roles); only then
-		 * are this subtransaction's entries written. So no rename reads an entry
-		 * this merge just wrote, whatever the hash order: e.g. a new role
-		 * created under a name renamed away in the same subtransaction, or a
-		 * swap of two names. The subtransaction's table isn't changed here, so
-		 * the three scans visit its entries in the same order.
-		 */
-		i = 0;
 		hash_seq_init(&status, old_table->role_table);
 		while ((entry = hash_seq_search(&status)) != NULL)
 		{
-			if (entry->old_name[0] != '\0')
-			{
-				RoleEntry  *old = hash_search(CurrentDdlTable->role_table,
-											  entry->old_name,
-											  HASH_FIND,
-											  NULL);
-
-				if (old)
-				{
-					olds[i] = *old;
-					found_olds[i] = true;
-				}
-			}
-			i++;
-		}
-		hash_seq_init(&status, old_table->role_table);
-		while ((entry = hash_seq_search(&status)) != NULL)
-		{
-			if (entry->old_name[0] != '\0')
-				hash_search(CurrentDdlTable->role_table,
-							entry->old_name,
-							HASH_REMOVE,
-							NULL);
-		}
-
-		i = 0;
-		hash_seq_init(&status, old_table->role_table);
-		while ((entry = hash_seq_search(&status)) != NULL)
-		{
-			RoleEntry  *old = found_olds[i] ? &olds[i] : NULL;
 			bool		found_parent = false;
-			RoleEntry  *to_write = hash_search(
-											   CurrentDdlTable->role_table,
-											   entry->name,
+			RoleAttrs  *to_write = hash_search(CurrentDdlTable->role_table,
+											   &entry->oid,
 											   HASH_ENTER,
 											   &found_parent);
 
-			i++;
 			if (!found_parent)
-				InitRoleEntry(to_write);
-			to_write->type = entry->type;
-
-			/*
-			 * An entry made only by an attribute change or a GRANT keeps the
-			 * parent's password.
-			 */
+				InitRoleAttrs(to_write);
 			if (entry->password_set)
 			{
 				to_write->password = entry->password;
-				to_write->password_null = entry->password_null;
 				to_write->password_set = true;
 			}
-
-			/*
-			 * Attributes: what this subtransaction set wins, touched is
-			 * OR-ed, and a DROP forgets them.
-			 */
-			if (entry->type == Op_Delete)
-			{
-				ResetRoleAttributes(to_write);
-				to_write->created = false;
-				to_write->recreated = false;
-			}
-			else
-			{
-				if (entry->created)
-				{
-					ResetRoleAttributes(to_write);
-					to_write->created = true;
-					to_write->recreated = entry->recreated;
-				}
-				if (entry->login != Login_Unset)
-					to_write->login = entry->login;
-				if (entry->valid_until)
-					to_write->valid_until = entry->valid_until;
-				to_write->touched |= entry->touched;
-			}
-
-			/*
-			 * An entry without old_name (e.g. a PASSWORD change after a
-			 * rename in the parent) must keep the parent's old_name.
-			 */
-			if (entry->old_name[0] == '\0')
-				continue;
-			strlcpy(to_write->old_name, entry->old_name, NAMEDATALEN);
-
-			/*
-			 * A rename in this subtransaction: carry over what the parent
-			 * knew about the old name (its own old_name, which keeps the
-			 * chain, and its password), unless this subtransaction set a
-			 * password itself.
-			 */
-			if (!old)
-				continue;
-			if (old->old_name[0] != '\0')
-				strlcpy(to_write->old_name, old->old_name, NAMEDATALEN);
-
-			/*
-			 * A role created in this subtransaction (then renamed) is a new
-			 * role: what the parent recorded under the name it was created
-			 * with belongs to the role dropped before it.
-			 */
-			if (entry->created)
-				continue;
-			if (!entry->password && !entry->password_null)
-			{
-				to_write->password = old->password;
-				to_write->password_null = old->password_null;
-			}
-			/* Likewise the attributes the parent recorded under the old name */
-			if (entry->type == Op_Set)
-			{
-				if (entry->login == Login_Unset)
-					to_write->login = old->login;
-				if (!entry->valid_until)
-					to_write->valid_until = old->valid_until;
-				to_write->touched |= old->touched;
-				/* A rename keeps the role created (or recreated) */
-				to_write->created |= old->created;
-				to_write->recreated |= old->recreated;
-			}
+			to_write->login_set |= entry->login_set;
+			if (entry->valid_until)
+				to_write->valid_until = entry->valid_until;
+			to_write->touched |= entry->touched;
 		}
-		pfree(olds);
-		pfree(found_olds);
 		hash_destroy(old_table->role_table);
-	}
-
-	/* The dropped names join the parent's */
-	if (old_table->dropped_roles)
-	{
-		char	   *name;
-		HASH_SEQ_STATUS status;
-
-		InitDroppedRolesIfNeeded();
-		hash_seq_init(&status, old_table->dropped_roles);
-		while ((name = hash_seq_search(&status)) != NULL)
-			hash_search(CurrentDdlTable->dropped_roles, name, HASH_ENTER, NULL);
-		hash_destroy(old_table->dropped_roles);
 	}
 }
 
@@ -863,7 +873,7 @@ NeonXactCallback(XactEvent event, void *arg)
 	}
 	RootTable.role_table = NULL;
 	RootTable.db_table = NULL;
-	RootTable.dropped_roles = NULL;
+	RoleIdentities = NULL;		/* freed with TopTransactionContext */
 	Assert(CurrentDdlTable == &RootTable);
 }
 
@@ -1057,88 +1067,43 @@ ParseRoleOptions(List *options, RoleOptions *out)
 
 /* Records LOGIN, VALID UNTIL and touched from the statement's options */
 static void
-SetRoleAttributes(RoleEntry *entry, RoleOptions *opts)
+SetRoleAttributes(RoleAttrs *attrs, RoleOptions *opts)
 {
+	if (opts->dpass)
+	{
+		attrs->password = opts->dpass->arg ?
+			MemoryContextStrdup(CurTransactionContext, strVal(opts->dpass->arg)) : NULL;
+		attrs->password_set = true;
+	}
 	if (opts->dlogin)
-		entry->login = defGetBoolean(opts->dlogin) ? Login_True : Login_False;
+		attrs->login_set = true;
 	if (opts->dvalid_until && opts->dvalid_until->arg)
-		entry->valid_until = MemoryContextStrdup(CurTransactionContext,
+		attrs->valid_until = MemoryContextStrdup(CurTransactionContext,
 												 strVal(opts->dvalid_until->arg));
 	if (opts->touched)
-		entry->touched = true;
+		attrs->touched = true;
 }
 
 /*
- * True when this top-level transaction dropped a role of this name, in this
- * subtransaction, an enclosing one or a released one (whatever renames did to
- * the name's entry since).
+ * After CREATE ROLE / USER / GROUP ran: the new role's OID is known. It is
+ * always sent with its login and its password (an explicit null when it has
+ * none), so its PASSWORD clause, if any, is kept.
  */
-static bool
-RoleDroppedInTransaction(const char *role_name)
-{
-	for (DdlHashTable *table = CurrentDdlTable; table != NULL; table = table->prev_table)
-	{
-		if (table->dropped_roles &&
-			hash_search(table->dropped_roles, role_name, HASH_FIND, NULL) != NULL)
-			return true;
-	}
-	return false;
-}
-
 static void
-HandleCreateRole(CreateRoleStmt *stmt)
+HandleCreateRoleDone(CreateRoleStmt *stmt)
 {
-	bool		found = false;
-	RoleEntry  *entry;
 	RoleOptions opts;
-	bool		recreated;
+	Oid			oid = get_role_oid(stmt->role, true);
+	bool		found = false;
+	RoleIdentity *id;
 
-	InitRoleTableIfNeeded();
-
+	if (!OidIsValid(oid))
+		return;
+	id = RoleIdentityFor(oid, &found);
+	id->created = true;
+	id->orig_name[0] = '\0';
 	ParseRoleOptions(stmt->options, &opts);
-
-	/*
-	 * The transaction dropped a role of this name: this one replaces it. A
-	 * name freed only by a rename isn't a recreation.
-	 */
-	recreated = RoleDroppedInTransaction(stmt->role);
-
-	entry = hash_search(CurrentDdlTable->role_table,
-						stmt->role,
-						HASH_ENTER,
-						&found);
-	if (!found)
-		InitRoleEntry(entry);
-	/*
-	 * A new role without a password is sent with an explicit null (beside
-	 * its login key): the receiver then drops any copy left under the name
-	 * (DROP and CREATE in one transaction merge into one set) and applies
-	 * its checks for reserved names.
-	 */
-	if (opts.dpass && opts.dpass->arg)
-	{
-		entry->password = MemoryContextStrdup(CurTransactionContext, strVal(opts.dpass->arg));
-		entry->password_null = false;
-	}
-	else
-	{
-		entry->password = NULL;
-		entry->password_null = true;
-	}
-	entry->password_set = true;
-
-	/*
-	 * A new role: forget anything recorded under its name, and always send
-	 * LOGIN (CREATE USER defaults to LOGIN, CREATE ROLE and GROUP to NOLOGIN).
-	 */
-	ResetRoleAttributes(entry);
-	entry->created = true;
-	entry->login = stmt->stmt_type == ROLESTMT_USER ? Login_True : Login_False;
-	SetRoleAttributes(entry, &opts);
-	entry->recreated = recreated;
-	if (recreated)
-		entry->touched = true;
-	entry->type = Op_Set;
+	SetRoleAttributes(RoleAttrsFor(oid), &opts);
 }
 
 static void
@@ -1146,138 +1111,52 @@ HandleAlterRole(AlterRoleStmt *stmt)
 {
 	char	   *role_name;
 	RoleOptions opts;
-	bool		found = false;
-	RoleEntry  *entry;
-
-	InitRoleTableIfNeeded();
+	Oid			oid;
 
 	role_name = get_rolespec_name(stmt->role);
 	if (IsPrivilegedRole(role_name) && !superuser())
 		elog(ERROR, "could not ALTER %s", privileged_role_name);
 
 	/* Return when nothing tracked is present */
-	if (!ParseRoleOptions(stmt->options, &opts))
+	if (ParseRoleOptions(stmt->options, &opts))
 	{
-		pfree(role_name);
-		return;
+		oid = TouchExistingRole(role_name);
+		if (OidIsValid(oid))
+			SetRoleAttributes(RoleAttrsFor(oid), &opts);
 	}
-
-	entry = hash_search(CurrentDdlTable->role_table,
-						role_name,
-						HASH_ENTER,
-						&found);
-	if (!found)
-		InitRoleEntry(entry);
-	if (opts.dpass)
-	{
-		if (opts.dpass->arg)
-			entry->password = MemoryContextStrdup(CurTransactionContext, strVal(opts.dpass->arg));
-		else
-			entry->password = NULL;
-		entry->password_null = (opts.dpass->arg == NULL);
-		entry->password_set = true;
-	}
-	SetRoleAttributes(entry, &opts);
-	entry->type = Op_Set;
-
 	pfree(role_name);
 }
 
+/* The name before the transaction is recorded; the new name is read at commit */
 static void
 HandleRoleRename(RenameStmt *stmt)
 {
-	bool		found = false;
-	RoleEntry  *entry;
-	RoleEntry  *entry_for_new_name;
-
 	Assert(stmt->renameType == OBJECT_ROLE);
-	InitRoleTableIfNeeded();
-
-	entry = hash_search(CurrentDdlTable->role_table,
-						stmt->subname,
-						HASH_FIND,
-						&found);
-
-	entry_for_new_name = hash_search(CurrentDdlTable->role_table,
-									 stmt->newname,
-									 HASH_ENTER,
-									 NULL);
-
-	entry_for_new_name->type = Op_Set;
-	if (found)
-	{
-		if (entry->old_name[0] != '\0')
-			strlcpy(entry_for_new_name->old_name, entry->old_name, NAMEDATALEN);
-		else
-			strlcpy(entry_for_new_name->old_name, entry->name, NAMEDATALEN);
-		entry_for_new_name->password = entry->password;
-		entry_for_new_name->password_null = entry->password_null;
-		entry_for_new_name->login = entry->login;
-		entry_for_new_name->valid_until = entry->valid_until;
-		entry_for_new_name->touched = entry->touched;
-		entry_for_new_name->created = entry->created;
-		entry_for_new_name->recreated = entry->recreated;
-		hash_search(
-					CurrentDdlTable->role_table,
-					entry->name,
-					HASH_REMOVE,
-					NULL);
-	}
-	else
-	{
-		strlcpy(entry_for_new_name->old_name, stmt->subname, NAMEDATALEN);
-		entry_for_new_name->password = NULL;
-		entry_for_new_name->password_null = false;
-		ResetRoleAttributes(entry_for_new_name);
-		entry_for_new_name->created = false;
-		entry_for_new_name->recreated = false;
-	}
-	entry_for_new_name->password_set = true;
+	(void) TouchExistingRole(stmt->subname);
 }
 
+/* Likewise: a role from before the transaction that is gone at commit is sent as a del */
 static void
 HandleDropRole(DropRoleStmt *stmt)
 {
 	ListCell   *item;
 
-	InitRoleTableIfNeeded();
-	InitDroppedRolesIfNeeded();
-
 	foreach(item, stmt->roles)
 	{
 		RoleSpec   *spec = lfirst(item);
-		bool		found = false;
-		RoleEntry  *entry = hash_search(
-										CurrentDdlTable->role_table,
-										spec->rolename,
-										HASH_ENTER,
-										&found);
 
-		if (!found)
-			InitRoleEntry(entry);
-		hash_search(CurrentDdlTable->dropped_roles, spec->rolename, HASH_ENTER, NULL);
-		entry->type = Op_Delete;
-		entry->password = NULL;
-		entry->password_null = false;
-		entry->password_set = true;
-		ResetRoleAttributes(entry);
-		entry->created = false;
-		entry->recreated = false;
+		if (spec->roletype == ROLESPEC_CSTRING && spec->rolename)
+			(void) TouchExistingRole(spec->rolename);
 	}
 }
 
 static void
 MarkRoleTouched(const char *role_name)
 {
-	bool		found = false;
-	RoleEntry  *entry = hash_search(CurrentDdlTable->role_table,
-									role_name,
-									HASH_ENTER,
-									&found);
+	Oid			oid = TouchExistingRole(role_name);
 
-	if (!found)
-		InitRoleEntry(entry);
-	entry->touched = true;
+	if (OidIsValid(oid))
+		RoleAttrsFor(oid)->touched = true;
 }
 
 /*
@@ -1289,8 +1168,6 @@ static void
 HandleGrantRole(GrantRoleStmt *stmt)
 {
 	ListCell   *item;
-
-	InitRoleTableIfNeeded();
 
 	foreach(item, stmt->grantee_roles)
 	{
@@ -1876,9 +1753,6 @@ NeonProcessUtility(
 		case T_DropdbStmt:
 			HandleDropDb(castNode(DropdbStmt, parseTree));
 			break;
-		case T_CreateRoleStmt:
-			HandleCreateRole(castNode(CreateRoleStmt, parseTree));
-			break;
 		case T_AlterRoleStmt:
 			HandleAlterRole(castNode(AlterRoleStmt, parseTree));
 			break;
@@ -1924,6 +1798,10 @@ NeonProcessUtility(
 			dest,
 			qc);
 	}
+
+	/* A new role is tracked once it exists (by its OID) */
+	if (IsA(parseTree, CreateRoleStmt))
+		HandleCreateRoleDone(castNode(CreateRoleStmt, parseTree));
 }
 
 /*

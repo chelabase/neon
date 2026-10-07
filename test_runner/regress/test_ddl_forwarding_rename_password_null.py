@@ -60,10 +60,10 @@ SCRAM = "<scram-sha-256 hash>"
                 ]
             },
         ),
-        # DROP after a rename deletes the role under its new name, keeping old_name.
+        # DROP after a rename deletes the role under its name before the transaction.
         (
             "ALTER ROLE a RENAME TO b; DROP ROLE b",
-            {"roles": [{"op": "del", "name": "b", "old_name": "a"}]},
+            {"roles": [{"op": "del", "name": "a"}]},
         ),
         # Savepoints (RELEASE) give the same payloads as the same statements without them.
         (
@@ -104,7 +104,7 @@ SCRAM = "<scram-sha-256 hash>"
         ),
         (
             "ALTER ROLE a RENAME TO b; SAVEPOINT s; DROP ROLE b; RELEASE s",
-            {"roles": [{"op": "del", "name": "b", "old_name": "a"}]},
+            {"roles": [{"op": "del", "name": "a"}]},
         ),
         # A rename in a savepoint of an untouched role.
         (
