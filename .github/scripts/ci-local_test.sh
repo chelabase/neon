@@ -111,6 +111,67 @@ for step in build rust-tests regress; do
     fi
 done
 
+# Volume names: CHELA_NEON_VOLUME_SUFFIX gives each clone its own pair.
+vols() {
+    (
+        if [[ $# -gt 0 ]]; then export CHELA_NEON_VOLUME_SUFFIX="$1"; else unset CHELA_NEON_VOLUME_SUFFIX; fi
+        init_volumes || exit 1
+        echo "$CARGO_VOLUME $TARGET_VOLUME"
+    )
+}
+expect "volume names default" "chela-neon-cargo chela-neon-target" "$(vols)"
+expect "volume names with suffix p4" "chela-neon-cargo-p4 chela-neon-target-p4" "$(vols p4)"
+expect "suffix with digits and dashes" "chela-neon-cargo-a-1 chela-neon-target-a-1" "$(vols a-1)"
+for bad in P4 a/b "" "a b" "p_4"; do
+    if vols "$bad" >/dev/null 2>&1; then
+        echo "FAIL: suffix [$bad] must be refused"
+        failures=$((failures + 1))
+    else
+        echo "ok: suffix [$bad] is refused"
+    fi
+done
+suffixed="$(CHELA_NEON_VOLUME_SUFFIX=p4 bash -c 'source "$1"; init_volumes; docker_args /r v17 release build | paste -sd" " -' _ "$here/ci-local.sh")"
+if [[ "$suffixed" == *src=chela-neon-cargo-p4,* && "$suffixed" == *src=chela-neon-target-p4,* ]]; then
+    echo "ok: docker args use the suffixed volumes"
+else
+    echo "FAIL: docker args must use the suffixed volumes: $suffixed"
+    failures=$((failures + 1))
+fi
+
+# --only and --test-filter.
+steps() {
+    (
+        parse_args "$@" || exit 1
+        echo "$(selected_steps | paste -sd, -) regress=$REGRESS"
+    )
+}
+expect "default steps" "lint,build,rust-tests regress=0" "$(steps)"
+expect "--regress adds regress" "lint,build,rust-tests,regress regress=1" "$(steps --regress)"
+expect "--only build runs only build" "build regress=0" "$(steps --only build)"
+expect "--only build,rust-tests runs both" "build,rust-tests regress=0" "$(steps --only build,rust-tests)"
+expect "--only runs in pipeline order" "build,rust-tests regress=0" "$(steps --only rust-tests,build)"
+expect "--only regress sets regress=1" "regress regress=1" "$(steps --only regress)"
+for bad in "--only lint" "--only" "--only build,foo" "--only ," "--test-filter x" "--test-filter" "--only build --test-filter x"; do
+    # shellcheck disable=SC2086
+    if steps $bad >/dev/null 2>&1; then
+        echo "FAIL: [$bad] must be rejected"
+        failures=$((failures + 1))
+    else
+        echo "ok: [$bad] is rejected"
+    fi
+done
+expect "--test-filter with rust-tests" "rust-tests regress=0" "$(steps --only rust-tests --test-filter 'test(foo)')"
+nx="$(TEST_FILTER='test(foo)' nextest_expr)"
+expect "--test-filter reaches the nextest expression" \
+    "(not (package(remote_storage) and binary(test_real_gcs))) and (test(foo))" "$nx"
+expect "nextest expression without a filter" "not (package(remote_storage) and binary(test_real_gcs))" "$(TEST_FILTER='' nextest_expr)"
+if [[ "$(TEST_FILTER=x docker_args /r v17 release rust-tests | paste -sd' ' -)" == *"TEST_FILTER=x"* ]]; then
+    echo "ok: docker args pass TEST_FILTER"
+else
+    echo "FAIL: docker args must pass TEST_FILTER"
+    failures=$((failures + 1))
+fi
+
 if ((failures > 0)); then
     echo "$failures check(s) failed"
     exit 1

@@ -4,6 +4,7 @@
 #
 #   .github/scripts/ci-local.sh [--pg v14|v15|v16|v17] [--build-type release|debug]
 #                               [--regress [-k <pytest expr>] [-n <workers>]]
+#                               [--only build,rust-tests,regress [--test-filter <nextest expr>]]
 #
 # The default run (lint + build + rust-tests) is the gate for every PR. Neon's
 # regression suite is opt-in: use --regress for a targeted run (for example to
@@ -14,6 +15,14 @@
 #   --regress     also run Neon's pytest regression suite (opt-in)
 #   -k EXPR       pytest -k expression (needs --regress)
 #   -n N          pytest-xdist workers (needs --regress; default 6)
+#   --only STEPS  comma list of build, rust-tests, regress: run just those, in
+#                 pipeline order, skipping lint (regress implies --regress)
+#   --test-filter EXPR  cargo nextest -E filter, ANDed with the quarantine
+#                 (needs --only with rust-tests)
+#
+# Env CHELA_NEON_VOLUME_SUFFIX=<suffix> (^[a-z0-9-]+$) uses the volumes
+# chela-neon-cargo-<suffix> and chela-neon-target-<suffix>, so parallel clones
+# don't share build state.
 #
 # Steps (each in its own `docker run --rm` of the build-tools image, as the
 # image's `nonroot` user, mirroring pr.yml's jobs and commands):
@@ -53,6 +62,8 @@ parse_args() {
     REGRESS=0
     KEXPR=""
     WORKERS=6
+    ONLY_STEPS=()
+    TEST_FILTER=""
     local k_given=0 n_given=0
     while (($# > 0)); do
         case "$1" in
@@ -89,6 +100,27 @@ parse_args() {
             n_given=1
             shift 2
             ;;
+        --only)
+            [[ $# -ge 2 ]] || { echo "ci-local.sh: --only needs a value" >&2; return 1; }
+            local s
+            ONLY_STEPS=()
+            IFS=, read -r -a ONLY_STEPS <<<"$2"
+            ((${#ONLY_STEPS[@]} > 0)) || { echo "ci-local.sh: --only needs at least one step" >&2; return 1; }
+            for s in "${ONLY_STEPS[@]}"; do
+                case "$s" in
+                build | rust-tests) ;;
+                regress) REGRESS=1 ;;
+                *) echo "ci-local.sh: --only steps are build, rust-tests, regress; not '$s'" >&2; return 1 ;;
+                esac
+            done
+            shift 2
+            ;;
+        --test-filter)
+            [[ $# -ge 2 ]] || { echo "ci-local.sh: --test-filter needs a value" >&2; return 1; }
+            [[ -n "$2" ]] || { echo "ci-local.sh: --test-filter needs a non-empty expression" >&2; return 1; }
+            TEST_FILTER="$2"
+            shift 2
+            ;;
         -h | --help)
             usage
             return 2
@@ -102,6 +134,52 @@ parse_args() {
     if ((REGRESS == 0 && (k_given || n_given))); then
         echo "ci-local.sh: -k and -n only apply with --regress" >&2
         return 1
+    fi
+    if [[ -n "$TEST_FILTER" ]]; then
+        local s found=0
+        for s in "${ONLY_STEPS[@]}"; do [[ "$s" == rust-tests ]] && found=1; done
+        ((found)) || { echo "ci-local.sh: --test-filter needs --only with rust-tests" >&2; return 1; }
+    fi
+}
+
+# selected_steps: the steps to run, in pipeline order, one per line.
+selected_steps() {
+    local s
+    if ((${#ONLY_STEPS[@]} > 0)); then
+        for s in build rust-tests regress; do
+            case " ${ONLY_STEPS[*]} " in *" $s "*) echo "$s" ;; esac
+        done
+        return 0
+    fi
+    echo lint
+    echo build
+    echo rust-tests
+    ((REGRESS == 1)) && echo regress
+    return 0
+}
+
+# init_volumes: sets CARGO_VOLUME and TARGET_VOLUME from CHELA_NEON_VOLUME_SUFFIX
+# (unset: the plain names, so a clone without it shares the original pair).
+init_volumes() {
+    CARGO_VOLUME="chela-neon-cargo"
+    TARGET_VOLUME="chela-neon-target"
+    if [[ -v CHELA_NEON_VOLUME_SUFFIX ]]; then
+        if [[ ! "$CHELA_NEON_VOLUME_SUFFIX" =~ ^[a-z0-9-]+$ ]]; then
+            echo "ci-local.sh: CHELA_NEON_VOLUME_SUFFIX must match ^[a-z0-9-]+\$, not '$CHELA_NEON_VOLUME_SUFFIX'" >&2
+            return 1
+        fi
+        CARGO_VOLUME="chela-neon-cargo-$CHELA_NEON_VOLUME_SUFFIX"
+        TARGET_VOLUME="chela-neon-target-$CHELA_NEON_VOLUME_SUFFIX"
+    fi
+}
+
+# nextest_expr: the -E filter of the rust-tests step (TEST_FILTER narrows it).
+nextest_expr() {
+    local base='not (package(remote_storage) and binary(test_real_gcs))'
+    if [[ -n "${TEST_FILTER:-}" ]]; then
+        echo "($base) and ($TEST_FILTER)"
+    else
+        echo "$base"
     fi
 }
 
@@ -144,6 +222,7 @@ docker_args() {
         -e "CI_LOCAL_RUN=$run" \
         -e "WORKERS=${WORKERS:-6}" \
         -e "KEXPR=${KEXPR:-}" \
+        -e "TEST_FILTER=${TEST_FILTER:-}" \
         -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e 'GIT_CONFIG_VALUE_0=*'
 }
 
@@ -259,7 +338,7 @@ step_rust_tests() {
     #   the S3 and Azure suites it doesn't skip itself when unconfigured.
     # shellcheck disable=SC2086
     mold -run cargo nextest run $CARGO_FLAGS $RELEASE_FLAG --no-fail-fast \
-        -E 'not (package(remote_storage) and binary(test_real_gcs))'
+        -E "$(nextest_expr)"
     echo "rust tests took $(($(date +%s) - start))s"
 }
 
@@ -497,6 +576,7 @@ main() {
     parse_args "$@" || rc=$?
     if ((rc == 2)); then exit 0; elif ((rc != 0)); then usage; exit 1; fi
 
+    init_volumes || exit 1
     ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
     cd "$ROOT"
     command -v docker >/dev/null || { echo "ci-local.sh: docker not found" >&2; exit 1; }
@@ -520,17 +600,21 @@ main() {
     sync_build_state
 
     OVERALL=0
-    run_step lint step_lint || OVERALL=1
-    local build_ok=1
-    run_step build step_build || { OVERALL=1; build_ok=0; }
-    run_step rust-tests step_rust_tests || OVERALL=1
-    if ((REGRESS == 1)); then
-        if ((build_ok)); then
-            run_step regress step_regress || OVERALL=1
-        else
-            echo "regress skipped: the build failed"
-        fi
-    fi
+    local build_ok=1 step
+    for step in $(selected_steps); do
+        case "$step" in
+        lint) run_step lint step_lint || OVERALL=1 ;;
+        build) run_step build step_build || { OVERALL=1; build_ok=0; } ;;
+        rust-tests) run_step rust-tests step_rust_tests || OVERALL=1 ;;
+        regress)
+            if ((build_ok)); then
+                run_step regress step_regress || OVERALL=1
+            else
+                echo "regress skipped: the build failed"
+            fi
+            ;;
+        esac
+    done
     summary
     exit "$OVERALL"
 }
