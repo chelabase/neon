@@ -215,6 +215,8 @@ def test_multixact_next_offset_after_restart(neon_simple_env: NeonEnv, pg_bin: P
     assert creates > 2 * 2048
 
     lsn, mid = gap
+    # Whether mid + 1's entry is on the next offsets page (the cross-page path).
+    log.info(f"gap at mid {mid}, straddles an offsets page: {(mid + 1) % 2048 == 0}")
     env.create_branch("mx_gap", ancestor_branch_name="main", ancestor_start_lsn=Lsn(lsn))
     endpoint_gap = env.endpoints.create_start("mx_gap")
 

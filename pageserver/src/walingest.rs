@@ -1036,60 +1036,63 @@ impl WalIngest {
             next_moff,
         };
 
-        let pageno = xlrec.mid / pg_constants::MULTIXACT_OFFSETS_PER_PAGE as u32;
-        let segno = pageno / pg_constants::SLRU_PAGES_PER_SEGMENT;
-        let rpageno = pageno % pg_constants::SLRU_PAGES_PER_SEGMENT;
-        modification.put_slru_wal_record(
-            SlruKind::MultiXactOffsets,
-            segno,
-            rpageno,
-            offsets_rec.clone(),
-        )?;
-
-        let next_pageno = next_mid / pg_constants::MULTIXACT_OFFSETS_PER_PAGE as u32;
-        if next_pageno != pageno && self.shard.is_shard_zero() {
-            let next_segno = next_pageno / pg_constants::SLRU_PAGES_PER_SEGMENT;
-            let next_rpageno = next_pageno % pg_constants::SLRU_PAGES_PER_SEGMENT;
-            let page_exists = modification
-                .tline
-                .get_slru_segment_exists(
+        // The record goes on mid's page and, when it differs, on the next entry's page.
+        // A page may not exist yet:
+        // - mid's page, after a compute upgrade from an older Postgres minor:
+        //   TrimMultiXact zeroes nextMXact's page without logging it when nextMXact is
+        //   its entry 0, and the new minor only logs ZERO_OFF_PAGE for the page after;
+        // - the next page, in WAL from older minors, which zero it only when the next
+        //   multixact is assigned (RecordNewMultiXact initializes it during recovery).
+        // A missing page is written as one image with its entries already set, never a
+        // zero image plus the record: a key holds one value per LSN, so one of the two
+        // would be lost. Mid's page goes first, so that extending the segment for the
+        // next page never zero-fills mid's page at this LSN.
+        //
+        // A later ZERO_OFF_PAGE for a page created here (only in WAL from older minors)
+        // re-zeroes the next entry until the next multixact's own CREATE_ID sets it
+        // again. Postgres avoids that with pre_initialized_offsets_page; here it only
+        // lasts until that record, as before this change.
+        let per_page = pg_constants::MULTIXACT_OFFSETS_PER_PAGE as u32;
+        let pageno = xlrec.mid / per_page;
+        let next_pageno = next_mid / per_page;
+        let pages = if next_pageno == pageno {
+            vec![pageno]
+        } else {
+            vec![pageno, next_pageno]
+        };
+        for page in pages {
+            let segno = page / pg_constants::SLRU_PAGES_PER_SEGMENT;
+            let rpageno = page % pg_constants::SLRU_PAGES_PER_SEGMENT;
+            if !self.shard.is_shard_zero()
+                || slru_page_exists(
+                    modification,
                     SlruKind::MultiXactOffsets,
-                    next_segno,
-                    Version::Modified(modification),
+                    segno,
+                    rpageno,
                     ctx,
                 )
                 .await?
-                && modification
-                    .tline
-                    .get_slru_segment_size(
-                        SlruKind::MultiXactOffsets,
-                        next_segno,
-                        Version::Modified(modification),
-                        ctx,
-                    )
-                    .await?
-                    > next_rpageno;
-            if page_exists {
+            {
                 modification.put_slru_wal_record(
                     SlruKind::MultiXactOffsets,
-                    next_segno,
-                    next_rpageno,
-                    offsets_rec,
+                    segno,
+                    rpageno,
+                    offsets_rec.clone(),
                 )?;
             } else {
-                // WAL from older Postgres minors doesn't zero the next page before this
-                // record (RecordNewMultiXact initializes it during recovery). Write it as
-                // one image with the entry set: a key holds one value per LSN, so a zero
-                // image followed by a record would lose one of them.
-                let mut page = ZERO_PAGE.to_vec();
-                let entry = (next_mid % pg_constants::MULTIXACT_OFFSETS_PER_PAGE as u32) as usize;
-                page[entry * 4..entry * 4 + 4].copy_from_slice(&next_moff.to_le_bytes());
+                let mut img = ZERO_PAGE.to_vec();
+                for (m, moff) in [(xlrec.mid, xlrec.moff), (next_mid, next_moff)] {
+                    if m / per_page == page {
+                        let at = (m % per_page) as usize * 4;
+                        img[at..at + 4].copy_from_slice(&moff.to_le_bytes());
+                    }
+                }
                 self.put_slru_page_image(
                     modification,
                     SlruKind::MultiXactOffsets,
-                    next_segno,
-                    next_rpageno,
-                    Bytes::from(page),
+                    segno,
+                    rpageno,
+                    Bytes::from(img),
                     ctx,
                 )
                 .await?;
@@ -1664,6 +1667,24 @@ impl WalIngest {
         }
         Ok(())
     }
+}
+
+/// Whether SLRU page (`segno`, `blknum`) exists as of this modification. Shard 0 only.
+async fn slru_page_exists(
+    modification: &DatadirModification<'_>,
+    kind: SlruKind,
+    segno: u32,
+    blknum: BlockNumber,
+    ctx: &RequestContext,
+) -> Result<bool, PageReconstructError> {
+    let tline = modification.tline;
+    Ok(tline
+        .get_slru_segment_exists(kind, segno, Version::Modified(modification), ctx)
+        .await?
+        && tline
+            .get_slru_segment_size(kind, segno, Version::Modified(modification), ctx)
+            .await?
+            > blknum)
 }
 
 /// Returns the size of the relation as of this modification, or None if the relation doesn't exist.
@@ -2820,6 +2841,104 @@ mod tests {
         assert_eq!(offsets_entry(&tline, mid, Lsn(0x40), &ctx).await?, 10);
         assert_eq!(offsets_entry(&tline, mid + 1, Lsn(0x40), &ctx).await?, 13);
         assert_eq!(offsets_entry(&tline, mid + 2, Lsn(0x40), &ctx).await?, 15);
+        Ok(())
+    }
+
+    /// After a compute upgrade from an older Postgres minor, TrimMultiXact zeroes
+    /// nextMXact's offsets page without logging it when nextMXact is its entry 0, and
+    /// the new minor never logs ZERO_OFF_PAGE for it. The first CREATE_ID on that page
+    /// must create it.
+    #[tokio::test]
+    async fn create_on_missing_offsets_page_creates_it() -> Result<()> {
+        let (tenant, ctx) = TenantHarness::create("create_on_missing_offsets_page_creates_it")
+            .await?
+            .load()
+            .await;
+        let tline = tenant
+            .create_test_timeline(TIMELINE_ID, Lsn(8), DEFAULT_PG_VERSION, &ctx)
+            .await?;
+        let mut walingest = init_walingest_test(&tline, &ctx).await?;
+        zero_slru_pages(
+            &mut walingest,
+            &tline,
+            Lsn(0x20),
+            &[
+                (SlruKind::MultiXactOffsets, 0),
+                (SlruKind::MultiXactMembers, 0),
+            ],
+            &ctx,
+        )
+        .await?;
+
+        // Entry 0 of offsets page 1, which was never zeroed through WAL.
+        let mid = OFFSETS_PER_PAGE;
+        ingest_mx_create(
+            &mut walingest,
+            &tline,
+            Lsn(0x30),
+            mx_create(mid, 10, 3),
+            &ctx,
+        )
+        .await?;
+
+        assert_eq!(
+            tline
+                .get_slru_segment_size(SlruKind::MultiXactOffsets, 0, Version::at(Lsn(0x30)), &ctx)
+                .await?,
+            2
+        );
+        assert_eq!(offsets_entry(&tline, mid, Lsn(0x30), &ctx).await?, 10);
+        assert_eq!(offsets_entry(&tline, mid + 1, Lsn(0x30), &ctx).await?, 13);
+        assert_eq!(offsets_entry(&tline, mid + 2, Lsn(0x30), &ctx).await?, 0);
+        Ok(())
+    }
+
+    /// As above, with mid at the last entry of the missing page and the next
+    /// multixact's page missing too: each page is written once, with its entry.
+    #[tokio::test]
+    async fn create_on_missing_page_with_next_on_missing_page() -> Result<()> {
+        let (tenant, ctx) =
+            TenantHarness::create("create_on_missing_page_with_next_on_missing_page")
+                .await?
+                .load()
+                .await;
+        let tline = tenant
+            .create_test_timeline(TIMELINE_ID, Lsn(8), DEFAULT_PG_VERSION, &ctx)
+            .await?;
+        let mut walingest = init_walingest_test(&tline, &ctx).await?;
+        zero_slru_pages(
+            &mut walingest,
+            &tline,
+            Lsn(0x20),
+            &[
+                (SlruKind::MultiXactOffsets, 0),
+                (SlruKind::MultiXactMembers, 0),
+            ],
+            &ctx,
+        )
+        .await?;
+
+        // The last entry of offsets page 1; neither page 1 nor page 2 exists.
+        let mid = 2 * OFFSETS_PER_PAGE - 1;
+        ingest_mx_create(
+            &mut walingest,
+            &tline,
+            Lsn(0x30),
+            mx_create(mid, 10, 3),
+            &ctx,
+        )
+        .await?;
+
+        assert_eq!(
+            tline
+                .get_slru_segment_size(SlruKind::MultiXactOffsets, 0, Version::at(Lsn(0x30)), &ctx)
+                .await?,
+            3
+        );
+        assert_eq!(offsets_entry(&tline, mid - 1, Lsn(0x30), &ctx).await?, 0);
+        assert_eq!(offsets_entry(&tline, mid, Lsn(0x30), &ctx).await?, 10);
+        assert_eq!(offsets_entry(&tline, mid + 1, Lsn(0x30), &ctx).await?, 13);
+        assert_eq!(offsets_entry(&tline, mid + 2, Lsn(0x30), &ctx).await?, 0);
         Ok(())
     }
 }
