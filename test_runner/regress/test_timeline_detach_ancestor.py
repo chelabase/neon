@@ -15,6 +15,7 @@ from fixtures.common_types import Lsn, TimelineArchivalState, TimelineId
 from fixtures.log_helper import log
 from fixtures.neon_fixtures import (
     LogCursor,
+    NeonEnv,
     NeonEnvBuilder,
     PgBin,
     flush_ep_to_pageserver,
@@ -1912,6 +1913,276 @@ def test_detach_ancestors_with_no_writes(
 
         client = env.pageserver.http_client()
         client.detach_ancestor(tenant_id=env.initial_tenant, timeline_id=tlid)
+
+
+def _values(env: NeonEnv, branch_name: str) -> list[str]:
+    """Reads table `t` on a branch through a compute."""
+    with env.endpoints.create_start(branch_name, tenant_id=env.initial_tenant) as ep:
+        return [row[0] for row in ep.safe_psql("SELECT v FROM t ORDER BY v")]
+
+
+def _ancestor(env: NeonEnv, timeline_id: TimelineId) -> TimelineId | None:
+    details = env.pageserver.http_client().timeline_detail(env.initial_tenant, timeline_id)
+    ancestor = details["ancestor_timeline_id"]
+    return None if ancestor is None else TimelineId(ancestor)
+
+
+def _lagging_ancestor_env(neon_env_builder: NeonEnvBuilder) -> tuple[NeonEnv, TimelineId]:
+    """
+    Leaves the pageserver restarted (immediately, so nothing unflushed survives) with every
+    safekeeper stopped. `main` holds one flushed row and 1000 rows that only the safekeepers
+    have; `child` branches from `main` after all of them.
+    """
+    env = neon_env_builder.init_start()
+    env.pageserver.allowed_errors.extend(SHUTDOWN_ALLOWED_ERRORS)
+    tenant = env.initial_tenant
+    client = env.pageserver.http_client()
+
+    with env.endpoints.create_start("main", tenant_id=tenant) as ep:
+        ep.safe_psql("CREATE TABLE t (v text)")
+        ep.safe_psql("INSERT INTO t VALUES ('flushed')")
+        wait_for_last_flush_lsn(env, ep, tenant, env.initial_timeline)
+        client.timeline_checkpoint(tenant, env.initial_timeline)
+        ep.safe_psql("INSERT INTO t SELECT 'late' FROM generate_series(1, 1000)")
+        branch_at = wait_for_last_flush_lsn(env, ep, tenant, env.initial_timeline)
+
+    child = env.create_branch("child", ancestor_branch_name="main", ancestor_start_lsn=branch_at)
+
+    for sk in env.safekeepers:
+        sk.stop()
+    env.pageserver.restart(immediate=True)
+
+    last_record = Lsn(client.timeline_detail(tenant, env.initial_timeline)["last_record_lsn"])
+    assert last_record < branch_at, "the late writes should only be on the safekeepers now"
+    return env, child
+
+
+def _late_rows(env: NeonEnv, branch_name: str) -> int:
+    with env.endpoints.create_start(branch_name, tenant_id=env.initial_tenant) as ep:
+        return int(ep.safe_psql("SELECT count(*) FROM t WHERE v = 'late'")[0][0])
+
+
+def test_detach_waits_for_lagging_ancestor(neon_env_builder: NeonEnvBuilder):
+    """
+    The ancestor restarted at its last flush and its WAL is held back (safekeepers down): the
+    detach waits for the ancestor to ingest up to the branch point instead of copying a stale
+    ancestor, and completes once the WAL arrives.
+    """
+    env, child = _lagging_ancestor_env(neon_env_builder)
+    client = env.pageserver.http_client().without_status_retrying()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        detach = pool.submit(client.detach_ancestor, env.initial_tenant, child)
+        time.sleep(3)
+        assert not detach.done(), "detach finished before the ancestor caught up with its WAL"
+        for sk in env.safekeepers:
+            sk.start()
+        assert detach.result(timeout=60) == set()
+
+    assert _ancestor(env, child) is None
+    assert _late_rows(env, "child") == 1000
+
+
+def test_detach_ancestor_lsn_timeout_is_503(neon_env_builder: NeonEnvBuilder):
+    """
+    The ancestor never catches up (safekeepers stay down): the detach gives up after about 30 s
+    with a retryable 503, holds no attempt and no gc block, and a later detach succeeds.
+    """
+    env, child = _lagging_ancestor_env(neon_env_builder)
+    client = env.pageserver.http_client().without_status_retrying()
+
+    started = time.monotonic()
+    with pytest.raises(PageserverApiException, match="has not caught up") as info:
+        client.detach_ancestor(env.initial_tenant, child)
+    elapsed = time.monotonic() - started
+    assert info.value.status_code == 503
+    assert 25 <= elapsed <= 90, f"expected the 30 s wait, took {elapsed:.1f} s"
+
+    assert _ancestor(env, child) == env.initial_timeline
+    assert isinstance(env.pageserver_remote_storage, LocalFsStorage)
+    index = env.pageserver_remote_storage.index_content(env.initial_tenant, child)
+    assert index.get("gc_blocking") is None, "a timed-out detach must not leave a gc block"
+
+    for sk in env.safekeepers:
+        sk.start()
+    assert client.detach_ancestor(env.initial_tenant, child) == set()
+    assert _ancestor(env, child) is None
+    assert _late_rows(env, "child") == 1000
+
+
+def test_detach_after_pageserver_restart_waits_for_wal(neon_env_builder: NeonEnvBuilder):
+    """
+    The live bug: write on the parent, restart the pageserver (losing what wasn't flushed),
+    detach a child at once. The child must see every write up to its branch point.
+
+    Re-ingesting the lost WAL is slowed down (5 ms per record) so that the detach reliably
+    starts before the parent has caught up.
+    """
+    env = neon_env_builder.init_start()
+    env.pageserver.allowed_errors.extend(SHUTDOWN_ALLOWED_ERRORS)
+    tenant = env.initial_tenant
+    client = env.pageserver.http_client()
+
+    with env.endpoints.create_start("main", tenant_id=tenant) as ep:
+        ep.safe_psql("CREATE TABLE t (v text)")
+        ep.safe_psql("INSERT INTO t SELECT 'late' FROM generate_series(1, 2000)")
+        branch_at = wait_for_last_flush_lsn(env, ep, tenant, env.initial_timeline)
+
+    child = env.create_branch("child", ancestor_branch_name="main", ancestor_start_lsn=branch_at)
+
+    env.pageserver.stop(immediate=True)
+    env.pageserver.start(extra_env_vars={"FAILPOINTS": "walreceiver-after-ingest=sleep(5)"})
+
+    assert client.detach_ancestor(tenant, child) == set()
+    client.configure_failpoints(("walreceiver-after-ingest", "off"))
+    assert _ancestor(env, child) is None
+    assert _late_rows(env, "child") == 2000
+
+
+def _two_level_chain(
+    env: NeonEnv,
+) -> tuple[TimelineId, Lsn, Lsn]:
+    """
+    main: A, | parent branches here |, B
+    parent: C, | child_at |, D
+    Returns (parent, parent_at, child_at). The root's layers straddle parent_at (checkpointed);
+    the parent's writes are only in memory.
+    """
+    tenant = env.initial_tenant
+    client = env.pageserver.http_client()
+
+    with env.endpoints.create_start("main", tenant_id=tenant) as ep:
+        ep.safe_psql("CREATE TABLE t (v text)")
+        ep.safe_psql("INSERT INTO t VALUES ('A')")
+        parent_at = wait_for_last_flush_lsn(env, ep, tenant, env.initial_timeline)
+        ep.safe_psql("INSERT INTO t VALUES ('B')")
+        wait_for_last_flush_lsn(env, ep, tenant, env.initial_timeline)
+        client.timeline_checkpoint(tenant, env.initial_timeline)
+
+    parent = env.create_branch("parent", ancestor_branch_name="main", ancestor_start_lsn=parent_at)
+
+    with env.endpoints.create_start("parent", tenant_id=tenant) as ep:
+        ep.safe_psql("INSERT INTO t VALUES ('C')")
+        child_at = wait_for_last_flush_lsn(env, ep, tenant, parent)
+        ep.safe_psql("INSERT INTO t VALUES ('D')")
+        wait_for_last_flush_lsn(env, ep, tenant, parent)
+
+    return parent, parent_at, child_at
+
+
+def test_multi_level_detach_copies_each_level(neon_env_builder: NeonEnvBuilder):
+    """
+    A grandchild detach copies the root's layers up to the parent's branch point and the
+    parent's layers up to the child's branch point, and nothing written later on either.
+    """
+    env = neon_env_builder.init_start()
+    env.pageserver.allowed_errors.extend(SHUTDOWN_ALLOWED_ERRORS)
+    client = env.pageserver.http_client()
+
+    parent, _, child_at = _two_level_chain(env)
+    child = env.create_branch("child", ancestor_branch_name="parent", ancestor_start_lsn=child_at)
+
+    assert client.detach_ancestor(env.initial_tenant, child, detach_behavior="v2") == set()
+    assert _ancestor(env, child) is None
+
+    env.pageserver.restart()
+
+    assert _ancestor(env, child) is None
+    assert _values(env, "child") == ["A", "C"]
+    assert _values(env, "parent") == ["A", "C", "D"]
+    assert _values(env, "main") == ["A", "B"]
+
+
+def test_multi_level_detach_equal_lsn_level_contributes_nothing(
+    neon_env_builder: NeonEnvBuilder,
+):
+    """
+    main -> parent (branched at parent_at) -> mid (branched at child_at, no writes)
+    -> child (branched from mid at child_at, the same LSN): the equal-LSN level contributes
+    nothing and the detach still copies main's and parent's layers.
+    """
+    env = neon_env_builder.init_start()
+    env.pageserver.allowed_errors.extend(SHUTDOWN_ALLOWED_ERRORS)
+    client = env.pageserver.http_client()
+
+    parent, _, child_at = _two_level_chain(env)
+    mid = env.create_branch("mid", ancestor_branch_name="parent", ancestor_start_lsn=child_at)
+    child = env.create_branch("child", ancestor_branch_name="mid", ancestor_start_lsn=child_at)
+
+    assert client.detach_ancestor(env.initial_tenant, child, detach_behavior="v2") == set()
+
+    env.pageserver.restart()
+
+    assert _ancestor(env, child) is None
+    assert _ancestor(env, mid) == parent
+    assert _values(env, "child") == ["A", "C"]
+
+
+def test_multi_level_detach_tombstones_all_levels(neon_env_builder: NeonEnvBuilder):
+    """
+    Aux files (non-inherited keys) written on the root and on the parent never show on the
+    detached grandchild.
+    """
+    env = neon_env_builder.init_start()
+    env.pageserver.allowed_errors.extend(SHUTDOWN_ALLOWED_ERRORS)
+    tenant = env.initial_tenant
+    client = env.pageserver.http_client()
+
+    with env.endpoints.create_start("main", tenant_id=tenant) as ep:
+        ep.safe_psql("SELECT pg_create_logical_replication_slot('slot_root', 'pgoutput')")
+        parent_at = wait_for_last_flush_lsn(env, ep, tenant, env.initial_timeline)
+    assert set(client.list_aux_files(tenant, env.initial_timeline, parent_at).keys()) == {
+        "pg_replslot/slot_root/state"
+    }
+
+    parent = env.create_branch("parent", ancestor_branch_name="main", ancestor_start_lsn=parent_at)
+    with env.endpoints.create_start("parent", tenant_id=tenant) as ep:
+        ep.safe_psql("SELECT pg_create_logical_replication_slot('slot_parent', 'pgoutput')")
+        child_at = wait_for_last_flush_lsn(env, ep, tenant, parent)
+    assert set(client.list_aux_files(tenant, parent, child_at).keys()) == {
+        "pg_replslot/slot_parent/state"
+    }
+
+    child = env.create_branch("child", ancestor_branch_name="parent", ancestor_start_lsn=child_at)
+    assert set(client.list_aux_files(tenant, child, child_at).keys()) == set()
+
+    assert client.detach_ancestor(tenant, child, detach_behavior="v2") == set()
+    assert _ancestor(env, child) is None
+    assert set(client.list_aux_files(tenant, child, child_at).keys()) == set()
+
+    env.pageserver.restart()
+
+    assert set(client.list_aux_files(tenant, child, child_at).keys()) == set()
+    assert set(client.list_aux_files(tenant, parent, child_at).keys()) == {
+        "pg_replslot/slot_parent/state"
+    }
+    assert set(client.list_aux_files(tenant, env.initial_timeline, parent_at).keys()) == {
+        "pg_replslot/slot_root/state"
+    }
+
+
+def test_multi_level_detach_leaves_siblings_attached(neon_env_builder: NeonEnvBuilder):
+    """
+    A sibling of the detached child on the parent keeps its ancestor (no reparenting) and
+    still reads its data.
+    """
+    env = neon_env_builder.init_start()
+    env.pageserver.allowed_errors.extend(SHUTDOWN_ALLOWED_ERRORS)
+    client = env.pageserver.http_client()
+
+    parent, _, child_at = _two_level_chain(env)
+    child = env.create_branch("child", ancestor_branch_name="parent", ancestor_start_lsn=child_at)
+    sibling = env.create_branch("sibling", ancestor_branch_name="parent")
+
+    assert client.detach_ancestor(env.initial_tenant, child, detach_behavior="v2") == set()
+
+    env.pageserver.restart()
+
+    assert _ancestor(env, child) is None
+    assert _ancestor(env, sibling) == parent
+    assert _ancestor(env, parent) == env.initial_timeline
+    assert _values(env, "sibling") == ["A", "C", "D"]
+    assert _values(env, "child") == ["A", "C"]
 
 
 # TODO:
