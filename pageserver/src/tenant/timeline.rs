@@ -2009,10 +2009,11 @@ impl Timeline {
 
             // A lease is keyed at the exact requested LSN, never normalized: gc-compaction keeps
             // only the image at a kept point, so a key normalized past a page header would not
-            // keep the page start the compute reads at once the cutoff passes it. Reads at the
-            // normalized LSN still match (`GcInfo::lsn_is_retained`). Below a cutoff, a lease is
-            // granted only when the requested LSN itself is kept whole (a child's branch point
-            // or another lease).
+            // keep the page start the compute reads at once the cutoff passes it. A read matches
+            // the lease when its LSN is equal to the key, or the same point past the page header
+            // (`GcInfo::lsn_is_retained`). Below a cutoff, a lease is granted only when the
+            // requested LSN is equal to a kept point (a child's branch point or another lease),
+            // or the same point past the page header.
             let retained = gc_info.lsn_is_retained(lsn);
 
             let valid_until = SystemTime::now() + length;
