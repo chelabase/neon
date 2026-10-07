@@ -540,8 +540,39 @@ impl GcInfo {
     pub(super) fn remove_child_offloaded(&mut self, child_id: TimelineId) -> bool {
         self.remove_child_maybe_offloaded(child_id, MaybeOffloaded::Yes)
     }
-    pub(crate) fn lsn_covered_by_lease(&self, lsn: Lsn) -> bool {
-        self.leases.contains_key(&lsn)
+    /// Whether GC keeps `lsn` readable whole: a child's branch point or a lease key.
+    ///
+    /// Exact: `lsn` equals the kept point, or lies at or after it and normalizes to the same
+    /// LSN (no WAL record lies between them, so the point's image is `lsn`'s). Never below the
+    /// point and no ranges: gc-compaction keeps only the image at the exact point and drops the
+    /// history below it. A point kept by an offloaded child counts too; reads there may hit
+    /// cold layers (performance only).
+    pub(crate) fn lsn_is_retained(&self, lsn: Lsn) -> bool {
+        let normalized = xlog_utils::normalize_lsn(lsn, WAL_SEGMENT_SIZE);
+        let matches = |point: Lsn| {
+            point == lsn
+                || (point <= lsn
+                    && xlog_utils::normalize_lsn(point, WAL_SEGMENT_SIZE) == normalized)
+        };
+        self.retain_lsns
+            .iter()
+            .any(|(retained, _, _)| matches(*retained))
+            || self.leases.keys().any(|leased| matches(*leased))
+    }
+
+    /// Takes or extends a lease at exactly `lsn` (no normalizing), valid for `length`.
+    pub(super) fn insert_lease(&mut self, lsn: Lsn, length: Duration) -> LsnLease {
+        let valid_until = SystemTime::now() + length;
+        match self.leases.entry(lsn) {
+            Entry::Occupied(mut occupied) => {
+                let existing_lease = occupied.get_mut();
+                if valid_until > existing_lease.valid_until {
+                    existing_lease.valid_until = valid_until;
+                }
+                existing_lease.clone()
+            }
+            Entry::Vacant(vacant) => vacant.insert(LsnLease { valid_until }).clone(),
+        }
     }
 }
 
@@ -1916,14 +1947,17 @@ impl Timeline {
         }
     }
 
-    /// Check that it is valid to request operations with that lsn.
+    /// Check that it is valid to request operations with that lsn: at or above the applied GC
+    /// cutoff, or below it at a point GC keeps whole ([`GcInfo::lsn_is_retained`]).
+    ///
+    /// Takes `gc_info`'s lock briefly: never call it while holding that lock.
     pub(crate) fn check_lsn_is_in_scope(
         &self,
         lsn: Lsn,
         latest_gc_cutoff_lsn: &RcuReadGuard<Lsn>,
     ) -> anyhow::Result<()> {
         ensure!(
-            lsn >= **latest_gc_cutoff_lsn,
+            lsn >= **latest_gc_cutoff_lsn || self.gc_info.read().unwrap().lsn_is_retained(lsn),
             "LSN {} is earlier than latest GC cutoff {} (we might've already garbage collected needed data)",
             lsn,
             **latest_gc_cutoff_lsn,
@@ -1931,7 +1965,8 @@ impl Timeline {
         Ok(())
     }
 
-    /// Initializes an LSN lease. The function will return an error if the requested LSN is less than the `latest_gc_cutoff_lsn`.
+    /// Initializes an LSN lease. The function will return an error if the requested LSN is less than the `latest_gc_cutoff_lsn`,
+    /// unless GC keeps that exact point whole ([`GcInfo::lsn_is_retained`]).
     pub(crate) fn init_lsn_lease(
         &self,
         lsn: Lsn,
@@ -1966,12 +2001,28 @@ impl Timeline {
         _ctx: &RequestContext,
     ) -> anyhow::Result<LsnLease> {
         let lease = {
+            let requested = lsn;
             // Normalize the requested LSN to be aligned, and move to the first record
             // if it points to the beginning of the page (header).
-            let lsn = xlog_utils::normalize_lsn(lsn, WAL_SEGMENT_SIZE);
+            let normalized = xlog_utils::normalize_lsn(lsn, WAL_SEGMENT_SIZE);
 
+            // The check and the insert below share this write lock, so a child dropped in
+            // between can't leave a lease at a point GC no longer keeps.
             let mut gc_info = self.gc_info.write().unwrap();
             let planned_cutoff = gc_info.min_cutoff();
+            let latest_gc_cutoff_lsn = *self.get_applied_gc_cutoff_lsn();
+
+            // Below a cutoff, a lease is granted only at a point GC keeps whole (a child's
+            // branch point or another lease; `GcInfo::lsn_is_retained`), and it is keyed at the
+            // exact requested LSN when that is the kept point: gc-compaction keeps only exact
+            // points, so a key normalized past the point would not keep the point's history.
+            let below_a_cutoff = requested < latest_gc_cutoff_lsn.max(planned_cutoff);
+            let lsn = if below_a_cutoff && gc_info.lsn_is_retained(requested) {
+                requested
+            } else {
+                normalized
+            };
+            let retained = gc_info.lsn_is_retained(lsn);
 
             let valid_until = SystemTime::now() + length;
 
@@ -1992,13 +2043,11 @@ impl Timeline {
                     existing_lease.clone()
                 }
                 Entry::Vacant(vacant) => {
-                    // Never allow a lease to be requested for an LSN below the applied GC cutoff. The data could have been deleted.
-                    let latest_gc_cutoff_lsn = self.get_applied_gc_cutoff_lsn();
-                    if lsn < *latest_gc_cutoff_lsn {
+                    // Never allow a lease to be requested for an LSN below the applied GC cutoff, unless GC
+                    // keeps that exact point whole. Otherwise the data could have been deleted.
+                    if lsn < latest_gc_cutoff_lsn && !retained {
                         bail!(
-                            "tried to request an lsn lease for an lsn below the latest gc cutoff. requested at {} gc cutoff {}",
-                            lsn,
-                            *latest_gc_cutoff_lsn
+                            "tried to request an lsn lease for an lsn below the latest gc cutoff. requested at {lsn} gc cutoff {latest_gc_cutoff_lsn}"
                         );
                     }
 
@@ -2011,7 +2060,8 @@ impl Timeline {
 
                     // Do not allow initial lease creation to be below the planned gc cutoff. The client (compute_ctl) determines
                     // whether it is a initial lease creation or a renewal.
-                    if (init || validate) && lsn < planned_cutoff {
+                    // A point GC keeps whole is exempt here too.
+                    if (init || validate) && lsn < planned_cutoff && !retained {
                         bail!(
                             "tried to request an lsn lease for an lsn below the planned gc cutoff. requested at {lsn} planned gc cutoff {planned_cutoff}"
                         );

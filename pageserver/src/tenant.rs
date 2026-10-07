@@ -157,6 +157,11 @@ pub const TENANTS_SEGMENT_NAME: &str = "tenants";
 /// Parts of the `.neon/tenants/<tenant_id>/timelines/<timeline_id>` directory prefix.
 pub const TIMELINES_SEGMENT_NAME: &str = "timelines";
 
+/// The lease a branch create takes at a kept point below its parent's GC cutoff. It only has to
+/// last until the new branch registers its own branch point, which happens before the create
+/// returns; legacy GC culls expired leases under `gc_cs`, which the create holds throughout.
+const BRANCH_CREATE_LEASE_LENGTH: Duration = Duration::from_secs(60);
+
 /// References to shared objects that are passed into each tenant, such
 /// as the shared remote storage client and process initialization state.
 #[derive(Clone)]
@@ -5031,11 +5036,25 @@ impl TenantShard {
         // check against last actual 'latest_gc_cutoff' first
         let applied_gc_cutoff_lsn = src_timeline.get_applied_gc_cutoff_lsn();
         {
-            let gc_info = src_timeline.gc_info.read().unwrap();
-            let planned_cutoff = gc_info.min_cutoff();
-            if gc_info.lsn_covered_by_lease(start_lsn) {
+            // A lease or a child's branch point is kept whole by GC. Below a cutoff, check it and
+            // take a short lease at the exact point under the same write lock: a child dropped
+            // before the new branch registers its own branch point (in `Timeline::new`) then
+            // can't let gc-compaction (which doesn't take `gc_cs`) drop the point. Release the
+            // lock before `check_lsn_is_in_scope`, which takes it again.
+            let (planned_cutoff, exempt) = {
+                let mut gc_info = src_timeline.gc_info.write().unwrap();
+                let planned_cutoff = gc_info.min_cutoff();
+                let below_a_cutoff =
+                    start_lsn < *applied_gc_cutoff_lsn || start_lsn < planned_cutoff;
+                let exempt = gc_info.lsn_is_retained(start_lsn);
+                if below_a_cutoff && exempt {
+                    gc_info.insert_lease(start_lsn, BRANCH_CREATE_LEASE_LENGTH);
+                }
+                (planned_cutoff, exempt)
+            };
+            if exempt {
                 tracing::info!(
-                    "skipping comparison of {start_lsn} with gc cutoff {} and planned gc cutoff {planned_cutoff} due to lsn lease",
+                    "skipping comparison of {start_lsn} with gc cutoff {} and planned gc cutoff {planned_cutoff} due to lsn lease or retained branch point",
                     *applied_gc_cutoff_lsn
                 );
             } else {
@@ -5082,7 +5101,9 @@ impl TenantShard {
             dst_prev,
             Some(src_id),
             start_lsn,
-            *src_timeline.applied_gc_cutoff_lsn.read(), // FIXME: should we hold onto this guard longer?
+            // Capped at the branch point: a branch at a retained or leased LSN below the
+            // parent's cutoff must still serve reads at its own start.
+            (*src_timeline.applied_gc_cutoff_lsn.read()).min(start_lsn),
             src_timeline.initdb_lsn,
             src_timeline.pg_version,
         );
@@ -9538,6 +9559,366 @@ mod tests {
             .init_lsn_lease(Lsn(leased_lsns[1]), timeline.get_lsn_lease_length(), &ctx)
             .expect("lease renewal with validation should succeed");
 
+        Ok(())
+    }
+
+    const RETAINED_TEST_KEY: &str = "010000000033333333444444445500000000";
+
+    /// A parent with one image of `RETAINED_TEST_KEY` every 0x10 from 0x20 to 0x90, a child
+    /// branched at 0x50, an optional lease at 0x70, and the applied GC cutoff moved to 0x100
+    /// (past both).
+    async fn retained_lsn_setup(
+        name: &'static str,
+        lease: bool,
+    ) -> anyhow::Result<(Arc<TenantShard>, Arc<Timeline>, RequestContext)> {
+        let (tenant, ctx) = TenantHarness::create(name).await?.load().await;
+        tenant
+            .update_tenant_config(|mut conf| {
+                conf.lsn_lease_length = Some(LsnLease::DEFAULT_LENGTH);
+                Ok(conf)
+            })
+            .unwrap();
+        let key = Key::from_hex(RETAINED_TEST_KEY).unwrap();
+        let end_lsn = Lsn(0x100);
+        let image_layers = (0x20..=0x90)
+            .step_by(0x10)
+            .map(|n| (Lsn(n), vec![(key, test_img(&format!("data key at {n:x}")))]))
+            .collect();
+        let tline = tenant
+            .create_test_timeline_with_layers(
+                TIMELINE_ID,
+                Lsn(0x10),
+                DEFAULT_PG_VERSION,
+                &ctx,
+                Vec::new(),
+                Vec::new(),
+                image_layers,
+                end_lsn,
+            )
+            .await?;
+        tenant
+            .branch_timeline_test(&tline, NEW_TIMELINE_ID, Some(Lsn(0x50)), &ctx)
+            .await?;
+        if lease {
+            tline.init_lsn_lease(Lsn(0x70), tline.get_lsn_lease_length(), &ctx)?;
+        }
+        tline.force_set_disk_consistent_lsn(end_lsn);
+        tenant
+            .gc_iteration(
+                Some(TIMELINE_ID),
+                0,
+                Duration::ZERO,
+                &CancellationToken::new(),
+                &ctx,
+            )
+            .await?;
+        assert!(*tline.get_applied_gc_cutoff_lsn() > Lsn(0x90));
+        Ok((tenant, tline, ctx))
+    }
+
+    #[tokio::test]
+    async fn retained_lsn_readable_below_cutoff() -> anyhow::Result<()> {
+        let (tenant, tline, ctx) =
+            retained_lsn_setup("retained_lsn_readable_below_cutoff", false).await?;
+        let key = Key::from_hex(RETAINED_TEST_KEY).unwrap();
+        let retained = Lsn(0x50);
+
+        // GC kept the data the child reads at its branch point.
+        assert_eq!(
+            tline.get(key, retained, &ctx).await?,
+            test_img("data key at 50")
+        );
+
+        // basebackup (libpq and gRPC)
+        {
+            let cutoff = tline.get_applied_gc_cutoff_lsn();
+            tline
+                .check_lsn_is_in_scope(retained, &cutoff)
+                .expect("a retained LSN is in scope");
+            // get_page
+            assert_eq!(
+                crate::page_service::effective_request_lsn_for_test(&tline, retained, &cutoff),
+                Ok(retained)
+            );
+        }
+
+        // branch create, and the new branch reads its own branch point
+        let new_id = TimelineId::generate();
+        let branch = tenant
+            .branch_timeline_test(&tline, new_id, Some(retained), &ctx)
+            .await
+            .expect("branching at a retained LSN succeeds");
+        assert!(
+            *branch.get_applied_gc_cutoff_lsn() <= retained,
+            "the new branch's GC cutoff must not be above its own branch point"
+        );
+        {
+            let cutoff = branch.get_applied_gc_cutoff_lsn();
+            assert_eq!(
+                crate::page_service::effective_request_lsn_for_test(&branch, retained, &cutoff),
+                Ok(retained)
+            );
+        }
+        assert_eq!(
+            branch.get(key, retained, &ctx).await?,
+            test_img("data key at 50")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unretained_lsn_below_cutoff_refused() -> anyhow::Result<()> {
+        let (tenant, tline, ctx) =
+            retained_lsn_setup("unretained_lsn_below_cutoff_refused", false).await?;
+        let unretained = Lsn(0x60);
+        {
+            let cutoff = tline.get_applied_gc_cutoff_lsn();
+            let err = tline
+                .check_lsn_is_in_scope(unretained, &cutoff)
+                .expect_err("an unretained LSN below the cutoff is refused");
+            assert!(
+                err.to_string()
+                    .contains("we might've already garbage collected needed data"),
+                "{err}"
+            );
+            let err =
+                crate::page_service::effective_request_lsn_for_test(&tline, unretained, &cutoff)
+                    .expect_err("get_page below the cutoff is refused");
+            assert!(err.contains("garbage collected"), "{err}");
+        }
+        match tenant
+            .branch_timeline_test(&tline, TimelineId::generate(), Some(unretained), &ctx)
+            .await
+        {
+            Ok(_) => panic!("branching below the cutoff should fail"),
+            Err(CreateTimelineError::AncestorLsn(err)) => {
+                assert!(
+                    err.to_string().contains("invalid branch start lsn"),
+                    "{err}"
+                )
+            }
+            Err(err) => panic!("wrong error: {err}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn lsn_is_retained_matches_exact_points_only() {
+        let mut gc_info = GcInfo::default();
+        // A branch point at the start of a WAL page (unnormalized) and one mid-page.
+        let page_start = Lsn(0x0300_2000);
+        gc_info.insert_child(TimelineId::generate(), page_start, MaybeOffloaded::No);
+        gc_info.insert_child(
+            TimelineId::generate(),
+            Lsn(0x0300_4100),
+            MaybeOffloaded::Yes,
+        );
+
+        assert!(gc_info.lsn_is_retained(page_start));
+        // past the page header: the same point once normalized
+        assert!(gc_info.lsn_is_retained(page_start + 24));
+        assert!(gc_info.lsn_is_retained(Lsn(0x0300_4100)));
+        // no ranges
+        assert!(!gc_info.lsn_is_retained(Lsn(0x0300_4108)));
+        assert!(!gc_info.lsn_is_retained(Lsn(0x0300_40f8)));
+        assert!(!gc_info.lsn_is_retained(Lsn(0x0300_3000)));
+
+        // Never below a kept point, even when both normalize to the same LSN: gc-compaction
+        // keeps only the image at the exact point, so the page start just below a point past
+        // the header (or a lease, stored normalized) has no data left.
+        let past_header = Lsn(0x0300_6018);
+        gc_info.insert_child(TimelineId::generate(), past_header, MaybeOffloaded::No);
+        assert!(gc_info.lsn_is_retained(past_header));
+        assert!(!gc_info.lsn_is_retained(Lsn(0x0300_6000)));
+        let leased = Lsn(0x0300_8018);
+        gc_info.leases.insert(
+            leased,
+            LsnLease {
+                valid_until: std::time::SystemTime::now(),
+            },
+        );
+        assert!(gc_info.lsn_is_retained(leased));
+        assert!(!gc_info.lsn_is_retained(Lsn(0x0300_8000)));
+    }
+
+    #[tokio::test]
+    async fn lease_exemption_unchanged() -> anyhow::Result<()> {
+        let (tenant, tline, ctx) = retained_lsn_setup("lease_exemption_unchanged", true).await?;
+        let leased = Lsn(0x70);
+        {
+            let cutoff = tline.get_applied_gc_cutoff_lsn();
+            assert_eq!(
+                crate::page_service::effective_request_lsn_for_test(&tline, leased, &cutoff),
+                Ok(leased)
+            );
+            // basebackup now honours leases too
+            tline
+                .check_lsn_is_in_scope(leased, &cutoff)
+                .expect("a leased LSN is in scope");
+        }
+        tenant
+            .branch_timeline_test(&tline, TimelineId::generate(), Some(leased), &ctx)
+            .await
+            .expect("branching at a leased LSN succeeds");
+        Ok(())
+    }
+
+    /// gc-compaction keeps a child's branch point as one image at that exact LSN and drops the
+    /// history below it: reads at the point still work, and the page start just below it (the
+    /// same point once normalized) is refused instead of read from history that is gone.
+    #[tokio::test]
+    async fn gc_compaction_keeps_only_the_exact_retained_point() -> anyhow::Result<()> {
+        let (tenant, ctx) =
+            TenantHarness::create("gc_compaction_keeps_only_the_exact_retained_point")
+                .await?
+                .load()
+                .await;
+        let key = Key::from_hex(RETAINED_TEST_KEY).unwrap();
+        let end_lsn = Lsn(0x0300_4000);
+        let tline = tenant
+            .create_test_timeline_with_layers(
+                TIMELINE_ID,
+                Lsn(0x10),
+                DEFAULT_PG_VERSION,
+                &ctx,
+                Vec::new(),
+                Vec::new(),
+                vec![
+                    (Lsn(0x0300_1000), vec![(key, test_img("data key at 1000"))]),
+                    (Lsn(0x0300_3000), vec![(key, test_img("data key at 3000"))]),
+                ],
+                end_lsn,
+            )
+            .await?;
+        tline.add_extra_test_dense_keyspace(KeySpace::single(key..key.next()));
+        // A child branched past a page header; the page start below it normalizes to it.
+        let retained = Lsn(0x0300_2018);
+        let page_start = Lsn(0x0300_2000);
+        tenant
+            .branch_timeline_test(&tline, NEW_TIMELINE_ID, Some(retained), &ctx)
+            .await?;
+        tline.force_set_disk_consistent_lsn(end_lsn);
+        tenant
+            .gc_iteration(
+                Some(TIMELINE_ID),
+                0,
+                Duration::ZERO,
+                &CancellationToken::new(),
+                &ctx,
+            )
+            .await?;
+        assert!(*tline.get_applied_gc_cutoff_lsn() > Lsn(0x0300_3000));
+        tline
+            .compact_with_gc(
+                &CancellationToken::new(),
+                CompactOptions::default_for_gc_compaction_unit_tests(),
+                &ctx,
+            )
+            .await?;
+
+        assert_eq!(
+            tline.get(key, retained, &ctx).await?,
+            test_img("data key at 1000")
+        );
+        {
+            let cutoff = tline.get_applied_gc_cutoff_lsn();
+            tline
+                .check_lsn_is_in_scope(retained, &cutoff)
+                .expect("the kept point is in scope");
+            tline
+                .check_lsn_is_in_scope(page_start, &cutoff)
+                .expect_err("the page start below the kept point is not in scope");
+            crate::page_service::effective_request_lsn_for_test(&tline, page_start, &cutoff)
+                .expect_err("get_page at the page start below the kept point is refused");
+        }
+        // Why: the history below the kept point is gone.
+        assert!(tline.get(key, page_start, &ctx).await.is_err());
+        Ok(())
+    }
+
+    /// D19: a lease below the applied cutoff is granted only at a point GC keeps whole, and it
+    /// then keeps that point after the child that retained it is deleted.
+    #[tokio::test]
+    async fn lease_below_cutoff_only_at_retained_point() -> anyhow::Result<()> {
+        let (tenant, tline, ctx) =
+            retained_lsn_setup("lease_below_cutoff_only_at_retained_point", false).await?;
+        let key = Key::from_hex(RETAINED_TEST_KEY).unwrap();
+        let retained = Lsn(0x50);
+
+        let err = tline
+            .init_lsn_lease(Lsn(0x60), tline.get_lsn_lease_length(), &ctx)
+            .expect_err("an unretained LSN below the cutoff gets no lease");
+        assert!(
+            err.to_string().contains("below the latest gc cutoff"),
+            "{err}"
+        );
+        tline
+            .init_lsn_lease(retained, tline.get_lsn_lease_length(), &ctx)
+            .expect("a retained LSN below the cutoff can be leased");
+
+        // The child goes away; the lease keeps its branch point.
+        Arc::clone(&tenant).delete_timeline(NEW_TIMELINE_ID).await?;
+        // The deletion finishes in the background.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while tenant
+            .timelines
+            .lock()
+            .unwrap()
+            .contains_key(&NEW_TIMELINE_ID)
+        {
+            assert!(std::time::Instant::now() < deadline, "child not deleted");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tenant
+            .gc_iteration(
+                Some(TIMELINE_ID),
+                0,
+                Duration::ZERO,
+                &CancellationToken::new(),
+                &ctx,
+            )
+            .await?;
+        assert!(tline.gc_info.read().unwrap().retain_lsns.is_empty());
+        tline
+            .compact_with_gc(
+                &CancellationToken::new(),
+                CompactOptions::default_for_gc_compaction_unit_tests(),
+                &ctx,
+            )
+            .await?;
+        {
+            let cutoff = tline.get_applied_gc_cutoff_lsn();
+            tline
+                .check_lsn_is_in_scope(retained, &cutoff)
+                .expect("the leased point is in scope");
+        }
+        assert_eq!(
+            tline.get(key, retained, &ctx).await?,
+            test_img("data key at 50")
+        );
+        Ok(())
+    }
+
+    /// D19: a branch created at a retained point below the cutoff takes a short lease there,
+    /// checked and taken under one `gc_info` lock, so the point stays kept if the child that
+    /// retained it is dropped before the new branch registers its own branch point.
+    #[tokio::test]
+    async fn branch_at_retained_point_takes_a_lease() -> anyhow::Result<()> {
+        let (tenant, tline, ctx) =
+            retained_lsn_setup("branch_at_retained_point_takes_a_lease", false).await?;
+        let retained = Lsn(0x50);
+        assert!(!tline.gc_info.read().unwrap().leases.contains_key(&retained));
+        tenant
+            .branch_timeline_test(&tline, TimelineId::generate(), Some(retained), &ctx)
+            .await?;
+        assert!(tline.gc_info.read().unwrap().leases.contains_key(&retained));
+
+        // A branch at or above the cutoff takes none.
+        let head = tline.get_last_record_lsn();
+        tenant
+            .branch_timeline_test(&tline, TimelineId::generate(), Some(head), &ctx)
+            .await?;
+        assert!(!tline.gc_info.read().unwrap().leases.contains_key(&head));
         Ok(())
     }
 
