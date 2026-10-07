@@ -254,4 +254,58 @@ mod test {
 
         assert!(!ValueBytes::will_init(&expected).unwrap());
     }
+
+    /// Layers already stored hold this record; its encoding must never change.
+    #[test]
+    fn multixact_offset_create_encoding_unchanged() {
+        let rec = NeonWalRecord::MultixactOffsetCreate {
+            mid: 0x0102_0304,
+            moff: 0x0506_0708,
+        };
+        let rec = Value::WalRecord(rec);
+
+        #[rustfmt::skip]
+        let expected = [
+            // discriminators: Value::WalRecord, NeonWalRecord::MultixactOffsetCreate
+            0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x04,
+            // mid
+            0x01, 0x02, 0x03, 0x04,
+            // moff
+            0x05, 0x06, 0x07, 0x08,
+        ];
+
+        roundtrip!(rec, expected);
+
+        assert!(!ValueBytes::will_init(&expected).unwrap());
+    }
+
+    /// The new record takes discriminator 8 in every build (it sits before the
+    /// testing-only `Test` variant).
+    #[test]
+    fn multixact_offset_create_with_next_encoding() {
+        let rec = NeonWalRecord::MultixactOffsetCreateWithNext {
+            mid: 0x0102_0304,
+            moff: 0x0506_0708,
+            next_moff: 0x090a_0b0c,
+        };
+        let rec = Value::WalRecord(rec);
+
+        #[rustfmt::skip]
+        let expected = [
+            // discriminators: Value::WalRecord, NeonWalRecord::MultixactOffsetCreateWithNext
+            0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x08,
+            // mid
+            0x01, 0x02, 0x03, 0x04,
+            // moff
+            0x05, 0x06, 0x07, 0x08,
+            // next_moff
+            0x09, 0x0a, 0x0b, 0x0c,
+        ];
+
+        roundtrip!(rec, expected);
+
+        assert!(!ValueBytes::will_init(&expected).unwrap());
+    }
 }

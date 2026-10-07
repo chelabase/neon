@@ -47,6 +47,18 @@ pub enum NeonWalRecord {
         trunc_byte: usize,
         trunc_offs: usize,
     },
+    /// Set a multixact's starting offset and, if still unset, the next multixact's
+    /// (`next_moff`, the end of this multixact's members), as Postgres'
+    /// `RecordNewMultiXact` does. Stored on each offsets page that holds one of
+    /// the two entries. Replaces `MultixactOffsetCreate`, which stays readable.
+    ///
+    /// Keep this before the testing-only `Test` variant, so its encoding is the
+    /// same with and without the `testing` feature.
+    MultixactOffsetCreateWithNext {
+        mid: MultiXactId,
+        moff: MultiXactOffset,
+        next_moff: MultiXactOffset,
+    },
 
     /// A testing record for unit testing purposes. It supports append data to an existing image, or clear it.
     #[cfg(feature = "testing")]
