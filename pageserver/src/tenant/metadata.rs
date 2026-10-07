@@ -301,8 +301,10 @@ impl TimelineMetadata {
 
     /// Returns true if anything was changed
     pub fn detach_from_ancestor(&mut self, branchpoint: &(TimelineId, Lsn)) {
-        // Detaching from ancestor now doesn't always detach directly to the direct ancestor, but we
-        // ensure the LSN is the same. So we don't check the timeline ID.
+        // The branchpoint names the timeline the detach ended at, which is not always the
+        // direct ancestor: a multi-level detach names the root of the chain, whose own cuts
+        // differ from this timeline's. Its LSN is still this timeline's own `ancestor_lsn`
+        // (the detach records it that way), so we check the LSN but not the timeline ID.
         if self.body.ancestor_lsn != Lsn(0) {
             assert_eq!(self.body.ancestor_lsn, branchpoint.1);
         }

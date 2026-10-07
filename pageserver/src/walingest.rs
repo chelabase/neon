@@ -1046,7 +1046,14 @@ impl WalIngest {
         // A missing page is written as one image with its entries already set, never a
         // zero image plus the record: a key holds one value per LSN, so one of the two
         // would be lost. Mid's page goes first, so that extending the segment for the
-        // next page never zero-fills mid's page at this LSN.
+        // next page never zero-fills mid's page at this LSN. The same path covers the
+        // wraparound form: after mid `u32::MAX` the next multixact is 1 (0 is skipped), and
+        // if offsets segment 0 is gone (truncated), mid 1's CREATE_ID recreates segment 0
+        // with just that page.
+        //
+        // Accepted limit: a page that already got CREATE_ID records from an older
+        // pageserver without ever being created (this gap, before the fix) gets a zero
+        // image here, so the earlier multixacts on it read offset 0 instead of failing.
         //
         // A later ZERO_OFF_PAGE for a page created here (only in WAL from older minors)
         // re-zeroes the next entry until the next multixact's own CREATE_ID sets it
@@ -2939,6 +2946,51 @@ mod tests {
         assert_eq!(offsets_entry(&tline, mid, Lsn(0x30), &ctx).await?, 10);
         assert_eq!(offsets_entry(&tline, mid + 1, Lsn(0x30), &ctx).await?, 13);
         assert_eq!(offsets_entry(&tline, mid + 2, Lsn(0x30), &ctx).await?, 0);
+        Ok(())
+    }
+
+    /// The wraparound form of the missing page: multixact ids wrapped past `u32::MAX`,
+    /// offsets segment 0 is gone, and the first CREATE_ID after the wrap (mid 1, as
+    /// mid 0 is skipped) must recreate segment 0 with just that page.
+    #[tokio::test]
+    async fn create_after_wraparound_recreates_dropped_segment_zero() -> Result<()> {
+        let (tenant, ctx) =
+            TenantHarness::create("create_after_wraparound_recreates_dropped_segment_zero")
+                .await?
+                .load()
+                .await;
+        let tline = tenant
+            .create_test_timeline(TIMELINE_ID, Lsn(8), DEFAULT_PG_VERSION, &ctx)
+            .await?;
+        let mut walingest = init_walingest_test(&tline, &ctx).await?;
+        zero_slru_pages(
+            &mut walingest,
+            &tline,
+            Lsn(0x20),
+            &[
+                (SlruKind::MultiXactOffsets, 0),
+                (SlruKind::MultiXactOffsets, u32::MAX / OFFSETS_PER_PAGE),
+                (SlruKind::MultiXactMembers, 0),
+            ],
+            &ctx,
+        )
+        .await?;
+        let mut m = tline.begin_modification(Lsn(0x28));
+        m.drop_slru_segment(SlruKind::MultiXactOffsets, 0, &ctx)
+            .await?;
+        m.commit(&ctx).await?;
+
+        ingest_mx_create(&mut walingest, &tline, Lsn(0x30), mx_create(1, 10, 3), &ctx).await?;
+
+        assert_eq!(
+            tline
+                .get_slru_segment_size(SlruKind::MultiXactOffsets, 0, Version::at(Lsn(0x30)), &ctx)
+                .await?,
+            1
+        );
+        assert_eq!(offsets_entry(&tline, 1, Lsn(0x30), &ctx).await?, 10);
+        assert_eq!(offsets_entry(&tline, 2, Lsn(0x30), &ctx).await?, 13);
+        assert_eq!(offsets_entry(&tline, 3, Lsn(0x30), &ctx).await?, 0);
         Ok(())
     }
 }

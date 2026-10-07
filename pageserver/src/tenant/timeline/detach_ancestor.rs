@@ -74,6 +74,12 @@ pub(crate) enum Error {
 
     #[error("two ancestor levels have a layer named {layer}")]
     LayerNameCollision { layer: String },
+
+    #[error("ancestor {ancestor} is broken, detach cannot proceed: {reason}")]
+    AncestorBroken {
+        ancestor: TimelineId,
+        reason: String,
+    },
 }
 
 impl Error {
@@ -119,7 +125,8 @@ impl From<Error> for ApiError {
             | Error::DetachReparent(_)
             | Error::Complete(_)
             | Error::Failpoint(_)
-            | Error::LayerNameCollision { .. } => ApiError::InternalServerError(value.into()),
+            | Error::LayerNameCollision { .. }
+            | Error::AncestorBroken { .. } => ApiError::InternalServerError(value.into()),
         }
     }
 }
@@ -393,6 +400,8 @@ pub(super) async fn prepare(
     // An ancestor reloaded since its last flush only has its WAL up to its disk consistent LSN
     // until its walreceiver catches up; copying before that would lose the writes in between.
     // Wait before taking the attempt and the gc block, so that a timeout holds neither.
+    // The levels are waited for one after the other, each up to ANCESTOR_WAIT_LSN_TIMEOUT, so
+    // the worst case is that timeout times the chain's depth before the 503.
     for (level, cut) in &chain {
         level
             .wait_lsn(
@@ -454,7 +463,11 @@ pub(super) async fn prepare(
         // which is something to keep in mind if copy skipping is implemented.
         tracing::info!(ancestor=%level.timeline_id, %cut, filtered=%filtered_layers, to_rewrite = straddling.len(), historic=%rest.len(), "collected layers");
 
-        // Refuse before copying anything if two levels would produce the same layer name.
+        // Refuse before copying anything if two levels would produce the same layer name. This
+        // runs after `start_new_attempt`, so the refusal keeps the gc block of the attempt; a
+        // retry then hits the same (deterministic) collision. Unreachable in practice: the
+        // levels contribute disjoint LSN ranges (a level's own layers start at its branch
+        // point, where its ancestor's contribution ends), and layer names carry the LSN range.
         for layer in &straddling {
             check_layer_name_unique(&mut layer_names, &rewritten_layer_name(layer, end_lsn))?;
         }
@@ -636,13 +649,17 @@ fn detach_chain<T>(
     Ok(chain)
 }
 
-/// Maps a failed wait for an ancestor's WAL: cancellation is a shutdown, anything else a
-/// retryable timeout.
+/// Maps a failed wait for an ancestor's WAL: cancellation is a shutdown, a broken ancestor a
+/// 500 (retrying won't help), anything else (a timeout, a loading ancestor) a retryable 503.
 fn ancestor_wait_error(e: WaitLsnError, ancestor: TimelineId, lsn: Lsn) -> Error {
     if e.is_cancel() {
-        Error::ShuttingDown
-    } else {
-        Error::AncestorLsnTimeout { ancestor, lsn }
+        return Error::ShuttingDown;
+    }
+    match e {
+        WaitLsnError::BadState(pageserver_api::models::TimelineState::Broken {
+            reason, ..
+        }) => Error::AncestorBroken { ancestor, reason },
+        _ => Error::AncestorLsnTimeout { ancestor, lsn },
     }
 }
 
@@ -1538,6 +1555,29 @@ mod tests {
                 "must be a retryable 503"
             );
         }
+    }
+
+    #[test]
+    fn broken_ancestor_maps_to_500() {
+        let ancestor = TimelineId::generate();
+        let e = WaitLsnError::BadState(TimelineState::Broken {
+            reason: "disk on fire".to_string(),
+            backtrace: String::new(),
+        });
+        let err = ancestor_wait_error(e, ancestor, Lsn(42));
+        assert!(
+            matches!(&err, Error::AncestorBroken { ancestor: a, reason } if *a == ancestor && reason == "disk on fire"),
+            "{err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("broken") && !msg.contains("retry"),
+            "must not read as retryable: {msg}"
+        );
+        assert!(
+            matches!(ApiError::from(err), ApiError::InternalServerError(_)),
+            "a broken ancestor must not be a retryable 503"
+        );
     }
 
     #[test]
