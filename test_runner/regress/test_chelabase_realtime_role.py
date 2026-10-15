@@ -498,6 +498,11 @@ def test_rt_names_are_realtimes_alone(pg: VanillaPostgres):
         ({"options": "-c wal_sender_timeout=0"}, "wal_sender_timeout"),
         ({"options": "-c logical_decoding_work_mem=1GB"}, "logical_decoding_work_mem"),
         ({"options": "-c statement_timeout=120s"}, "statement_timeout"),
+        ({"options": "--wal_sender_timeout=0"}, "wal_sender_timeout"),
+        ({"options": "-cwal_sender_timeout=0"}, "wal_sender_timeout"),
+        ({"options": "-d 5"}, "-d"),
+        # client_encoding is allowed as a startup key, not through options
+        ({"options": "-c client_encoding=UTF8"}, "client_encoding"),
     ],
     ids=[
         "key-wal_sender_timeout",
@@ -506,6 +511,10 @@ def test_rt_names_are_realtimes_alone(pg: VanillaPostgres):
         "options-wal_sender_timeout",
         "options-logical_decoding_work_mem",
         "options-statement_timeout",
+        "options-long-wal_sender_timeout",
+        "options-joined-wal_sender_timeout",
+        "options-switch-d",
+        "options-client_encoding",
     ],
 )
 def test_realtime_may_not_set_parameters(pg: VanillaPostgres, params: dict[str, str], name: str):
@@ -526,6 +535,12 @@ def test_realtime_may_not_set_parameters_through_libpq(pg: VanillaPostgres):
             connection_factory=LogicalReplicationConnection,
         )
     assert 'role "chelabase_realtime" may not set parameter "wal_sender_timeout"' in str(e.value)
+
+
+def test_realtime_may_send_empty_options(pg: VanillaPostgres):
+    """options that carry nothing (whitespace only) set nothing: allowed."""
+    s = Raw(pg, {**walsender_params(pg, RT), "options": "   "})
+    assert len(s.query("IDENTIFY_SYSTEM")) == 1
 
 
 def test_realtime_may_name_itself_and_its_encoding(pg: VanillaPostgres):
