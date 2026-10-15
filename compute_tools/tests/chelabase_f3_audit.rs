@@ -278,7 +278,30 @@ fn the_chain_check_accepts_only_p256_ecdsa() {
 /// 6: product rule, aws-lc-rs over ring.
 #[test]
 fn the_tls_code_does_not_use_ring() {
-    for needle in ["ring::", "use ring"] {
-        assert!(!TLS_RS.contains(needle), "tls.rs uses {needle}");
-    }
+    // `ring` as a crate name only: `Ordering::` or `string::` don't count.
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let names_ring = |text: &str| {
+        text.match_indices("ring").any(|(at, _)| {
+            let before = text[..at].chars().next_back();
+            let after = text[at + 4..].chars().next();
+            !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
+        })
+    };
+    let code = TLS_RS
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!names_ring(&code), "tls.rs uses the ring crate");
+    let cargo = include_str!("../Cargo.toml");
+    assert!(
+        !cargo
+            .lines()
+            .any(|l| l.trim_start().starts_with("ring") && names_ring(l)),
+        "compute_tools depends on ring"
+    );
+    // The needle itself: a crate path is found, a longer identifier isn't.
+    assert!(names_ring("use ring::digest;"));
+    assert!(names_ring("ring = { workspace = true }"));
+    assert!(!names_ring("atomic::Ordering::Relaxed; let s: String;"));
 }

@@ -84,6 +84,43 @@ fn rewrite(dir: &Path, spec: &ComputeSpec) -> anyhow::Result<()> {
     rewrite_config_files(dir, &params(dir), spec, None, 3082, &None, false)
 }
 
+/// A self-signed P-256 pair in `<dir>/tls/`, as the compute's mounted files.
+fn tls_pair(dir: &Path) -> TlsConfig {
+    let tls = dir.join("tls");
+    std::fs::create_dir_all(&tls).unwrap();
+    let out = std::process::Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:P-256",
+            "-nodes",
+            "-keyout",
+            "server.key",
+            "-out",
+            "server.crt",
+            "-days",
+            "2",
+            "-subj",
+            "/CN=compute",
+        ])
+        .current_dir(&tls)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    TlsConfig {
+        key_path: tls.join("server.key").to_string_lossy().into(),
+        cert_path: tls.join("server.crt").to_string_lossy().into(),
+        ca_path: None,
+    }
+}
+
 /// The three files as they are before a reconfigure.
 fn seed(dir: &Path, hba: &str) -> [(PathBuf, String); 3] {
     std::fs::write(dir.join("PG_VERSION"), "17\n").unwrap();
@@ -134,13 +171,25 @@ fn a_failed_rewrite_writes_nothing() {
 fn a_rewrite_writes_all_three_files() {
     let dir = fresh("f3_audit_rewrite_ok");
     seed(&dir, &format!("local all all trust\n{MD5}"));
-    rewrite(&dir, &spec(&["chelabase-orchestrator"])).unwrap();
+    let tls = Some(tls_pair(&dir));
+    rewrite_config_files(
+        &dir,
+        &params(&dir),
+        &spec(&["chelabase-orchestrator"]),
+        None,
+        3082,
+        &tls,
+        false,
+    )
+    .unwrap();
     let conf = read(&dir.join("postgresql.conf"));
     assert!(conf.contains("neon.branch_protected"), "{conf}");
+    assert!(conf.contains("ssl = on"), "{conf}");
     assert!(!conf.contains("# the running config"), "{conf}");
+    assert!(dir.join("server.crt").exists() && dir.join("server.key").exists());
     let hba = read(&dir.join("pg_hba.conf"));
     assert!(
-        hba.starts_with(HEAD) && hba.contains("10.213.4.10/32"),
+        hba.starts_with(HEAD) && hba.contains("hostssl") && hba.contains("10.213.4.10/32"),
         "{hba}"
     );
     let ident = read(&dir.join("pg_ident.conf"));
@@ -151,6 +200,18 @@ fn a_rewrite_writes_all_three_files() {
             .any(|l| l.starts_with("chelabase_member\tchelabase-orchestrator\t")),
         "{ident}"
     );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Without TLS the member block only rejects (as `member_hba_block` does).
+#[test]
+fn a_rewrite_without_tls_writes_the_reject_only_block() {
+    let dir = fresh("f3_audit_rewrite_no_tls");
+    seed(&dir, &format!("local all all trust\n{MD5}"));
+    rewrite(&dir, &spec(&["chelabase-orchestrator"])).unwrap();
+    let hba = read(&dir.join("pg_hba.conf"));
+    assert!(hba.starts_with(HEAD) && !hba.contains("hostssl"), "{hba}");
+    assert!(read(&dir.join("postgresql.conf")).contains("neon.branch_protected"));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
