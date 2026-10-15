@@ -223,8 +223,8 @@ fi
 for step in build rust-tests pg-check; do
     args="$(CHELA_NEON_VOLUME_SUFFIX=t9 docker_args /r v17 release "$step" | paste -sd' ' -)"
     for want in \
-        "type=volume,src=chela-neon-sccache,dst=/home/nonroot/.cache/sccache" \
-        "SCCACHE_DIR=/home/nonroot/.cache/sccache" \
+        "type=volume,src=chela-neon-sccache,dst=/sccache-cache" \
+        "SCCACHE_DIR=/sccache-cache" \
         "RUSTC_WRAPPER=/opt/sccache/sccache" \
         "dst=/opt/sccache,readonly"; do
         if [[ "$args" == *"$want"* ]]; then
@@ -235,6 +235,25 @@ for step in build rust-tests pg-check; do
         fi
     done
 done
+
+# T1b fix round: a damaged installed sccache (truncated copy, interrupted install) is never
+# trusted; the installed binary's own sha256 is pinned and checked on every run.
+expect "the installed binary's sha256 is pinned" "64" "$(v="${SCCACHE_BIN_SHA256:-}"; echo "${#v}")"
+fake_cache="$(mktemp -d)"
+mkdir -p "$fake_cache/chela-neon/sccache-$SCCACHE_VERSION"
+printf 'truncated' >"$fake_cache/chela-neon/sccache-$SCCACHE_VERSION/sccache"
+chmod 755 "$fake_cache/chela-neon/sccache-$SCCACHE_VERSION/sccache"
+if (
+    XDG_CACHE_HOME="$fake_cache"
+    curl() { return 7; }
+    ensure_sccache
+) >/dev/null 2>&1; then
+    echo "FAIL: ensure_sccache must not trust a damaged sccache binary"
+    failures=$((failures + 1))
+else
+    echo "ok: a damaged sccache binary is not trusted"
+fi
+rm -rf "$fake_cache"
 
 if ((failures > 0)); then
     echo "$failures check(s) failed"
