@@ -65,14 +65,19 @@ pub struct S3Bucket {
 /// for S3-compatible stores on slow links.
 pub const S3_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The timeout config for an S3 client: `base` (the loaded SDK config's, if any) with the
-/// connect timeout set to [`S3_CONNECT_TIMEOUT`]. Every other timeout of `base` is kept, since
-/// setting a timeout config on an SDK config builder replaces the whole config.
+/// The timeout config for an S3 client: `base` with [`S3_CONNECT_TIMEOUT`] as its connect
+/// timeout when `base` has none. A connect timeout `base` carries (the caller's choice) and
+/// every other timeout of `base` are kept, since setting a timeout config on an SDK config
+/// builder replaces the whole config.
+///
+/// Pass it to `aws_config::defaults(..).timeout_config(..)` before `load()`: the loader fills
+/// only the unset fields from the SDK's defaults, so the 10 s then wins over their 3.1 s.
 pub fn s3_timeout_config(base: Option<&TimeoutConfig>) -> TimeoutConfig {
-    base.map(TimeoutConfig::to_builder)
-        .unwrap_or_default()
-        .connect_timeout(S3_CONNECT_TIMEOUT)
-        .build()
+    let builder = base.map(TimeoutConfig::to_builder).unwrap_or_default();
+    match base.and_then(TimeoutConfig::connect_timeout) {
+        Some(_) => builder.build(),
+        None => builder.connect_timeout(S3_CONNECT_TIMEOUT).build(),
+    }
 }
 
 struct GetObjectRequest {
@@ -118,7 +123,10 @@ impl S3Bucket {
                 .region(region_opt)
                 .identity_cache(IdentityCache::lazy().build())
                 .credentials_provider(credentials_provider)
-                .sleep_impl(SharedAsyncSleep::from(sleep_impl));
+                .sleep_impl(SharedAsyncSleep::from(sleep_impl))
+                // Set before loading: the loader fills only unset fields from the SDK's
+                // defaults (3.1 s connect), and the S3 client below inherits this config.
+                .timeout_config(s3_timeout_config(None));
 
         let sdk_config: aws_config::SdkConfig = std::thread::scope(|s| {
             s.spawn(|| {
@@ -151,11 +159,6 @@ impl S3Bucket {
             .set_max_attempts(Some(1))
             .set_mode(Some(RetryMode::Adaptive));
         s3_config_builder = s3_config_builder.retry_config(retry_config.build());
-
-        // `timeout_config` replaces the whole timeout config, so start from the loaded one to
-        // keep its other timeouts.
-        s3_config_builder =
-            s3_config_builder.timeout_config(s3_timeout_config(sdk_config.timeout_config()));
 
         // Stalled-stream protection on downloads only, as under the 2023-11-09 behavior version
         // this code was written against: uploads are bounded by our own timeouts

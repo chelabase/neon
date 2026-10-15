@@ -441,6 +441,9 @@ where
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Before any TLS use: rustls has no implicit default with two providers compiled in.
+    http_utils::tls_certs::install_default_crypto_provider();
+
     let cli = Cli::parse();
 
     let ssl_ca_certs = match &cli.ssl_ca_file {
