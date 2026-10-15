@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import json
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from psycopg2.errors import InsufficientPrivilege
@@ -10,17 +11,30 @@ if TYPE_CHECKING:
     from fixtures.httpserver import ListenAddress
     from fixtures.neon_fixtures import VanillaPostgres
     from pytest_httpserver import HTTPServer
+    from werkzeug.wrappers.request import Request
+
+
+@pytest.fixture
+def patches() -> list[Any]:
+    """Every body the control-plane mock received, in order."""
+    return []
 
 
 @pytest.fixture
 def neon_pg(
-    httpserver: HTTPServer, vanilla_pg: VanillaPostgres, httpserver_listen_address: ListenAddress
+    httpserver: HTTPServer,
+    vanilla_pg: VanillaPostgres,
+    httpserver_listen_address: ListenAddress,
+    patches: list[Any],
 ):
     (host, port) = httpserver_listen_address
     endpoint = "/test/roles_and_databases"
-    httpserver.expect_request(endpoint, method="PATCH").respond_with_handler(
-        lambda request: Response(status=200)
-    )
+
+    def record(request: Request) -> Response:
+        patches.append(json.loads(request.get_data(as_text=True)))
+        return Response(status=200)
+
+    httpserver.expect_request(endpoint, method="PATCH").respond_with_handler(record)
     vanilla_pg.configure(
         [f"neon.console_url=http://{host}:{port}{endpoint}", "shared_preload_libraries = 'neon'"]
     )
@@ -107,3 +121,46 @@ def test_only_a_superuser_changes_member_roles(neon_pg: VanillaPostgres):
     # Ordinary roles are untouched.
     with neon_pg.cursor(user="owner", password="pw") as cur:
         cur.execute("CREATE ROLE ordinary; ALTER ROLE ordinary PASSWORD 'x'; DROP ROLE ordinary")
+
+
+# T5 m4: more statement shapes.
+MORE_AS_OWNER = [
+    (f"CREATE ROLE g4 IN ROLE {MEMBER}", MEMBER),
+    (f"CREATE ROLE g5 IN GROUP {MEMBER}", MEMBER),
+    ("CREATE ROLE g6 IN ROLE chelabase_realtime", "chelabase_realtime"),
+    (f"ALTER GROUP grp DROP USER {MEMBER}", MEMBER),
+    (f"ALTER GROUP {MEMBER} ADD USER grp", MEMBER),
+    (f"ALTER ROLE {MEMBER} IN DATABASE postgres RESET ALL", MEMBER),
+]
+MORE_AS_MEMBER = [
+    "ALTER ROLE CURRENT_USER IN DATABASE postgres SET work_mem = '1MB'",
+    f"ALTER ROLE {MEMBER} IN DATABASE postgres SET work_mem = '1MB'",
+    "ALTER ROLE CURRENT_USER IN DATABASE postgres RESET ALL",
+    "ALTER USER CURRENT_USER IN DATABASE postgres SET search_path = 'x'",
+]
+
+
+def test_a_refusal_forwards_nothing(neon_pg: VanillaPostgres, patches: list[Any]):
+    setup_roles(neon_pg)
+    for user, cases in [
+        ("owner", AS_OWNER + MORE_AS_OWNER),
+        (MEMBER, [(sql, MEMBER) for sql in AS_MEMBER + MORE_AS_MEMBER]),
+    ]:
+        for sql, name in cases:
+            before = len(patches)
+            refused(neon_pg, user, sql, name)
+            assert len(patches) == before, f"{sql}: forwarded {patches[before:]}"
+    # Refused inside a savepoint that is rolled back to: the rest of the
+    # transaction is forwarded, nothing of the refused statement.
+    before = len(patches)
+    with neon_pg.cursor(user="owner", password="pw", autocommit=False) as cur:
+        cur.execute("CREATE ROLE kept")
+        cur.execute("SAVEPOINT s")
+        with pytest.raises(InsufficientPrivilege):
+            cur.execute(f"ALTER ROLE {MEMBER} PASSWORD 'x'")
+        cur.execute("ROLLBACK TO SAVEPOINT s")
+        cur.connection.commit()
+    assert len(patches) == before + 1, patches[before:]
+    body = patches[-1]
+    assert "dbs" not in body, body
+    assert [role["name"] for role in body["roles"]] == ["kept"], body
