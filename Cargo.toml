@@ -66,15 +66,18 @@ flate2 = "1.0.26"
 assert-json-diff = "2"
 async-stream = "0.3"
 async-trait = "0.1"
-aws-config = { version = "1.5", default-features = false, features=["rustls", "sso"] }
-aws-sdk-s3 = "1.52"
-aws-sdk-iam = "1.46.0"
-aws-sdk-kms = "1.47.0"
-aws-smithy-async = { version = "1.2.1", default-features = false, features=["rt-tokio"] }
-aws-smithy-types = "1.2"
-aws-credential-types = "1.2.0"
-aws-sigv4 = { version = "1.2", features = ["sign-http"] }
-aws-types = "1.3"
+# The AWS SDK's HTTP client is its default one (hyper 1, rustls 0.23 on aws-lc-rs). The SDK
+# crates' `rustls` feature is the legacy hyper 0.14 / rustls 0.21 client, so their default
+# features (which include it) stay off.
+aws-config = { version = "1.12", default-features = false, features=["default-https-client", "rt-tokio", "sso"] }
+aws-sdk-s3 = { version = "1.152", default-features = false, features=["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
+aws-sdk-iam = { version = "1.128", default-features = false, features=["default-https-client", "rt-tokio"] }
+aws-sdk-kms = { version = "1.123", default-features = false, features=["default-https-client", "rt-tokio"] }
+aws-smithy-async = { version = "1.3", default-features = false, features=["rt-tokio"] }
+aws-smithy-types = "1.8"
+aws-credential-types = "1.3"
+aws-sigv4 = { version = "1.6", features = ["sign-http"] }
+aws-types = "1.6"
 axum = { version = "0.8.1", features = ["ws"] }
 axum-extra = { version = "0.10.0", features = ["typed-header", "query"] }
 base64 = "0.22"

@@ -31,7 +31,8 @@ reason = "the marvin attack only affects private key decryption, not public key 
 id = "RUSTSEC-2024-0436"
 reason = "The paste crate is a build-only dependency with no runtime components. It is unlikely to have any security impact."
 
-# Fork additions (Task 3a, 2026-10-01). This list may only shrink: every entry
+# Policy: this ignore list only shrinks. A new advisory is fixed by upgrading the
+# dependency; an ignore needs the user's explicit approval and a reason. Every entry
 # below has no fixed release reachable without replacing a dependency.
 
 [[advisories.ignore]]
@@ -40,11 +41,11 @@ reason = "bincode 1.3.3 is unmaintained but is the final, complete 1.x release; 
 
 [[advisories.ignore]]
 id = "RUSTSEC-2025-0134"
-reason = "rustls-pemfile is unmaintained (no vulnerability), only parses PEM input. Used directly by the workspace (replacement is rustls-pki-types PemObject, many call sites) and transitively by gcp_auth, reqwest and hyper-rustls 0.24 (AWS SDK legacy HTTP client)."
+reason = "rustls-pemfile is unmaintained (no vulnerability), only parses PEM input. Used directly by the workspace (replacement is rustls-pki-types PemObject, many call sites) and transitively by gcp_auth and reqwest."
 
 [[advisories.ignore]]
 id = "RUSTSEC-2026-0258"
-reason = "h2 0.3.x has no fix (patched only in 0.4.16+). h2 0.3 comes in through hyper 0.14, which routerify (internal management HTTP APIs) and the AWS SDK legacy HTTP client still require. Removing it means dropping routerify and moving the AWS clients off the legacy connector."
+reason = "h2 0.3.x has no fix (patched only in 0.4.16+). h2 0.3 comes in through hyper 0.14, which routerify (internal management HTTP APIs) and the workspace crates built on it still require. Removing it means dropping routerify."
 
 [[advisories.ignore]]
 id = "RUSTSEC-2026-0174"
