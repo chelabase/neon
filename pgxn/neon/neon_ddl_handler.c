@@ -83,9 +83,9 @@ static bool RegressTestMode = false;
 /*
  * neon.born_closed: a marker only (no runtime effect). Set as a database
  * setting (pg_db_role_setting, setrole = 0) on a database a non-superuser
- * created on a protected branch (BranchProtected); the member-roles reconcile opens the
- * database once it carries the guard, and resets the marker. PGC_SUSET, so
- * the database's owner can neither set nor reset it.
+ * created on a protected branch (BranchProtected); the member-roles
+ * reconcile opens the database once it carries the guard, and resets the
+ * marker. PGC_SUSET, so the database's owner can neither set nor reset it.
  */
 static bool BornClosed = false;
 

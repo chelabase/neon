@@ -380,13 +380,13 @@ pub fn update_pg_ident(
     member_logins: Option<&MemberLogins>,
 ) -> Result<()> {
     info!("checking pg_ident.conf");
-    let pghba_path = pgdata_path.join("pg_ident.conf");
+    let pgident_path = pgdata_path.join("pg_ident.conf");
 
     let block = format!(
         "{MEMBER_IDENT_HEAD}\n{}{MEMBER_IDENT_TAIL}\n",
         member_ident_lines(member_logins)?
     );
-    let current = read_conf_file(&pghba_path)?;
+    let current = read_conf_file(&pgident_path)?;
     let has_markers = current
         .lines()
         .any(|l| l == MEMBER_IDENT_HEAD || l == MEMBER_IDENT_TAIL);
@@ -407,14 +407,14 @@ pub fn update_pg_ident(
         &block,
         "pg_ident.conf",
     )?;
-    if write_conf_file(&pghba_path, &current, &updated)? {
+    if write_conf_file(&pgident_path, &current, &updated)? {
         info!("updated the member certificate map in pg_ident.conf");
     }
 
     // Update pg_ident to contains databricks specfic settings
     if let Some(databricks_pg_ident) = databricks_pg_ident {
         if config::line_in_file(
-            &pghba_path,
+            &pgident_path,
             &format!("include_if_exists {}\n", *databricks_pg_ident),
         )? {
             info!("updated pg_ident.conf to include databricks_pg_ident.conf");
