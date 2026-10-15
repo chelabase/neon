@@ -20,7 +20,7 @@ pprof.workspace = true
 regex.workspace = true
 routerify.workspace = true
 rustls-pemfile.workspace = true
-rustls.workspace = true
+rustls = { workspace = true, features = ["aws_lc_rs"] }
 serde_json.workspace = true
 serde_path_to_error.workspace = true
 serde.workspace = true

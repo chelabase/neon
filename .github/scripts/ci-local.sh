@@ -28,11 +28,13 @@
 # Steps (each in its own `docker run --rm` of the build-tools image, as the
 # image's `nonroot` user, mirroring pr.yml's jobs and commands):
 #   lint        self-tests, actionlint, cargo fmt, clippy, cargo deny (advisories,
-#               bans, licenses, sources; all blocking, as in pr.yml), ruff, mypy
+#               bans, licenses, sources; all blocking, as in pr.yml), cargo hakari
+#               (workspace_hack up to date), ruff, mypy
 #   build       Postgres <pg> + extensions + Rust binaries (`make ... all`)
 #   rust-tests  Postgres v14-v17 + extensions, cargo test --doc, cargo nextest
-#   pg-check    (only via --only) `make check` of Postgres <pg> and, for v17, of
-#               contrib/chelabase_keys; each regression.diffs goes to the step's log
+#   pg-check    (only via --only) `make -j check` of Postgres <pg> and, for v17, of
+#               contrib/chelabase_keys with neon_rmgr preloaded (builds the neon
+#               extensions first); this run's regression.diffs go to the step's log
 #   regress     (only with --regress) pytest test_runner/regress in one process with -n <workers> and
 #               --reruns 2, deselecting test_runner/known_failures.txt and
 #               test_runner/known_failures.local.txt
@@ -332,10 +334,17 @@ lint_ruff_mypy() {
     poetry run ruff check . && poetry run ruff format --check . && poetry run mypy .
 }
 
+# lint_hakari: workspace_hack is what `cargo hakari generate` writes for the current
+# dependency graph, every crate depends on it, and it unifies features as it should.
+lint_hakari() {
+    cargo hakari generate --diff && cargo hakari manage-deps --dry-run && cargo hakari verify
+}
+
 step_lint() {
     check "known_failures.sh self-test" .github/scripts/known_failures_test.sh
     check "advisory_issue.sh self-test" .github/scripts/advisory_issue_test.sh
     check "ci-local.sh self-test" .github/scripts/ci-local_test.sh
+    check "ci-local.sh pg-check self-test" .github/scripts/ci-local_pg_check_test.sh
     check "publish-dev.sh self-test" .github/scripts/publish-dev_test.sh
     check "check_tag_free.sh self-test" .github/scripts/check_tag_free_test.sh
     check "actionlint" lint_actionlint
@@ -343,6 +352,7 @@ step_lint() {
     check "postgres headers" make -j"$(nproc)" postgres-headers
     check "cargo clippy" lint_clippy
     check "cargo deny (advisories, bans, licenses, sources)" cargo deny check --hide-inclusion-graph
+    check "cargo hakari (workspace_hack)" lint_hakari
     check "python deps" ./scripts/pysync
     check "ruff and mypy" lint_ruff_mypy
     echo
@@ -407,23 +417,91 @@ pg_check_dirs() {
     return 0
 }
 
+# The temp config of contrib/chelabase_keys' `make check` (see pg_check_make_args).
+PG_CHECK_TEMP_CONFIG=/tmp/ci-local-pg-check-neon-rmgr.conf
+
+# pg_check_build_targets <pg>: the make targets pg-check needs, one per line: Postgres <pg>
+# with its contrib, and for v17 the neon extensions (chelabase_keys' check preloads neon_rmgr).
+pg_check_build_targets() {
+    echo "postgres-$1"
+    [[ "$1" == v17 ]] && echo "neon-pg-ext-v17"
+    return 0
+}
+
+# pg_check_diffs_file <dir>: where `make -C <dir> check` writes regression.diffs. The core
+# check (build/<pg>) runs pg_regress in src/test/regress; a contrib module's runs in its dir.
+pg_check_diffs_file() {
+    if [[ "$1" =~ (^|/)build/v[0-9]+/?$ ]]; then
+        echo "${1%/}/src/test/regress/regression.diffs"
+    else
+        echo "${1%/}/regression.diffs"
+    fi
+}
+
+# pg_check_clean_diffs <dir>: removes <dir>'s regression.diffs (a stale one from an earlier
+# run in the persistent build volume would otherwise be printed as this run's).
+pg_check_clean_diffs() {
+    rm -f "$(pg_check_diffs_file "$1")"
+}
+
+# pg_check_print_diffs <dir>: prints <dir>'s regression.diffs, if any, into the step's log.
+pg_check_print_diffs() {
+    local f
+    f="$(pg_check_diffs_file "$1")"
+    [[ -f "$f" ]] || return 0
+    echo "--- $f"
+    cat "$f"
+}
+
+# pg_check_temp_config_content: the temp config of chelabase_keys' check. Heap DML logs
+# under RM_NEON_ID, so the server needs neon_rmgr preloaded, found in the volume's
+# pg_install (the check's temporary install has only core and contrib).
+pg_check_temp_config_content() {
+    echo "shared_preload_libraries = 'neon_rmgr'"
+    echo "dynamic_library_path = '\$libdir:/work/pg_install/v17/lib/postgresql'"
+}
+
+# pg_check_make_args <dir> <jobs>: make's arguments for <dir>'s check, one per line.
+# -j<jobs> parallelises the check's temp install (`temp-install` reinstalls the tree into
+# tmp_install before pg_regress starts) and any rebuild; pg_regress itself already runs each
+# group of the schedule concurrently (no MAX_CONNECTIONS limit), which -j doesn't change.
+pg_check_make_args() {
+    printf '%s\n' "-j$2" -C "$1" check
+    [[ "$1" =~ (^|/)build/v17/contrib/chelabase_keys/?$ ]] && echo "TEMP_CONFIG=$PG_CHECK_TEMP_CONFIG"
+    return 0
+}
+
+# pg_check_require_rmgr <pg_install_dir>: fails with a clear message when neon_rmgr isn't
+# installed (rather than a Postgres startup error in the middle of the check).
+pg_check_require_rmgr() {
+    [[ -f "$1/lib/postgresql/neon_rmgr.so" ]] && return 0
+    echo "pg-check: neon_rmgr.so is not installed in $1/lib/postgresql; build the neon" \
+        "extensions first (make neon-pg-ext-v17, or ci-local.sh --only build,pg-check)" >&2
+    return 1
+}
+
 step_pg_check() {
-    local start dir failed=() d
+    local start dir failed=() targets make_args
     start=$(date +%s)
-    # Builds Postgres <pg> (and its contrib) if the volume doesn't have it yet.
+    # Builds Postgres <pg> (and its contrib), and the neon extensions for v17, if the volume
+    # doesn't have them yet.
+    mapfile -t targets < <(pg_check_build_targets "$PG_VERSION")
     # shellcheck disable=SC2086
     mold -run make -j"$(nproc)" BUILD_TYPE="$BUILD_TYPE" CARGO_BUILD_FLAGS="$CARGO_FLAGS" \
-        "postgres-$PG_VERSION"
+        "${targets[@]}" || return 1
+    if [[ "$PG_VERSION" == v17 ]]; then
+        pg_check_require_rmgr "$PWD/pg_install/v17" || return 1
+        pg_check_temp_config_content >"$PG_CHECK_TEMP_CONFIG"
+    fi
     while read -r dir; do
+        mapfile -t make_args < <(pg_check_make_args "$dir" "$(nproc)")
+        pg_check_clean_diffs "$dir"
         echo
-        echo "=== pg-check: make -C $dir check"
-        if ! make -C "$dir" check; then
+        echo "=== pg-check: make ${make_args[*]}"
+        if ! make "${make_args[@]}"; then
             failed+=("$dir")
-            # Keep the diffs in this step's log.
-            while read -r d; do
-                echo "--- $d"
-                cat "$d"
-            done < <(find "$dir" -name regression.diffs)
+            # Keep this run's diffs in the step's log.
+            pg_check_print_diffs "$dir"
         fi
     done < <(pg_check_dirs "$PG_VERSION")
     echo "pg-check took $(($(date +%s) - start))s"

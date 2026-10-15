@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import psycopg2
 import pytest
@@ -113,7 +113,7 @@ def setup_hba(pg: VanillaPostgres, certs: Path, cidr: str):
 
 
 def member(pg: VanillaPostgres, certs: Path, cert: str | None, **kw):
-    opts = dict(
+    opts: dict[str, Any] = dict(
         user=MEMBER,
         password="pw",
         host="127.0.0.1",
@@ -125,7 +125,9 @@ def member(pg: VanillaPostgres, certs: Path, cert: str | None, **kw):
     opts.update(kw)
     with pg.cursor(**opts) as cur:
         cur.execute("SELECT current_user")
-        return cur.fetchone()[0]
+        row = cur.fetchone()
+        assert row is not None
+        return row[0]
 
 
 @run_only_on_postgres([PgVersion.V17], "the hba map change is v17 only")

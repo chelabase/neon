@@ -57,6 +57,7 @@ def ddl_forward_handler(
     request: Request, dbs: dict[str, str], roles: dict[str, str], ddl: DdlForwardingContext
 ) -> Response:
     log.info(f"Received request with data {request.get_data(as_text=True)}")
+    ddl.requests += 1
     if ddl.fail:
         log.info("FAILING")
         return Response(status=500, response="Failed just cuz")
@@ -81,6 +82,8 @@ class DdlForwardingContext:
         self.dbs: dict[str, str] = {}
         self.roles: dict[str, str] = {}
         self.fail = False
+        # Every PATCH received, failed ones included
+        self.requests = 0
         endpoint = "/test/roles_and_databases"
         ddl_url = f"http://{host}:{port}{endpoint}"
         self.pg.configure(
@@ -1093,3 +1096,47 @@ def test_reassign_owned_reports_database_owner(ddl: DdlForwardingContext):
     ddl.send_and_wait("DROP ROLE ra")
     ddl.send_and_wait("DROP ROLE rb")
     assert ddl.dbs == {} and ddl.roles == {}
+
+
+REASSIGN_MEMBER = "cb_m_0123456789abcdef0123456789abcdef"
+
+
+def test_reassign_owned_to_the_privileged_role(ddl: DdlForwardingContext):
+    """T5 m2: a non-superuser can't REASSIGN OWNED databases to neon_superuser
+    (CREATE DATABASE ... OWNER and ALTER DATABASE ... OWNER refuse it too); a
+    superuser can (compute_ctl's DeleteDBRoleReferences runs it as cloud_admin)."""
+
+    def owner_of(db: str) -> str:
+        rows = ddl.send(f"SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = '{db}'")
+        return str(rows[0][0])
+
+    def as_owner(sql: str):
+        with ddl.pg.cursor(user="owner") as cur:
+            cur.execute(sql)
+
+    ddl.send_and_wait("CREATE ROLE neon_superuser NOLOGIN CREATEDB CREATEROLE")
+    ddl.send_and_wait("CREATE ROLE owner LOGIN CREATEDB CREATEROLE IN ROLE neon_superuser")
+    ddl.send_and_wait(f"CREATE ROLE {REASSIGN_MEMBER} LOGIN")
+    ddl.send_and_wait(f"GRANT {REASSIGN_MEMBER} TO owner")
+    as_owner("CREATE DATABASE odb")
+    assert ddl.dbs == {"odb": "owner"}
+    for sql in [
+        "REASSIGN OWNED BY owner TO neon_superuser",
+        "REASSIGN OWNED BY CURRENT_USER TO neon_superuser",
+        "DO $$BEGIN EXECUTE 'REASSIGN OWNED BY owner TO neon_superuser'; END$$",
+    ]:
+        before = ddl.requests
+        with pytest.raises(psycopg2.Error) as e:
+            as_owner(sql)
+        assert "neon_superuser" in str(e.value), (sql, str(e.value))
+        assert owner_of("odb") == "owner", sql
+        assert ddl.requests == before, f"{sql}: refused, but forwarded"
+    assert ddl.dbs == {"odb": "owner"}
+    # To itself and to a member role: allowed, as ALTER DATABASE ... OWNER is.
+    as_owner("REASSIGN OWNED BY owner TO owner")
+    assert owner_of("odb") == "owner" and ddl.dbs == {"odb": "owner"}
+    as_owner(f"REASSIGN OWNED BY owner TO {REASSIGN_MEMBER}")
+    assert owner_of("odb") == REASSIGN_MEMBER and ddl.dbs == {"odb": REASSIGN_MEMBER}
+    # A superuser may.
+    ddl.send_and_wait(f"REASSIGN OWNED BY {REASSIGN_MEMBER} TO neon_superuser")
+    assert owner_of("odb") == "neon_superuser" and ddl.dbs == {"odb": "neon_superuser"}

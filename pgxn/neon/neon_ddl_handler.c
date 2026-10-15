@@ -83,9 +83,9 @@ static bool RegressTestMode = false;
 /*
  * neon.born_closed: a marker only (no runtime effect). Set as a database
  * setting (pg_db_role_setting, setrole = 0) on a database a non-superuser
- * created in a guarded database; the member-roles reconcile opens the
- * database once it carries the guard, and resets the marker. PGC_SUSET, so
- * the database's owner can neither set nor reset it.
+ * created on a protected branch (BranchProtected); the member-roles
+ * reconcile opens the database once it carries the guard, and resets the
+ * marker. PGC_SUSET, so the database's owner can neither set nor reset it.
  */
 static bool BornClosed = false;
 
@@ -1281,6 +1281,18 @@ HandleReassignOwned(ReassignOwnedStmt *stmt)
 	ListCell   *item;
 	List	   *owners = NIL;
 
+	/*
+	 * Moving databases to the privileged role is refused to non-superusers, as
+	 * CREATE DATABASE ... OWNER and ALTER DATABASE ... OWNER refuse it
+	 * (HandleCreateDb, HandleAlterOwner). A superuser may: compute_ctl drops
+	 * roles with REASSIGN OWNED ... TO the privileged role as cloud_admin.
+	 */
+	if (!superuser() && stmt->newrole->roletype != ROLESPEC_PUBLIC &&
+		IsPrivilegedRole(get_rolespec_name(stmt->newrole)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("could not reassign owned objects to %s", privileged_role_name)));
+
 	foreach(item, stmt->roles)
 	{
 		RoleSpec   *spec = lfirst(item);
@@ -1899,16 +1911,26 @@ CheckManagedRoleStatement(Node *parseTree)
  * Databases born closed on a protected branch.
  *
  * A protected branch carries the schema guard in every connectable database:
- * an event trigger named SCHEMA_GUARD_TRIGGER, owned by a superuser and
- * ENABLE ALWAYS. A look-alike made by a customer through this extension is
- * owned by its creator (ProcessCreateEventTrigger), never a superuser.
+ * an event trigger named SCHEMA_GUARD_TRIGGER, ENABLE ALWAYS, owned by a
+ * superuser and running a function a superuser owns. A look-alike made by a
+ * customer through this extension is owned by its creator
+ * (ProcessCreateEventTrigger); its owner may hand the trigger to a superuser
+ * (ALTER EVENT TRIGGER ... OWNER TO), but the function stays the customer's.
+ *
+ * The branch's protection also reaches the compute as neon.branch_protected
+ * (U14), so a session in a database without the guard (an open user
+ * template, template1, a database created before the guard) is still on a
+ * protected branch: BranchProtected() is the flag or the guard.
  */
+static bool BranchProtectedFlag = false;
+
 static bool
 SessionDatabaseGuarded(void)
 {
 	Oid			oid = get_event_trigger_oid(SCHEMA_GUARD_TRIGGER, true);
 	HeapTuple	tuple;
 	bool		guarded = false;
+	Oid			funcoid = InvalidOid;
 
 	if (!OidIsValid(oid))
 		return false;
@@ -1919,9 +1941,24 @@ SessionDatabaseGuarded(void)
 
 		guarded = form->evtenabled == TRIGGER_FIRES_ALWAYS &&
 			superuser_arg(form->evtowner);
+		funcoid = form->evtfoid;
 		ReleaseSysCache(tuple);
 	}
+	if (!guarded)
+		return false;
+	tuple = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcoid));
+	if (!HeapTupleIsValid(tuple))
+		return false;
+	guarded = superuser_arg(((Form_pg_proc) GETSTRUCT(tuple))->proowner);
+	ReleaseSysCache(tuple);
 	return guarded;
+}
+
+/* Is the statement made on a protected branch? The flag, or the guard (U14). */
+static bool
+BranchProtected(void)
+{
+	return BranchProtectedFlag || SessionDatabaseGuarded();
 }
 
 /* Does the database carry neon.born_closed = on (its setrole = 0 setting)? */
@@ -1986,10 +2023,12 @@ RefuseBornClosedOption(void)
 }
 
 /*
- * CREATE DATABASE by a non-superuser in a guarded database: ALLOW_CONNECTIONS
- * (any value) and IS_TEMPLATE true are refused; otherwise the returned copy
- * of the statement (the tree may be read-only) has ALLOW_CONNECTIONS false
- * appended. The caller writes the marker once the database exists.
+ * CREATE DATABASE by a non-superuser on a protected branch, whatever the
+ * session's database and the template (U1, U14): ALLOW_CONNECTIONS (any
+ * value) and IS_TEMPLATE true are refused (IS_TEMPLATE DEFAULT is false, as
+ * in dbcommands.c); otherwise the returned copy of the statement (the tree
+ * may be read-only) has ALLOW_CONNECTIONS false appended. The caller writes
+ * the marker once the database exists.
  */
 static CreatedbStmt *
 BornClosedCreateDb(CreatedbStmt *stmt)
@@ -2002,7 +2041,7 @@ BornClosedCreateDb(CreatedbStmt *stmt)
 		DefElem    *defel = lfirst(option);
 
 		if (strcmp(defel->defname, "allow_connections") == 0 ||
-			(strcmp(defel->defname, "is_template") == 0 && defGetBoolean(defel)))
+			(strcmp(defel->defname, "is_template") == 0 && defel->arg && defGetBoolean(defel)))
 			RefuseBornClosedOption();
 	}
 	copy = copyObject(stmt);
@@ -2048,11 +2087,12 @@ WriteBornClosedMarker(Oid dboid)
 }
 
 /*
- * ALTER DATABASE ... ALLOW_CONNECTIONS / IS_TEMPLATE by a non-superuser is
- * refused when the target carries the marker (whatever the session's
- * database), or when the session's database carries the guard: on a
- * protected branch every connectable database must carry the guard, and an
- * owner-closed database stays closed while the branch is protected.
+ * ALTER DATABASE ... ALLOW_CONNECTIONS / IS_TEMPLATE (any value) by a
+ * non-superuser is refused when the target carries the marker (whatever the
+ * session's database), or on a protected branch (BranchProtected, whatever
+ * the session's database): every connectable database must carry the guard,
+ * and an owner-closed database stays closed while the branch is protected.
+ * A missing target is left to Postgres' own "does not exist".
  */
 static void
 CheckAlterDatabase(AlterDatabaseStmt *stmt)
@@ -2072,7 +2112,9 @@ CheckAlterDatabase(AlterDatabaseStmt *stmt)
 	if (!connections_or_template || superuser())
 		return;
 	dboid = get_database_oid(stmt->dbname, true);
-	if ((OidIsValid(dboid) && DatabaseBornClosed(dboid)) || SessionDatabaseGuarded())
+	if (!OidIsValid(dboid))
+		return;
+	if (DatabaseBornClosed(dboid) || BranchProtected())
 		RefuseBornClosedOption();
 }
 
@@ -2130,11 +2172,11 @@ NeonProcessUtility(
 	CheckManagedRoleStatement(parseTree);
 
 	/*
-	 * A non-superuser's CREATE DATABASE in a guarded database runs with
+	 * A non-superuser's CREATE DATABASE on a protected branch runs with
 	 * ALLOW_CONNECTIONS false (a copy of the statement) and gets the marker
 	 * below.
 	 */
-	if (IsA(parseTree, CreatedbStmt) && !superuser() && SessionDatabaseGuarded())
+	if (IsA(parseTree, CreatedbStmt) && !superuser() && BranchProtected())
 	{
 		PlannedStmt *copy = makeNode(PlannedStmt);
 
@@ -2161,6 +2203,30 @@ NeonProcessUtility(
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 					 errmsg("the branch's main database \"%s\" can't be dropped",
 							dropstmt->dbname)));
+	}
+
+	/*
+	 * Nor renamed (R-F3c): ALTER DATABASE main RENAME TO x; DROP DATABASE x
+	 * would get around the refusal above. Renaming another database to a
+	 * protected name is refused too, so the protection can't be moved onto
+	 * it. Superusers can still do both.
+	 */
+	if (IsA(parseTree, RenameStmt) &&
+		castNode(RenameStmt, parseTree)->renameType == OBJECT_DATABASE &&
+		!superuser())
+	{
+		RenameStmt *renamestmt = castNode(RenameStmt, parseTree);
+
+		if (IsProtectedDatabase(renamestmt->subname))
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("the branch's main database \"%s\" can't be renamed",
+							renamestmt->subname)));
+		if (IsProtectedDatabase(renamestmt->newname))
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("a database can't be renamed to the branch's main database name \"%s\"",
+							renamestmt->newname)));
 	}
 
 	/*
@@ -2358,6 +2424,22 @@ InitDDLHandler()
 							 &BornClosed,
 							 false,
 							 PGC_SUSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	/*
+	 * PGC_SIGHUP: only postgresql.conf sets it (compute_ctl writes it from
+	 * the spec and reloads); no session, database or role setting can.
+	 */
+	DefineCustomBoolVariable(
+							 "neon.branch_protected",
+							 "The branch is protected: non-superusers' new databases are born closed",
+							 NULL,
+							 &BranchProtectedFlag,
+							 false,
+							 PGC_SIGHUP,
 							 0,
 							 NULL,
 							 NULL,

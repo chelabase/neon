@@ -284,6 +284,9 @@ fn opt_pathbuf_parser(s: &str) -> Result<Utf8PathBuf, String> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
+    // Before any TLS use: rustls has no implicit default with two providers compiled in.
+    http_utils::tls_certs::install_default_crypto_provider();
+
     // We want to allow multiple occurences of the same arg (taking the last) so
     // that neon_local could generate command with defaults + overrides without
     // getting 'argument cannot be used multiple times' error. This seems to be

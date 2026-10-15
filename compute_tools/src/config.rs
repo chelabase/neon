@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::fmt::Write as FmtWrite;
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -16,6 +16,7 @@ use crate::pg_helpers::{
     DatabricksSettingsExt as _, GenericOptionExt, GenericOptionsSearch, PgOptionsSerialize,
     escape_conf_value,
 };
+use crate::spec;
 use crate::tls::{self, SERVER_CRT, SERVER_KEY};
 
 use utils::shard::{ShardIndex, ShardNumber};
@@ -57,7 +58,9 @@ pub fn tls_conf_lines(tls: &TlsConfig) -> String {
     lines
 }
 
-/// Create or completely rewrite configuration file specified by `path`
+/// Create or completely rewrite `postgresql.conf` (through a temporary file and
+/// a rename). With TLS on, the key and certificate are copied into pgdata first
+/// (retried until they are a valid pair).
 #[allow(clippy::too_many_arguments)]
 pub fn write_postgres_conf(
     pgdata_path: &Path,
@@ -69,9 +72,89 @@ pub fn write_postgres_conf(
     databricks_settings: Option<&DatabricksSettings>,
     lakebase_mode: bool,
 ) -> Result<()> {
-    let path = pgdata_path.join("postgresql.conf");
-    // File::create() destroys the file content if it exists.
-    let mut file = File::create(path)?;
+    if let Some(tls_config) = tls_config {
+        // postgres requires the keyfile to be in a secure file,
+        // currently too complicated to ensure that at the VM level,
+        // so we just copy them to another file instead. :shrug:
+        tls::update_key_path_blocking(pgdata_path, tls_config);
+    }
+    let conf = render_postgres_conf(
+        params,
+        spec,
+        postgres_port,
+        extension_server_port,
+        tls_config,
+        databricks_settings,
+        lakebase_mode,
+    )?;
+    write_file_atomically(&pgdata_path.join("postgresql.conf"), &conf)
+}
+
+/// Writes `data` to `path` through a temporary file and a rename.
+fn write_file_atomically(path: &Path, data: &[u8]) -> Result<()> {
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&tmp, data).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("rename {} into place", tmp.display()))
+}
+
+/// What [`ComputeNode::reconfigure`](crate::compute::ComputeNode::reconfigure)
+/// writes before it reloads, all-or-nothing: `postgresql.conf`, the pg_hba
+/// member block and the pg_ident member lines (databricks settings from the
+/// spec). Every new content is computed and checked first (and with TLS on, the
+/// key and certificate are copied once, without retrying); on any failure
+/// nothing is written and the error is returned.
+pub fn rewrite_config_files(
+    pgdata_path: &Path,
+    params: &ComputeNodeParams,
+    spec: &ComputeSpec,
+    postgres_port: Option<u16>,
+    extension_server_port: u16,
+    tls_config: &Option<TlsConfig>,
+    lakebase_mode: bool,
+) -> Result<()> {
+    let databricks_settings = spec.databricks_settings.as_ref();
+    let hba = spec::plan_pg_hba(
+        pgdata_path,
+        databricks_settings.map(|s| &s.databricks_pg_hba),
+        spec.member_logins.as_ref(),
+        tls_config.is_some(),
+    )?;
+    let ident = spec::plan_pg_ident(
+        pgdata_path,
+        databricks_settings.map(|s| &s.databricks_pg_ident),
+        spec.member_logins.as_ref(),
+    )?;
+    let conf = render_postgres_conf(
+        params,
+        spec,
+        postgres_port,
+        extension_server_port,
+        tls_config,
+        databricks_settings,
+        lakebase_mode,
+    )?;
+    if let Some(tls_config) = tls_config {
+        tls::copy_tls_files(pgdata_path, tls_config)
+            .context("copy the TLS key and certificate into pgdata")?;
+    }
+    write_file_atomically(&pgdata_path.join("postgresql.conf"), &conf)?;
+    hba.write()?;
+    ident.write()?;
+    Ok(())
+}
+
+/// The content of `postgresql.conf`.
+#[allow(clippy::too_many_arguments)]
+fn render_postgres_conf(
+    params: &ComputeNodeParams,
+    spec: &ComputeSpec,
+    postgres_port: Option<u16>,
+    extension_server_port: u16,
+    tls_config: &Option<TlsConfig>,
+    databricks_settings: Option<&DatabricksSettings>,
+    lakebase_mode: bool,
+) -> Result<Vec<u8>> {
+    let mut file: Vec<u8> = Vec::new();
 
     // Write the postgresql.conf content from the spec file as is.
     if let Some(conf) = &spec.cluster.postgresql_conf {
@@ -189,11 +272,6 @@ pub fn write_postgres_conf(
 
     // tls
     if let Some(tls_config) = tls_config {
-        // postgres requires the keyfile to be in a secure file,
-        // currently too complicated to ensure that at the VM level,
-        // so we just copy them to another file instead. :shrug:
-        tls::update_key_path_blocking(pgdata_path, tls_config);
-
         write!(file, "{}", tls_conf_lines(tls_config))?;
     }
 
@@ -384,11 +462,21 @@ pub fn write_postgres_conf(
         writeln!(file, "# Databricks settings end")?;
     }
 
+    // U14: the branch's protection, read by the neon extension's DDL handler
+    // (PGC_SIGHUP, so no session can change it). Written after the spec's own
+    // `postgresql_conf` and `settings` (and the Databricks settings), so none of
+    // them can override it.
+    writeln!(
+        file,
+        "neon.branch_protected={}",
+        if spec.branch_protected { "on" } else { "off" }
+    )?;
+
     // This is essential to keep this line at the end of the file,
     // because it is intended to override any settings above.
     writeln!(file, "include_if_exists = 'compute_ctl_temp_override.conf'")?;
 
-    Ok(())
+    Ok(file)
 }
 
 pub fn with_compute_ctl_tmp_override<F>(pgdata_path: &Path, options: &str, exec: F) -> Result<()>

@@ -20,8 +20,11 @@ pub enum MigrationKind {
 
 /// Options of the connection the migrations run on (RT3-14): a migration waiting
 /// on a customer's lock, or running away, can't hold the start forever. A timeout
-/// is a failure like any other.
-pub const MIGRATION_CONN_OPTIONS: &str = "-c lock_timeout=5s -c statement_timeout=2min";
+/// is a failure like any other. DDL forwarding is off from the connection's start
+/// (R-F3b): the migrations are compute_ctl's own changes, never the control
+/// plane's, so a start never depends on the console being reachable.
+pub const MIGRATION_CONN_OPTIONS: &str =
+    "-c lock_timeout=5s -c statement_timeout=2min -c neon.forward_ddl=off";
 
 /// Whether the failure of migration `failed` (0-based index into `kinds`) fails
 /// the start: the runner stops at the first failure, so the failed migration and
@@ -61,11 +64,7 @@ impl std::fmt::Display for MigrationFailure {
         if self.in_migration {
             write!(f, "migration {id} failed: {:#}", self.error)
         } else {
-            write!(
-                f,
-                "migrations could not run (next: migration {id}): {:#}",
-                self.error
-            )
+            write!(f, "migrations could not run: {:#}", self.error)
         }
     }
 }
@@ -231,5 +230,36 @@ impl<'m> MigrationRunner<'m> {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MIGRATION_CONN_OPTIONS;
+
+    /// R-F3b, audit hardening 5: the migration connection starts with DDL
+    /// forwarding off (a startup option in its connection options, which
+    /// `apply_config` appends to the connection), not a SET run on it
+    /// (structural: the runner needs a live Postgres; test_ddl_forwarding_invalid_db
+    /// covers the behaviour).
+    #[test]
+    fn the_migration_connection_starts_with_forwarding_off() {
+        let options: Vec<&str> = MIGRATION_CONN_OPTIONS.split_whitespace().collect();
+        assert!(
+            options
+                .windows(2)
+                .any(|w| w == ["-c", "neon.forward_ddl=off"]),
+            "{MIGRATION_CONN_OPTIONS:?} lacks -c neon.forward_ddl=off"
+        );
+        let source = include_str!("migration.rs");
+        let code = &source[..source.find("#[cfg(test)]").unwrap()];
+        assert!(
+            !code.contains("SET neon.forward_ddl"),
+            "forwarding is turned off at connect, not by a SET"
+        );
+        let compute = include_str!("compute.rs");
+        assert!(
+            compute.contains("append_conn_options(&mut migration_conf, MIGRATION_CONN_OPTIONS)")
+        );
     }
 }

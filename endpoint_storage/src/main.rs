@@ -43,6 +43,9 @@ struct Config {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Before any TLS use: rustls has no implicit default with two providers compiled in.
+    http_utils::tls_certs::install_default_crypto_provider();
+
     logging::init(
         logging::LogFormat::Plain,
         logging::TracingErrorLayerEnablement::EnableWithRustLogFilter,

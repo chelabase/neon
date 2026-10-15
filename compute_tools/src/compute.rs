@@ -62,7 +62,7 @@ use crate::rsyslog::{
 use crate::spec::*;
 use crate::swap::resize_swap;
 use crate::sync_sk::{check_if_synced, ping_safekeeper};
-use crate::tls::{reload_tls_files, watch_cert_for_changes};
+use crate::tls::{CertPoll, CertWatch, read_tls_digest, reload_tls_files, wait_for_tls};
 use crate::{config, extension_server, local_proxy};
 
 pub static SYNC_SAFEKEEPERS_PID: AtomicU32 = AtomicU32::new(0);
@@ -80,9 +80,43 @@ pub static BUILD_TAG: Lazy<String> = Lazy::new(|| {
 });
 const DEFAULT_INSTALLED_EXTENSIONS_COLLECTION_INTERVAL: u64 = 3600;
 
-/// How long a pending certificate reload waits before it is retried when the
-/// certificate doesn't change again (the watcher's poll interval).
+/// The certificate watcher's poll interval: a change, or a pending reload after a
+/// failure, is acted on at the next poll.
 const CERT_RELOAD_RETRY: Duration = Duration::from_secs(60);
+
+/// Runs `<pg_ctl> reload -D <pgdata>`: a pg_ctl that can't start or exits non-zero
+/// is an error (with its stderr), never a panic.
+pub fn pg_ctl_reload(pg_ctl: &Path, pgdata: &Path) -> Result<()> {
+    let out = Command::new(pg_ctl)
+        .arg("reload")
+        .arg("-D")
+        .arg(pgdata)
+        .output()
+        .with_context(|| format!("run {} reload", pg_ctl.display()))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "{} reload exited with {}: {}",
+            pg_ctl.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// The TLS config compute_ctl acts on: `tls` with the `tls_experimental`
+/// feature, none without. Every use of it (Postgres' config, pgbouncer,
+/// local_proxy and the certificate watcher) goes through this.
+pub fn tls_config_for<'a>(
+    features: &[ComputeFeature],
+    tls: &'a Option<TlsConfig>,
+) -> &'a Option<TlsConfig> {
+    if features.contains(&ComputeFeature::TlsExperimental) {
+        tls
+    } else {
+        &None
+    }
+}
 
 /// Appends `extra` to the connection's `options`, keeping the ones it has (later
 /// `-c` settings win over earlier ones).
@@ -802,17 +836,19 @@ impl ComputeNode {
         // Collect all the tasks that must finish here
         let mut pre_tasks = tokio::task::JoinSet::new();
 
-        // Make sure TLS certificates are properly loaded and in the right place.
-        if self.compute_ctl_config.tls.is_some() {
+        let tls_config = self.tls_config(&pspec.spec);
+
+        // Make sure TLS certificates are properly loaded and in the right place,
+        // and watch them for renewals; only with the TLS feature on, as for every
+        // other use of the TLS config.
+        if let Some(tls) = tls_config.clone() {
             let this = self.clone();
             pre_tasks.spawn(async move {
-                this.watch_cert_for_changes().await;
+                this.watch_cert_for_changes(tls).await;
 
                 Ok::<(), anyhow::Error>(())
             });
         }
-
-        let tls_config = self.tls_config(&pspec.spec);
 
         // If there are any remote extensions in shared_preload_libraries, start downloading them
         if pspec.spec.remote_extensions.is_some() {
@@ -1918,10 +1954,7 @@ impl ComputeNode {
                 .clone(),
         );
 
-        let mut tls_config = None::<TlsConfig>;
-        if spec.features.contains(&ComputeFeature::TlsExperimental) {
-            tls_config = self.compute_ctl_config.tls.clone();
-        }
+        let tls_config = self.tls_config(&spec).clone();
 
         self.update_installed_extensions_collection_interval(&spec);
 
@@ -2005,13 +2038,9 @@ impl ComputeNode {
     fn pg_reload_conf(&self) -> Result<()> {
         let pgctl_bin = Path::new(&self.params.pgbin)
             .parent()
-            .unwrap()
+            .context("pgbin has no parent directory")?
             .join("pg_ctl");
-        Command::new(pgctl_bin)
-            .args(["reload", "-D", &self.params.pgdata])
-            .output()
-            .expect("cannot run pg_ctl process");
-        Ok(())
+        pg_ctl_reload(&pgctl_bin, Path::new(&self.params.pgdata))
     }
 
     /// Similar to `apply_config()`, but does a bit different sequence of operations,
@@ -2058,17 +2087,18 @@ impl ComputeNode {
         let conf = PostgresLogsRsyslogConfig::new(spec.logs_export_host.as_deref());
         configure_postgres_logs_export(conf)?;
 
-        // Write new config
+        // Write the new config: postgresql.conf, the member-login block and the
+        // ident lines (E-m3), all-or-nothing, so a failure leaves the running
+        // config's files as they were; the reload below makes Postgres read them.
         let pgdata_path = Path::new(&self.params.pgdata);
         let postgres_port = self.params.connstr.port();
-        config::write_postgres_conf(
+        config::rewrite_config_files(
             pgdata_path,
             &self.params,
             &spec,
             postgres_port,
             self.params.internal_http_port,
             tls_config,
-            spec.databricks_settings.as_ref(),
             self.params.lakebase_mode,
         )?;
 
@@ -2140,71 +2170,69 @@ impl ComputeNode {
         Ok(())
     }
 
-    pub async fn watch_cert_for_changes(self: Arc<Self>) {
-        // update status on cert renewal
-        if let Some(tls_config) = &self.compute_ctl_config.tls {
-            let tls_config = tls_config.clone();
+    /// Waits until the TLS files can be read (Postgres can't start without them),
+    /// then watches the key, certificate and CA file together: on a change to any
+    /// of them, copies the new key and certificate into pgdata and reloads
+    /// Postgres; the compute's status is never touched (RT3-1). A reload that
+    /// fails or panics (e.g. a renewal seen with the new certificate but the old
+    /// key) stays pending and is retried at every poll until it succeeds, even if
+    /// the files don't change again ([`CertWatch`]). The loop ends only when the
+    /// compute terminates.
+    pub async fn watch_cert_for_changes(self: Arc<Self>, tls_config: TlsConfig) {
+        let loaded = wait_for_tls(&tls_config).await;
 
-            // wait until the cert exists.
-            let mut cert_watch = watch_cert_for_changes(tls_config.cert_path.clone()).await;
+        tokio::spawn(async move {
+            let pgdata = Path::new(&self.params.pgdata).to_owned();
+            // Shared with each blocking step, so a step that panics (the
+            // reload's own panics are a failed reload inside CertWatch::poll)
+            // loses nothing: the loop goes on from the same state.
+            let watch = Arc::new(Mutex::new(CertWatch::new(loaded)));
+            loop {
+                tokio::time::sleep(CERT_RELOAD_RETRY).await;
 
-            // On a change, copy the new key and certificate into pgdata and reload
-            // Postgres; the compute's status is never touched (RT3-1). A reload
-            // that fails (e.g. a renewal seen with the new certificate but the old
-            // key) stays pending and is retried at every poll until it succeeds,
-            // even if the certificate doesn't change again.
-            tokio::task::spawn_blocking(move || {
-                let handle = tokio::runtime::Handle::current();
-                let pgdata = Path::new(&self.params.pgdata).to_owned();
-                let mut pending = false;
-                loop {
-                    if pending {
-                        let next = handle.block_on(tokio::time::timeout(
-                            CERT_RELOAD_RETRY,
-                            cert_watch.changed(),
-                        ));
-                        if matches!(next, Ok(Err(_))) {
-                            break;
-                        }
-                    } else if handle.block_on(cert_watch.changed()).is_err() {
-                        break;
-                    }
-
-                    match self.get_status() {
-                        ComputeStatus::TerminationPendingFast
-                        | ComputeStatus::TerminationPendingImmediate
-                        | ComputeStatus::Terminated => break,
-                        // Postgres isn't up yet (start_compute copies the files
-                        // itself): try again at the next poll.
-                        ComputeStatus::Init | ComputeStatus::Empty => {
-                            pending = true;
-                            continue;
-                        }
-                        ComputeStatus::Running
-                        | ComputeStatus::Failed
-                        | ComputeStatus::ConfigurationPending
-                        | ComputeStatus::Configuration
-                        | ComputeStatus::RefreshConfiguration
-                        | ComputeStatus::RefreshConfigurationPending => {}
-                    }
-
-                    match reload_tls_files(&pgdata, &tls_config, || self.pg_reload_conf()) {
-                        Ok(()) => {
-                            info!("reloaded Postgres with the changed TLS certificate");
-                            pending = false;
-                            self.refresh_tls_consumers();
-                        }
-                        Err(e) => {
-                            warn!(
-                                error = ?e,
-                                "could not reload the changed TLS certificate, retrying at the next poll"
-                            );
-                            pending = true;
-                        }
-                    }
+                match self.get_status() {
+                    ComputeStatus::TerminationPendingFast
+                    | ComputeStatus::TerminationPendingImmediate
+                    | ComputeStatus::Terminated => break,
+                    // Postgres isn't up yet (start_compute copies the files
+                    // itself): the watch keeps its state, so a change is seen
+                    // at the next poll.
+                    ComputeStatus::Init | ComputeStatus::Empty => continue,
+                    ComputeStatus::Running
+                    | ComputeStatus::Failed
+                    | ComputeStatus::ConfigurationPending
+                    | ComputeStatus::Configuration
+                    | ComputeStatus::RefreshConfiguration
+                    | ComputeStatus::RefreshConfigurationPending => {}
                 }
-            });
-        }
+
+                let now = match read_tls_digest(&tls_config) {
+                    Ok(now) => now,
+                    Err(e) => {
+                        warn!(error = ?e, "could not read the TLS files, retrying at the next poll");
+                        continue;
+                    }
+                };
+                let (this, tls, pgdata) = (self.clone(), tls_config.clone(), pgdata.clone());
+                let watch = watch.clone();
+                let step = tokio::task::spawn_blocking(move || {
+                    let poll = watch
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .poll(now, || {
+                            reload_tls_files(&pgdata, &tls, || this.pg_reload_conf())
+                        });
+                    if poll == CertPoll::Reloaded {
+                        info!("reloaded Postgres with the changed TLS files");
+                        this.refresh_tls_consumers();
+                    }
+                })
+                .await;
+                if let Err(e) = step {
+                    error!(error = ?e, "a TLS watcher step failed, going on at the next poll");
+                }
+            }
+        });
     }
 
     /// After a certificate change: let pgbouncer and local_proxy, when the spec
@@ -2239,11 +2267,7 @@ impl ComputeNode {
     }
 
     pub fn tls_config(&self, spec: &ComputeSpec) -> &Option<TlsConfig> {
-        if spec.features.contains(&ComputeFeature::TlsExperimental) {
-            &self.compute_ctl_config.tls
-        } else {
-            &None::<TlsConfig>
-        }
+        tls_config_for(&spec.features, &self.compute_ctl_config.tls)
     }
 
     /// Update the `last_active` in the shared state, but ensure that it's a more recent one.

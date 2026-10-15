@@ -823,6 +823,7 @@ impl Endpoint {
                 suspend_timeout_seconds: -1, // Only used in neon_local.
                 databricks_settings: None,
                 member_logins: None,
+                branch_protected: false,
             };
 
             // this strange code is needed to support respec() in tests

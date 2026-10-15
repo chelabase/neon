@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 [dependencies]
 anyhow.workspace = true
+http-utils.workspace = true
 axum-extra.workspace = true
 axum.workspace = true
 camino.workspace = true

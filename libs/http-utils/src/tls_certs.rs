@@ -12,6 +12,24 @@ use rustls::{
 };
 use x509_cert::der::Reader;
 
+/// Installs aws-lc-rs as rustls' process-wide default crypto provider.
+///
+/// Both ring (our own TLS deps) and aws-lc-rs (the AWS SDK's HTTPS client) are compiled in, so
+/// rustls cannot pick a default by itself: without an installed one, every provider-less
+/// `ServerConfig::builder()` / `ClientConfig::builder()` (ours, tonic's, ...) panics. Every binary
+/// calls this at the very start of `main`, before any TLS use.
+///
+/// Calling it again, or after something else installed a provider, is fine: the provider that
+/// was installed first stays the default.
+pub fn install_default_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_some() {
+        return;
+    }
+    // `install_default` fails only when a provider is already installed (another thread won the
+    // race since the check above); that provider then stays the default.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
 pub async fn load_cert_chain(filename: &Utf8Path) -> anyhow::Result<Vec<CertificateDer<'static>>> {
     let cert_data = tokio::fs::read(filename)
         .await

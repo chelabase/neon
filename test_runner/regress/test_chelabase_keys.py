@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import select
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import psycopg2
 from fixtures.pg_version import PgVersion
@@ -14,12 +14,13 @@ if TYPE_CHECKING:
     from fixtures.neon_fixtures import NeonEnv, VanillaPostgres
 
 
-def read_one(conn, cur, timeout: float = 20.0) -> dict:
+def read_one(conn, cur, timeout: float = 20.0) -> dict[str, Any]:
     deadline = time.time() + timeout
     while time.time() < deadline:
         msg = cur.read_message()
         if msg is not None:
-            return json.loads(msg.payload)
+            payload: dict[str, Any] = json.loads(msg.payload)
+            return payload
         select.select([conn], [], [], 0.5)
     raise AssertionError("no message from chelabase_keys")
 
@@ -78,7 +79,9 @@ def test_xid_is_the_full_transaction_id(vanilla_pg: VanillaPostgres):
     with vanilla_pg.cursor(autocommit=False) as cur:
         cur.execute("INSERT INTO xt VALUES (1)")
         cur.execute("SELECT pg_current_xact_id()::text")
-        xid = int(cur.fetchone()[0])
+        row = cur.fetchone()
+        assert row is not None
+        xid = int(row[0])
         cur.connection.commit()
     assert xid >= 2**32, f"the epoch must be above 0: {xid}"
     rows = vanilla_pg.safe_psql("SELECT data FROM pg_logical_slot_get_changes('epoch', NULL, NULL)")
