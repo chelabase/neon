@@ -1107,9 +1107,8 @@ def test_reassign_owned_to_the_privileged_role(ddl: DdlForwardingContext):
     superuser can (compute_ctl's DeleteDBRoleReferences runs it as cloud_admin)."""
 
     def owner_of(db: str) -> str:
-        return ddl.send(f"SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = '{db}'")[
-            0
-        ][0]
+        rows = ddl.send(f"SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = '{db}'")
+        return str(rows[0][0])
 
     def as_owner(sql: str):
         with ddl.pg.cursor(user="owner") as cur:

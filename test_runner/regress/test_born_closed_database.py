@@ -21,11 +21,19 @@ def patches() -> list[Any]:
 
 
 @pytest.fixture
+def branch_protected() -> bool:
+    """U14: neon.branch_protected in postgresql.conf, as compute_ctl writes it from
+    the spec (tests override this fixture with parametrize)."""
+    return False
+
+
+@pytest.fixture
 def neon_pg(
     httpserver: HTTPServer,
     vanilla_pg: VanillaPostgres,
     httpserver_listen_address: ListenAddress,
     patches: list[Any],
+    branch_protected: bool,
 ):
     (host, port) = httpserver_listen_address
     endpoint = "/test/roles_and_databases"
@@ -36,7 +44,11 @@ def neon_pg(
 
     httpserver.expect_request(endpoint, method="PATCH").respond_with_handler(record)
     vanilla_pg.configure(
-        [f"neon.console_url=http://{host}:{port}{endpoint}", "shared_preload_libraries = 'neon'"]
+        [
+            f"neon.console_url=http://{host}:{port}{endpoint}",
+            "shared_preload_libraries = 'neon'",
+            f"neon.branch_protected = {'on' if branch_protected else 'off'}",
+        ]
     )
     vanilla_pg.start()
     vanilla_pg.safe_psql("CREATE ROLE neon_superuser NOLOGIN CREATEDB CREATEROLE")
@@ -149,7 +161,7 @@ def test_no_guard_no_change(neon_pg: VanillaPostgres):
 
 
 def superuser_name(pg: VanillaPostgres) -> str:
-    return pg.safe_psql("SELECT current_user")[0][0]
+    return str(pg.safe_psql("SELECT current_user")[0][0])
 
 
 def test_a_customer_trigger_handed_to_a_superuser_is_not_the_guard(neon_pg: VanillaPostgres):
@@ -195,31 +207,77 @@ def test_is_template_default_and_a_missing_database(neon_pg: VanillaPostgres):
         owner_refused(neon_pg, sql, 'database "nosuch" does not exist')
 
 
-def test_an_open_user_template_counts_as_guarded(neon_pg: VanillaPostgres):
-    """E-I2: on a protected branch an open user template carries the guard (RT3-5),
-    so a session there, or a CREATE DATABASE from it, is treated as guarded even
-    before the reconcile reached it. template1 isn't a user template."""
-    setup_owner(neon_pg)
-    neon_pg.safe_psql("CREATE DATABASE tpl OWNER owner TEMPLATE template0")
-    neon_pg.safe_psql("ALTER DATABASE tpl IS_TEMPLATE true")
-    neon_pg.safe_psql("CREATE DATABASE shut OWNER owner TEMPLATE template0")
-    neon_pg.safe_psql("ALTER DATABASE shut ALLOW_CONNECTIONS false")
-    # A session in the open template: born closed.
+def setup_template_and_shut(pg: VanillaPostgres):
+    setup_owner(pg)
+    pg.safe_psql("CREATE DATABASE tpl OWNER owner TEMPLATE template0")
+    pg.safe_psql("ALTER DATABASE tpl IS_TEMPLATE true")
+    pg.safe_psql("CREATE DATABASE shut OWNER owner TEMPLATE template0")
+    pg.safe_psql("ALTER DATABASE shut ALLOW_CONNECTIONS false")
+
+
+@pytest.mark.parametrize("branch_protected", [True])
+def test_the_branch_flag_protects_every_session(neon_pg: VanillaPostgres):
+    """U14 (E-I2): with neon.branch_protected on, no database carries the guard
+    here, yet a non-superuser's CREATE DATABASE is born closed and ALTER DATABASE
+    ... ALLOW_CONNECTIONS / IS_TEMPLATE is refused from any session: an unguarded
+    open user template, template1, an ordinary database."""
+    setup_template_and_shut(neon_pg)
     as_owner(neon_pg, "CREATE DATABASE e1 TEMPLATE template0", dbname="tpl")
-    assert state(neon_pg, "e1") == (False, ["neon.born_closed=on"]), "from the template"
-    # The template named by CREATE DATABASE, from an unguarded database.
-    as_owner(neon_pg, "CREATE DATABASE e2 TEMPLATE tpl")
-    assert state(neon_pg, "e2") == (False, ["neon.born_closed=on"]), "TEMPLATE tpl"
-    # Reopening an owner-closed database from the open template.
-    owner_refused(neon_pg, "ALTER DATABASE shut ALLOW_CONNECTIONS true", dbname="tpl")
-    owner_refused(neon_pg, "CREATE DATABASE e3 WITH ALLOW_CONNECTIONS true", dbname="tpl")
+    assert state(neon_pg, "e1") == (False, ["neon.born_closed=on"]), "from the open template"
+    as_owner(neon_pg, "CREATE DATABASE e2 TEMPLATE template0", dbname="template1")
+    assert state(neon_pg, "e2") == (False, ["neon.born_closed=on"]), "from template1"
+    as_owner(neon_pg, "CREATE DATABASE e3 TEMPLATE tpl")
+    assert state(neon_pg, "e3") == (False, ["neon.born_closed=on"]), "from postgres"
+    for dbname in ["tpl", "template1", "postgres"]:
+        owner_refused(neon_pg, "ALTER DATABASE shut ALLOW_CONNECTIONS true", dbname=dbname)
+        owner_refused(neon_pg, "ALTER DATABASE e1 IS_TEMPLATE true", dbname=dbname)
+        owner_refused(neon_pg, "CREATE DATABASE e4 WITH ALLOW_CONNECTIONS true", dbname=dbname)
     assert state(neon_pg, "shut") == (False, None)
-    # template1 (no guard here) and a closed template change nothing.
-    as_owner(neon_pg, "CREATE DATABASE e4 TEMPLATE template0", dbname="template1")
-    assert state(neon_pg, "e4") == (True, None), "template1 isn't a user template"
-    neon_pg.safe_psql("ALTER DATABASE tpl ALLOW_CONNECTIONS false")
-    as_owner(neon_pg, "CREATE DATABASE e5 TEMPLATE tpl")
-    assert state(neon_pg, "e5") == (True, None), "a closed template isn't connectable"
+    # A superuser is untouched.
+    neon_pg.safe_psql("CREATE DATABASE s1 TEMPLATE template0")
+    assert state(neon_pg, "s1") == (True, None)
+
+
+def test_unprotected_open_templates_behave_as_today(neon_pg: VanillaPostgres):
+    """U14's control: flag off and no guard (an unprotected branch), so nothing is
+    born closed and the owner opens and closes its databases from anywhere, an
+    open user template included."""
+    setup_template_and_shut(neon_pg)
+    as_owner(neon_pg, "CREATE DATABASE e1 TEMPLATE template0", dbname="tpl")
+    assert state(neon_pg, "e1") == (True, None)
+    as_owner(neon_pg, "CREATE DATABASE e2 TEMPLATE tpl")
+    assert state(neon_pg, "e2") == (True, None)
+    as_owner(neon_pg, "ALTER DATABASE shut ALLOW_CONNECTIONS true", dbname="tpl")
+    assert state(neon_pg, "shut") == (True, None)
+
+
+@pytest.mark.parametrize("branch_protected", [True])
+def test_no_session_can_change_the_branch_flag(neon_pg: VanillaPostgres):
+    """U14: neon.branch_protected is PGC_SIGHUP: only postgresql.conf sets it."""
+    setup_owner(neon_pg)
+    neon_pg.safe_psql("CREATE DATABASE own OWNER owner TEMPLATE template0")
+    with neon_pg.cursor(user="owner", password="pw") as cur:
+        cur.execute("SHOW neon.branch_protected")
+        assert cur.fetchone() == ("on",)
+    for sql in [
+        "SET neon.branch_protected = off",
+        "SET LOCAL neon.branch_protected = off",
+        "SELECT set_config('neon.branch_protected', 'off', false)",
+        "ALTER DATABASE own SET neon.branch_protected = off",
+        "ALTER ROLE owner SET neon.branch_protected = off",
+    ]:
+        owner_refused(neon_pg, sql, "cannot be changed now")
+    owner_refused(neon_pg, "ALTER SYSTEM SET neon.branch_protected = off", "permission denied")
+    for sql in [
+        "SET neon.branch_protected = off",
+        "ALTER DATABASE own SET neon.branch_protected = off",
+    ]:
+        with pytest.raises(psycopg2.Error) as e:
+            neon_pg.safe_psql(sql)
+        assert "cannot be changed now" in str(e.value), (sql, str(e.value))
+    with neon_pg.cursor(user="owner", password="pw") as cur:
+        cur.execute("SHOW neon.branch_protected")
+        assert cur.fetchone() == ("on",)
 
 
 # ---------------------------------------------------------------------------
@@ -228,11 +286,10 @@ def test_an_open_user_template_counts_as_guarded(neon_pg: VanillaPostgres):
 #   every non-superuser path that can create or open a database on a protected
 #   branch ends born closed or guarded.
 #
-# The extension sees only the session database's event triggers and the shared
-# catalogs. A statement counts as made on a protected branch when the session's
-# database carries the guard or is an open user template (datistemplate AND
-# datallowconn, not template1: those carry the guard too, RT3-5), and a CREATE
-# DATABASE also when its template is an open user template (U1). Then:
+# U14: a statement counts as made on a protected branch when neon.branch_protected
+# is on (compute_ctl writes it from the spec) or the session's database carries
+# the guard (fails closed), whichever database the session is in: an unguarded
+# open user template or template1 included. Then:
 # - CREATE DATABASE with ALLOW_CONNECTIONS (any value) or IS_TEMPLATE true is
 #   refused; otherwise it is born closed with the marker (IS_TEMPLATE false or
 #   DEFAULT: not a template);
@@ -242,11 +299,12 @@ def test_an_open_user_template_counts_as_guarded(neon_pg: VanillaPostgres):
 # - a missing database or template: Postgres' "does not exist" comes first;
 # - superusers are untouched; a member (no CREATEDB, owns nothing) is refused by
 #   Postgres or the hook, and nothing changes;
-# - a refused statement forwards nothing to the control plane.
+# - a refused statement forwards nothing to the control plane;
+# - unprotected (flag off, no guard): Postgres' own behaviour, nothing born closed.
 # ---------------------------------------------------------------------------
 
 MEMBER = "cb_m_0123456789abcdef0123456789abcdef"
-SESSIONS = ["sg", "su", "otpl_g", "otpl_u"]
+SESSIONS = ["sg", "su", "otpl_g", "otpl_u", "template1"]
 ROLES = ["superuser", "owner", MEMBER]
 # Databases set up with the superuser-owned guard.
 GUARDED = ["sg", "otpl_g", "tg"]
@@ -324,7 +382,10 @@ def attrs(pg: VanillaPostgres, db: str) -> tuple[bool, bool, int, bool] | None:
         " ON s.setdatabase = d.oid AND s.setrole = 0"
         f" WHERE d.datname = '{db}'"
     )
-    return tuple(rows[0]) if rows else None  # type: ignore[return-value]
+    if not rows:
+        return None
+    allow, template, limit, marked = rows[0]
+    return (bool(allow), bool(template), int(limit), bool(marked))
 
 
 def run_as(pg: VanillaPostgres, role: str, dbname: str, sql: str) -> str | None:
@@ -345,19 +406,18 @@ def split_option(opt: str) -> tuple[str, str]:
     return name, value
 
 
-def protected(session: str, open_templates: set[str]) -> bool:
-    return session in GUARDED or session in open_templates
+def protected(flag: bool, session: str) -> bool:
+    """U14: the branch flag, or the guard in the session's database."""
+    return flag or session in GUARDED
 
 
-def expect_create(
-    role: str, session: str, template: str | None, opt: str, open_templates: set[str]
-) -> Outcome:
+def expect_create(role: str, flag: bool, session: str, template: str | None, opt: str) -> Outcome:
     if role == MEMBER:
         return ("error", None)
     if template == "nosuch":
         return ("error", 'template database "nosuch" does not exist')
     name, value = split_option(opt)
-    if role == "owner" and (protected(session, open_templates) or template in open_templates):
+    if role == "owner" and protected(flag, session):
         if name == "ALLOW_CONNECTIONS" or (name == "IS_TEMPLATE" and value == "true"):
             return ("error", REFUSAL)
         return ("ok", (False, False, -1, True))
@@ -366,9 +426,7 @@ def expect_create(
     return ("ok", (allow, is_template, -1, False))
 
 
-def expect_alter(
-    role: str, session: str, target: str, opt: str, open_templates: set[str]
-) -> Outcome:
+def expect_alter(role: str, flag: bool, session: str, target: str, opt: str) -> Outcome:
     if target == "nosuch":
         return ("error", 'database "nosuch" does not exist')
     if role == MEMBER:
@@ -376,7 +434,7 @@ def expect_alter(
     allow, template, marked = SETUP[target]
     name, value = split_option(opt)
     if name in ("ALLOW_CONNECTIONS", "IS_TEMPLATE") and role == "owner":
-        if marked or protected(session, open_templates):
+        if marked or protected(flag, session):
             return ("error", REFUSAL)
     limit = -1
     if name == "ALLOW_CONNECTIONS":
@@ -424,7 +482,10 @@ def drop_db(pg: VanillaPostgres, db: str):
 
 
 @pytest.mark.parametrize("session", SESSIONS)
-def test_create_database_invariant(neon_pg: VanillaPostgres, patches: list[Any], session: str):
+@pytest.mark.parametrize("branch_protected", [True, False])
+def test_create_database_invariant(
+    neon_pg: VanillaPostgres, patches: list[Any], branch_protected: bool, session: str
+):
     open_templates = setup_matrix(neon_pg)
     assert open_templates == {"otpl_g", "otpl_u", "t_otpl"}
     violations: list[str] = []
@@ -440,8 +501,8 @@ def test_create_database_invariant(neon_pg: VanillaPostgres, patches: list[Any],
                 clauses = ([f"TEMPLATE {template}"] if template else []) + ([opt] if opt else [])
                 sql = f"CREATE DATABASE {db}"
                 sql += f" WITH {' '.join(clauses)}" if clauses else ""
-                label = f"[{role} in {session}] {sql}"
-                expected = expect_create(role, session, template, opt, open_templates)
+                label = f"[flag {branch_protected}, {role} in {session}] {sql}"
+                expected = expect_create(role, branch_protected, session, template, opt)
                 forwarded_before = len(patches)
                 err = run_as(neon_pg, role, session, sql)
                 problem = check(
@@ -459,7 +520,10 @@ def test_create_database_invariant(neon_pg: VanillaPostgres, patches: list[Any],
 
 
 @pytest.mark.parametrize("session", SESSIONS)
-def test_alter_database_invariant(neon_pg: VanillaPostgres, patches: list[Any], session: str):
+@pytest.mark.parametrize("branch_protected", [True, False])
+def test_alter_database_invariant(
+    neon_pg: VanillaPostgres, patches: list[Any], branch_protected: bool, session: str
+):
     open_templates = setup_matrix(neon_pg)
     assert open_templates == {"otpl_g", "otpl_u", "t_otpl"}
     violations: list[str] = []
@@ -469,8 +533,8 @@ def test_alter_database_invariant(neon_pg: VanillaPostgres, patches: list[Any], 
             for opt in ALTER_OPTIONS:
                 cells += 1
                 sql = f"ALTER DATABASE {target} WITH {opt}"
-                label = f"[{role} in {session}] {sql}"
-                expected = expect_alter(role, session, target, opt, open_templates)
+                label = f"[flag {branch_protected}, {role} in {session}] {sql}"
+                expected = expect_alter(role, branch_protected, session, target, opt)
                 before = attrs(neon_pg, target)
                 forwarded_before = len(patches)
                 err = run_as(neon_pg, role, session, sql)
