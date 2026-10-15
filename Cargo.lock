@@ -9358,6 +9358,7 @@ dependencies = [
  "parquet",
  "portable-atomic",
  "proc-macro2",
+ "prost 0.12.6",
  "prost 0.13.5",
  "quote",
  "rand 0.9.5",
