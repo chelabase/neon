@@ -204,6 +204,20 @@ else
     failures=$((failures + 1))
 fi
 
+# pg-check (round 3): only through --only, after rust-tests, before regress.
+expect "--only pg-check runs only pg-check" "pg-check regress=0" "$(steps --only pg-check)"
+expect "--only pg-check,build runs in pipeline order" "build,pg-check regress=0" "$(steps --only pg-check,build)"
+expect "--only regress,pg-check,rust-tests runs in pipeline order" "rust-tests,pg-check,regress regress=1" "$(steps --only regress,pg-check,rust-tests)"
+expect "pg-check is not in the default run" "lint,build,rust-tests regress=0" "$(steps)"
+expect "pg-check directories for v17" "build/v17 build/v17/contrib/chelabase_keys" "$(pg_check_dirs v17 | paste -sd' ' -)"
+expect "pg-check directories for v16: core only" "build/v16" "$(pg_check_dirs v16 | paste -sd' ' -)"
+if steps --only pg-check --test-filter 'test(x)' >/dev/null 2>&1; then
+    echo "FAIL: --test-filter without rust-tests must still be refused with pg-check"
+    failures=$((failures + 1))
+else
+    echo "ok: --test-filter needs rust-tests even with pg-check"
+fi
+
 if ((failures > 0)); then
     echo "$failures check(s) failed"
     exit 1
