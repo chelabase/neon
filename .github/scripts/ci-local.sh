@@ -4,7 +4,7 @@
 #
 #   .github/scripts/ci-local.sh [--pg v14|v15|v16|v17] [--build-type release|debug]
 #                               [--regress [-k <pytest expr>] [-n <workers>]]
-#                               [--only build,rust-tests,regress [--test-filter <nextest expr>]]
+#                               [--only build,rust-tests,pg-check,regress [--test-filter <nextest expr>]]
 #
 # The default run (lint + build + rust-tests) is the gate for every PR. Neon's
 # regression suite is opt-in: use --regress for a targeted run (for example to
@@ -15,7 +15,7 @@
 #   --regress     also run Neon's pytest regression suite (opt-in)
 #   -k EXPR       pytest -k expression (needs --regress)
 #   -n N          pytest-xdist workers (needs --regress; default 6)
-#   --only STEPS  comma list of build, rust-tests, regress: run just those, in
+#   --only STEPS  comma list of build, rust-tests, pg-check, regress: run just those, in
 #                 pipeline order, skipping lint (regress implies --regress)
 #   --test-filter EXPR  cargo nextest -E filter, ANDed with the quarantine
 #                 (needs --only with rust-tests; no newlines; skips the doc tests,
@@ -31,6 +31,8 @@
 #               bans, licenses, sources; all blocking, as in pr.yml), ruff, mypy
 #   build       Postgres <pg> + extensions + Rust binaries (`make ... all`)
 #   rust-tests  Postgres v14-v17 + extensions, cargo test --doc, cargo nextest
+#   pg-check    (only via --only) `make check` of Postgres <pg> and, for v17, of
+#               contrib/chelabase_keys; each regression.diffs goes to the step's log
 #   regress     (only with --regress) pytest test_runner/regress in one process with -n <workers> and
 #               --reruns 2, deselecting test_runner/known_failures.txt and
 #               test_runner/known_failures.local.txt
@@ -108,9 +110,9 @@ parse_args() {
             ((${#ONLY_STEPS[@]} > 0)) || { echo "ci-local.sh: --only needs at least one step" >&2; return 1; }
             for s in "${ONLY_STEPS[@]}"; do
                 case "$s" in
-                build | rust-tests) ;;
+                build | rust-tests | pg-check) ;;
                 regress) ;;
-                *) echo "ci-local.sh: --only steps are build, rust-tests, regress; not '$s'" >&2; return 1 ;;
+                *) echo "ci-local.sh: --only steps are build, rust-tests, pg-check, regress; not '$s'" >&2; return 1 ;;
                 esac
             done
             shift 2
@@ -152,7 +154,7 @@ parse_args() {
 selected_steps() {
     local s
     if ((${#ONLY_STEPS[@]} > 0)); then
-        for s in build rust-tests regress; do
+        for s in build rust-tests pg-check regress; do
             case " ${ONLY_STEPS[*]} " in *" $s "*) echo "$s" ;; esac
         done
         return 0
@@ -365,6 +367,40 @@ step_rust_tests() {
     mapfile -t nx_args < <(nextest_args)
     mold -run cargo nextest "${nx_args[@]}"
     echo "rust tests took $(($(date +%s) - start))s"
+}
+
+# pg_check_dirs <pg>: the build directories whose `make check` the pg-check step runs.
+pg_check_dirs() {
+    echo "build/$1"
+    [[ "$1" == v17 ]] && echo "build/v17/contrib/chelabase_keys"
+    return 0
+}
+
+step_pg_check() {
+    local start dir failed=() d
+    start=$(date +%s)
+    # Builds Postgres <pg> (and its contrib) if the volume doesn't have it yet.
+    # shellcheck disable=SC2086
+    mold -run make -j"$(nproc)" BUILD_TYPE="$BUILD_TYPE" CARGO_BUILD_FLAGS="$CARGO_FLAGS" \
+        "postgres-$PG_VERSION"
+    while read -r dir; do
+        echo
+        echo "=== pg-check: make -C $dir check"
+        if ! make -C "$dir" check; then
+            failed+=("$dir")
+            # Keep the diffs in this step's log.
+            while read -r d; do
+                echo "--- $d"
+                cat "$d"
+            done < <(find "$dir" -name regression.diffs)
+        fi
+    done < <(pg_check_dirs "$PG_VERSION")
+    echo "pg-check took $(($(date +%s) - start))s"
+    if ((${#failed[@]} > 0)); then
+        printf 'pg-check: failed: %s\n' "${failed[@]}"
+        return 1
+    fi
+    echo "pg-check: all checks passed"
 }
 
 collect_test_logs() {
@@ -631,6 +667,7 @@ main() {
         lint) run_step lint step_lint || OVERALL=1 ;;
         build) run_step build step_build || { OVERALL=1; build_ok=0; } ;;
         rust-tests) run_step rust-tests step_rust_tests || OVERALL=1 ;;
+        pg-check) run_step pg-check step_pg_check || OVERALL=1 ;;
         regress)
             if ((build_ok)); then
                 run_step regress step_regress || OVERALL=1
