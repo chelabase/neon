@@ -58,8 +58,8 @@ where
     if let Some("https") = tonic_endpoint.uri().scheme_str() {
         // tonic's client TLS uses the process-default crypto provider and falls back to ring
         // when none is installed. Binaries install aws-lc-rs as the default at start; this
-        // makes library users (tests, benches) that didn't use the same provider, and never
-        // replaces one installed earlier (installing ring here used to race the binaries).
+        // call covers library users (tests, benches) that didn't, and never replaces a
+        // provider installed earlier.
         http_utils::tls_certs::install_default_crypto_provider();
         tonic_endpoint = tonic_endpoint.tls_config(tls_config)?;
     }
