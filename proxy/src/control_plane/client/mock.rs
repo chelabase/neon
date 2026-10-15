@@ -9,7 +9,7 @@ use futures::TryFutureExt;
 use postgres_client::config::SslMode;
 use thiserror::Error;
 use tokio_postgres::Client;
-use tracing::{Instrument, error, info, info_span, warn};
+use tracing::{Instrument, info, info_span, warn};
 
 use crate::auth::IpPattern;
 use crate::auth::backend::ComputeUserInfo;

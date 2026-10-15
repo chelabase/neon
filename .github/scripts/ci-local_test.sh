@@ -236,6 +236,14 @@ for step in build rust-tests pg-check; do
     done
 done
 
+# T0b (round 3): the Rust toolchain is 1.99.0, pinned identically in rust-toolchain.toml and
+# the build-tools image.
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+toolchain_pin="$(sed -n 's/^channel = "\(.*\)"$/\1/p' "$repo_root/rust-toolchain.toml")"
+image_pin="$(sed -n 's/^ENV RUSTC_VERSION=\(.*\)$/\1/p' "$repo_root/build-tools/Dockerfile")"
+expect "rust-toolchain.toml pins Rust 1.99.0" "1.99.0" "$toolchain_pin"
+expect "the build-tools image pins the same Rust" "$toolchain_pin" "$image_pin"
+
 # T1b fix round: a damaged installed sccache (truncated copy, interrupted install) is never
 # trusted; the installed binary's own sha256 is pinned and checked on every run.
 expect "the installed binary's sha256 is pinned" "64" "$(v="${SCCACHE_BIN_SHA256:-}"; echo "${#v}")"

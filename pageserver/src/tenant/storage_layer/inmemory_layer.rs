@@ -463,8 +463,8 @@ impl InMemoryLayer {
                 let f = vectored_dio_read::execute(
                     &read_from.file,
                     reads
-                        .iter()
-                        .flat_map(|(_, value_reads)| value_reads.iter().map(|v| &v.read)),
+                        .values()
+                        .flat_map(|value_reads| value_reads.iter().map(|v| &v.read)),
                     &read_ctx,
                 );
                 send_future::SendFuture::send(f) // https://github.com/rust-lang/rust/issues/96865

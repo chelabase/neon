@@ -1,3 +1,7 @@
+// Handlers answer with an axum `Response` on both paths (`Result<Response, Response>`): the Err
+// is no larger than the Ok, so boxing it gains nothing.
+#![allow(clippy::result_large_err)]
+
 use anyhow::anyhow;
 use axum::body::{Body, Bytes};
 use axum::response::{IntoResponse, Response};

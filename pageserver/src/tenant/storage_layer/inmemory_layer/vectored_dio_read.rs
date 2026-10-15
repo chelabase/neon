@@ -182,10 +182,10 @@ where
         let mut last_chunk_no = None;
         let to_merge: Vec<(u64, Vec<Interest<B>>)> = by_chunk
             .peeking_take_while(|(chunk_no, _)| {
-                if let Some(last_chunk_no) = last_chunk_no {
-                    if *chunk_no != last_chunk_no + 1 {
-                        return false;
-                    }
+                if let Some(last_chunk_no) = last_chunk_no
+                    && *chunk_no != last_chunk_no + 1
+                {
+                    return false;
                 }
                 last_chunk_no = Some(*chunk_no);
                 true
@@ -290,7 +290,7 @@ where
             if range_in_io_buf.end > nread {
                 let msg = format!(
                     "physical read returned EOF where this logical read expected more data in the file: offset=0x{read_offset:x} req_len=0x{req_len:x} nread=0x{nread:x} {:?}",
-                    &*logical_read_state_borrow
+                    *logical_read_state_borrow
                 );
                 logical_read_state_borrow.transition_to_terminal(Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,

@@ -198,7 +198,7 @@ impl Storage for FileStorage {
             /*END_HADRON */
             format!(
                 "failed to create partial control file at: {}",
-                &control_partial_path
+                control_partial_path
             )
         })?;
 

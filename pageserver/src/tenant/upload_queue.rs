@@ -282,10 +282,10 @@ impl UploadQueueInitialized {
             return;
         };
         // Update the clean index on uploads.
-        if let UploadOp::UploadMetadata { ref uploaded } = task.op {
-            if task.task_id > self.clean.1.unwrap_or_default() {
-                self.clean = (*uploaded.clone(), Some(task.task_id));
-            }
+        if let UploadOp::UploadMetadata { ref uploaded } = task.op
+            && task.task_id > self.clean.1.unwrap_or_default()
+        {
+            self.clean = (*uploaded.clone(), Some(task.task_id));
         }
     }
 }

@@ -629,16 +629,15 @@ where
                         return res;
                     }
                     // BEGIN HADRON
-                    if let Err(e) = res.as_ref() {
-                        if let Some(sql_state) = e.code() {
-                            if sql_state.code() == "57014" {
-                                // SQL State 57014 (ERRCODE_QUERY_CANCELED) is used for statement timeouts.
-                                // Increment the counter whenever a statement timeout occurs. Timeouts on
-                                // this configuration path can only occur due to PS connectivity problems that
-                                // Postgres failed to recover from.
-                                COMPUTE_CONFIGURE_STATEMENT_TIMEOUT_ERRORS.inc();
-                            }
-                        }
+                    if let Err(e) = res.as_ref()
+                        && let Some(sql_state) = e.code()
+                        && sql_state.code() == "57014"
+                    {
+                        // SQL State 57014 (ERRCODE_QUERY_CANCELED) is used for statement timeouts.
+                        // Increment the counter whenever a statement timeout occurs. Timeouts on
+                        // this configuration path can only occur due to PS connectivity problems that
+                        // Postgres failed to recover from.
+                        COMPUTE_CONFIGURE_STATEMENT_TIMEOUT_ERRORS.inc();
                     }
                     // END HADRON
 
@@ -861,7 +860,7 @@ async fn get_operations<'a>(
                             // phase. We do all the cleanup before actually dropping the database.
                             let drop_db_query: String = format!(
                                 "DROP DATABASE IF EXISTS {} WITH (FORCE)",
-                                &op.name.pg_quote()
+                                op.name.pg_quote()
                             );
 
                             databases.remove(&op.name);
@@ -1128,15 +1127,15 @@ async fn get_operations<'a>(
         // Interestingly, we only install p_s_s in the main database, even when
         // it's preloaded.
         ApplySpecPhase::HandleOtherExtensions => {
-            if let Some(libs) = spec.cluster.settings.find("shared_preload_libraries") {
-                if libs.contains("pg_stat_statements") {
-                    return Ok(Box::new(once(Operation {
-                        query: String::from(
-                            "CREATE EXTENSION IF NOT EXISTS pg_stat_statements WITH SCHEMA public",
-                        ),
-                        comment: Some(String::from("create system extensions")),
-                    })));
-                }
+            if let Some(libs) = spec.cluster.settings.find("shared_preload_libraries")
+                && libs.contains("pg_stat_statements")
+            {
+                return Ok(Box::new(once(Operation {
+                    query: String::from(
+                        "CREATE EXTENSION IF NOT EXISTS pg_stat_statements WITH SCHEMA public",
+                    ),
+                    comment: Some(String::from("create system extensions")),
+                })));
             }
             Ok(Box::new(empty()))
         }

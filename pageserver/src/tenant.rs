@@ -657,20 +657,18 @@ impl OffloadedTimeline {
     ) {
         if let (Some(_retain_lsn), Some(ancestor_timeline_id)) =
             (self.ancestor_retain_lsn, self.ancestor_timeline_id)
-        {
-            if let Some((_, ancestor_timeline)) = timelines
+            && let Some((_, ancestor_timeline)) = timelines
                 .iter()
                 .find(|(tid, _tl)| **tid == ancestor_timeline_id)
-            {
-                let removal_happened = ancestor_timeline
-                    .gc_info
-                    .write()
-                    .unwrap()
-                    .remove_child_offloaded(self.timeline_id);
-                if !removal_happened {
-                    tracing::error!(tenant_id = %self.tenant_shard_id.tenant_id, shard_id = %self.tenant_shard_id.shard_slug(), timeline_id = %self.timeline_id,
+        {
+            let removal_happened = ancestor_timeline
+                .gc_info
+                .write()
+                .unwrap()
+                .remove_child_offloaded(self.timeline_id);
+            if !removal_happened {
+                tracing::error!(tenant_id = %self.tenant_shard_id.tenant_id, shard_id = %self.tenant_shard_id.shard_slug(), timeline_id = %self.timeline_id,
                         "Couldn't remove retain_lsn entry from offloaded timeline's parent: already removed");
-                }
             }
         }
         self.deleted_from_ancestor.store(true, Ordering::Release);
@@ -1877,7 +1875,7 @@ impl TenantShard {
             let timelines_accessor = self.timelines.lock().unwrap();
             let mut timelines_offloaded_accessor = self.timelines_offloaded.lock().unwrap();
 
-            timelines_offloaded_accessor.extend(offloaded_timelines_list.into_iter());
+            timelines_offloaded_accessor.extend(offloaded_timelines_list);
 
             // Before activation, populate each Timeline's GcInfo with information about its children
             self.initialize_gc_info(&timelines_accessor, &timelines_offloaded_accessor, None);
@@ -2207,12 +2205,12 @@ impl TenantShard {
     fn check_to_be_unarchived_timeline_has_no_archived_parent(
         timeline: &Arc<Timeline>,
     ) -> Result<(), TimelineArchivalError> {
-        if let Some(ancestor_timeline) = timeline.ancestor_timeline() {
-            if ancestor_timeline.is_archived() == Some(true) {
-                return Err(TimelineArchivalError::HasArchivedParent(
-                    ancestor_timeline.timeline_id,
-                ));
-            }
+        if let Some(ancestor_timeline) = timeline.ancestor_timeline()
+            && ancestor_timeline.is_archived() == Some(true)
+        {
+            return Err(TimelineArchivalError::HasArchivedParent(
+                ancestor_timeline.timeline_id,
+            ));
         }
         Ok(())
     }
@@ -2555,7 +2553,7 @@ impl TenantShard {
         initdb_lsn: Lsn,
         pg_version: PgMajorVersion,
         ctx: &RequestContext,
-    ) -> anyhow::Result<(UninitializedTimeline, RequestContext)> {
+    ) -> anyhow::Result<(UninitializedTimeline<'_>, RequestContext)> {
         anyhow::ensure!(
             self.is_active(),
             "Cannot create empty timelines on inactive tenant"
@@ -4856,11 +4854,11 @@ impl TenantShard {
                     .set(target.leases.len() as u64);
 
                 // Look up parent's PITR cutoff to update the child's knowledge of whether it is within parent's PITR
-                if let Some(ancestor_id) = timeline.get_ancestor_timeline_id() {
-                    if let Some(ancestor_gc_cutoffs) = gc_cutoffs.get(&ancestor_id) {
-                        target.within_ancestor_pitr =
-                            Some(timeline.get_ancestor_lsn()) >= ancestor_gc_cutoffs.time;
-                    }
+                if let Some(ancestor_id) = timeline.get_ancestor_timeline_id()
+                    && let Some(ancestor_gc_cutoffs) = gc_cutoffs.get(&ancestor_id)
+                {
+                    target.within_ancestor_pitr =
+                        Some(timeline.get_ancestor_lsn()) >= ancestor_gc_cutoffs.time;
                 }
 
                 // Update metrics that depend on GC state
@@ -5598,7 +5596,7 @@ impl TenantShard {
     ///
     /// Future is cancellation safe. Only one calculation can be running at once per tenant.
     #[instrument(skip_all, fields(tenant_id=%self.tenant_shard_id.tenant_id, shard_id=%self.tenant_shard_id.shard_slug()))]
-    pub async fn gather_size_inputs(
+    pub(crate) async fn gather_size_inputs(
         &self,
         // `max_retention_period` overrides the cutoff that is used to calculate the size
         // (only if it is shorter than the real cutoff).
@@ -5641,7 +5639,7 @@ impl TenantShard {
     /// This is periodically called by background worker.
     /// result is cached in tenant struct
     #[instrument(skip_all, fields(tenant_id=%self.tenant_shard_id.tenant_id, shard_id=%self.tenant_shard_id.shard_slug()))]
-    pub async fn calculate_synthetic_size(
+    pub(crate) async fn calculate_synthetic_size(
         &self,
         cause: LogicalSizeCalculationCause,
         cancel: &CancellationToken,
@@ -5712,10 +5710,11 @@ impl TenantShard {
         }
 
         while let Some(r) = results.next().await {
-            if let Err(e) = r {
-                if !e.is_cancelled() && !e.is_panic() {
-                    tracing::error!("unexpected join error: {e:?}");
-                }
+            if let Err(e) = r
+                && !e.is_cancelled()
+                && !e.is_panic()
+            {
+                tracing::error!("unexpected join error: {e:?}");
             }
         }
 
@@ -5788,10 +5787,10 @@ impl TenantShard {
 
         // Check if the manifest has changed. We ignore the version number here, to avoid
         // uploading every manifest on version number bumps.
-        if let Some(old) = guard.as_ref() {
-            if manifest.eq_ignoring_version(old) {
-                return Ok(());
-            }
+        if let Some(old) = guard.as_ref()
+            && manifest.eq_ignoring_version(old)
+        {
+            return Ok(());
         }
 
         // Update metrics
@@ -8247,7 +8246,7 @@ mod tests {
             {
                 let blknum = key.field6 as usize;
                 let value = value?;
-                assert!(blknum % STEP == 0);
+                assert!(blknum.is_multiple_of(STEP));
                 let blknum = blknum / STEP;
                 assert_eq!(
                     value,

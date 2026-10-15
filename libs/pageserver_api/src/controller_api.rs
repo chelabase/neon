@@ -337,10 +337,11 @@ impl From<NodeAvailability> for NodeAvailabilityWrapper {
 ///
 /// If you're not sure which policy to use to pin a shard to its current location, you probably
 /// want Pause.
-#[derive(Serialize, Deserialize, Clone, Copy, Eq, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, Clone, Copy, Eq, PartialEq, Debug, Default)]
 pub enum ShardSchedulingPolicy {
     // Normal mode: the tenant's scheduled locations may be updated at will, including
     // for non-essential optimization.
+    #[default]
     Active,
 
     // Disable optimizations, but permit scheduling when necessary to fulfil the PlacementPolicy.
@@ -355,12 +356,6 @@ pub enum ShardSchedulingPolicy {
     // No reconciling: we will make no location_conf API calls to pageservers at all.  If the
     // shard is unavailable, it stays that way.  If a node fails, this shard doesn't get failed over.
     Stop,
-}
-
-impl Default for ShardSchedulingPolicy {
-    fn default() -> Self {
-        Self::Active
-    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Eq, PartialEq, Debug)]

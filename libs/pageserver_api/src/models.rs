@@ -1806,8 +1806,10 @@ pub struct TenantScanRemoteStorageResponse {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum TenantSorting {
     /// Total size of layers on local disk for all timelines in a shard.
+    #[default]
     ResidentSize,
     /// The logical size of the largest timeline within a _tenant_ (not shard). Only tracked on
     /// shard 0, contains the sum across all shards.
@@ -1815,12 +1817,6 @@ pub enum TenantSorting {
     /// The logical size of the largest timeline within a _tenant_ (not shard), divided by number of
     /// shards. Only tracked on shard 0, and estimates the per-shard logical size.
     MaxLogicalSizePerShard,
-}
-
-impl Default for TenantSorting {
-    fn default() -> Self {
-        Self::ResidentSize
-    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -2032,8 +2028,8 @@ mod tests {
             serde_json::to_value(&original_broken).unwrap(),
             expected_broken
         );
-        assert!(format!("{:?}", &original_broken.state).contains("reason"));
-        assert!(format!("{:?}", &original_broken.state).contains("backtrace info"));
+        assert!(format!("{:?}", original_broken.state).contains("reason"));
+        assert!(format!("{:?}", original_broken.state).contains("backtrace info"));
     }
 
     #[test]

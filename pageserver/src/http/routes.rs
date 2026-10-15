@@ -3725,7 +3725,7 @@ async fn hadron_reset_alert_gauges(
 ///
 /// 'tar' command can also write extra blocks of zeros, up to a record
 /// size, controlled by the --record-size argument. Ignore them too.
-async fn read_tar_eof(mut reader: (impl tokio::io::AsyncRead + Unpin)) -> anyhow::Result<()> {
+async fn read_tar_eof(mut reader: impl tokio::io::AsyncRead + Unpin) -> anyhow::Result<()> {
     use tokio::io::AsyncReadExt;
     let mut buf = [0u8; 512];
 

@@ -223,7 +223,7 @@ fn determine_offloader(
                 .clone()
                 .filter(|p| p.commit_lsn >= threshold)
                 .collect::<Vec<_>>();
-            caughtup_peers.sort_by(|p1, p2| p1.sk_id.cmp(&p2.sk_id));
+            caughtup_peers.sort_by_key(|p1| p1.sk_id);
 
             // To distribute the load, shift by timeline_id.
             let offloader = caughtup_peers
@@ -233,7 +233,7 @@ fn determine_offloader(
             let mut capable_peers_dbg = capable_peers
                 .map(|p| (p.sk_id, p.commit_lsn))
                 .collect::<Vec<_>>();
-            capable_peers_dbg.sort_by(|p1, p2| p1.0.cmp(&p2.0));
+            capable_peers_dbg.sort_by_key(|p1| p1.0);
             (
                 Some(offloader),
                 format!(

@@ -112,9 +112,9 @@ impl Id {
         static HEX: &[u8] = b"0123456789abcdef";
 
         let mut buf = vec![0u8; self.0.len() * 2];
-        for (&b, chunk) in self.0.as_ref().iter().zip(buf.chunks_exact_mut(2)) {
-            chunk[0] = HEX[((b >> 4) & 0xf) as usize];
-            chunk[1] = HEX[(b & 0xf) as usize];
+        let (pairs, _) = buf.as_chunks_mut::<2>();
+        for (&b, pair) in self.0.as_ref().iter().zip(pairs) {
+            *pair = [HEX[((b >> 4) & 0xf) as usize], HEX[(b & 0xf) as usize]];
         }
 
         // SAFETY: vec constructed out of `HEX`, it can only be ascii

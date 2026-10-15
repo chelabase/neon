@@ -54,12 +54,8 @@ pub(crate) struct StaticAuthRules;
 
 pub static JWKS_ROLE_MAP: ArcSwapOption<EndpointJwksResponse> = ArcSwapOption::const_empty();
 
-impl FetchAuthRules for StaticAuthRules {
-    async fn fetch_auth_rules(
-        &self,
-        _ctx: &RequestContext,
-        _endpoint: EndpointId,
-    ) -> Result<Vec<AuthRule>, FetchAuthRulesError> {
+impl StaticAuthRules {
+    fn rules() -> Result<Vec<AuthRule>, FetchAuthRulesError> {
         let mappings = JWKS_ROLE_MAP.load();
         let role_mappings = mappings
             .as_deref()
@@ -75,5 +71,15 @@ impl FetchAuthRules for StaticAuthRules {
         }
 
         Ok(rules)
+    }
+}
+
+impl FetchAuthRules for StaticAuthRules {
+    fn fetch_auth_rules(
+        &self,
+        _ctx: &RequestContext,
+        _endpoint: EndpointId,
+    ) -> impl Future<Output = Result<Vec<AuthRule>, FetchAuthRulesError>> + Send {
+        std::future::ready(Self::rules())
     }
 }

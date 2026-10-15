@@ -112,7 +112,7 @@ impl LocalFs {
                             if file_type.is_symlink() {
                                 tracing::debug!("{entry_path:?} is a symlink, skipping")
                             } else if file_type.is_dir() {
-                                paths.extend(get_all_files(&entry_path).await?.into_iter())
+                                paths.extend(get_all_files(&entry_path).await?)
                             } else {
                                 paths.push(entry_path);
                             }

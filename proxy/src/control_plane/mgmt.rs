@@ -80,15 +80,15 @@ pub(crate) type ComputeReady = DatabaseInfo;
 struct MgmtHandler;
 
 impl postgres_backend::Handler<tokio::net::TcpStream> for MgmtHandler {
-    async fn process_query(
+    fn process_query(
         &mut self,
         pgb: &mut PostgresBackendTCP,
         query: &str,
-    ) -> Result<(), QueryError> {
-        try_process_query(pgb, query).map_err(|e| {
+    ) -> impl Future<Output = Result<(), QueryError>> {
+        std::future::ready(try_process_query(pgb, query).map_err(|e| {
             error!("failed to process response: {e:?}");
             e
-        })
+        }))
     }
 }
 

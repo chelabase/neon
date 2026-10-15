@@ -26,6 +26,8 @@ macro_rules! postgres_ffi {
                 #![allow(unsafe_op_in_unsafe_fn)]
                 #![allow(clippy::undocumented_unsafe_blocks)]
                 #![allow(clippy::ptr_offset_with_cast)]
+                // bindgen's generated bitfield helpers spell out `(x + 7) / 8`.
+                #![allow(clippy::manual_div_ceil)]
 
                 use serde::{Deserialize, Serialize};
                 include!(concat!(

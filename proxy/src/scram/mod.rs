@@ -55,7 +55,7 @@ mod tests {
         let salt = "QSXCR+Q6sek8bf92";
         let stored_key = "FO+9jBb3MUukt6jJnzjPZOWc5ow/Pu6JtPyju0aqaE8=";
         let server_key = "qxJ1SbmSAi5EcS0J5Ck/cKAm/+Ixa+Kwp63f4OHDgzo=";
-        let secret = format!("SCRAM-SHA-256${iterations}:{salt}${stored_key}:{server_key}",);
+        let secret = format!("SCRAM-SHA-256${iterations}:{salt}${stored_key}:{server_key}");
         let secret = ServerSecret::parse(&secret).unwrap();
 
         const NONCE: [u8; 18] = [

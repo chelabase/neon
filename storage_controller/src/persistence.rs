@@ -77,12 +77,6 @@ pub struct Persistence {
     connection_pool: Pool<AsyncPgConnection>,
 }
 
-/// Legacy format, for use in JSON compat objects in test environment
-#[derive(Serialize, Deserialize)]
-struct JsonPersistence {
-    tenants: HashMap<TenantShardId, TenantShardPersistence>,
-}
-
 #[derive(thiserror::Error, Debug)]
 pub(crate) enum DatabaseError {
     #[error(transparent)]
@@ -851,7 +845,7 @@ impl Persistence {
                     })
                 })
                 .await?;
-            rows.extend(chunk_rows.into_iter())
+            rows.extend(chunk_rows)
         }
 
         Ok(rows
@@ -2229,7 +2223,7 @@ fn client_config_with_root_certs() -> anyhow::Result<rustls::ClientConfig> {
     })
 }
 
-fn establish_connection_rustls(config: &str) -> BoxFuture<ConnectionResult<AsyncPgConnection>> {
+fn establish_connection_rustls(config: &str) -> BoxFuture<'_, ConnectionResult<AsyncPgConnection>> {
     let fut = async {
         // We first set up the way we want rustls to work.
         let rustls_config = client_config_with_root_certs()

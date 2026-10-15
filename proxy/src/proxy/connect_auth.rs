@@ -75,7 +75,7 @@ pub(crate) async fn connect_to_compute_and_auth(
                     continue;
                 }
 
-                return Err(e)?;
+                Err(e)?;
             }
         }
     }

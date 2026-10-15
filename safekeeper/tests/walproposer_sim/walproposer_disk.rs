@@ -24,7 +24,7 @@ impl DiskWalProposer {
         })
     }
 
-    pub fn lock(&self) -> MutexGuard<State> {
+    pub fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock()
     }
 }

@@ -205,7 +205,7 @@ async fn main_impl(
             };
             let cache: KeyspaceCacheDe =
                 serde_json::from_slice(&contents).context("deserialize cache file")?;
-            let tag_ok = HashSet::<TenantTimelineId>::from_iter(cache.tag.into_iter())
+            let tag_ok = HashSet::<TenantTimelineId>::from_iter(cache.tag)
                 == HashSet::from_iter(timelines.iter().cloned());
             info!("keyspace cache file matches tag: {tag_ok}");
             anyhow::Ok(if tag_ok { Some(cache.data) } else { None })

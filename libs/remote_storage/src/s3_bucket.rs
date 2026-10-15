@@ -94,14 +94,15 @@ impl S3Bucket {
         // AWS SDK requires us to specify how the RetryConfig should sleep when it wants to back off
         let sleep_impl: Arc<dyn AsyncSleep> = Arc::new(TokioSleep::new());
 
-        let sdk_config_loader: aws_config::ConfigLoader = aws_config::defaults(
-            #[allow(deprecated)] /* TODO: https://github.com/neondatabase/neon/issues/7665 */
-            BehaviorVersion::v2023_11_09(),
-        )
-        .region(region_opt)
-        .identity_cache(IdentityCache::lazy().build())
-        .credentials_provider(credentials_provider)
-        .sleep_impl(SharedAsyncSleep::from(sleep_impl));
+        // The current behavior version (the older ones are deprecated). Where it changed a
+        // default this code relies on, the old behavior is set explicitly below (retries,
+        // stalled-stream protection).
+        let sdk_config_loader: aws_config::ConfigLoader =
+            aws_config::defaults(BehaviorVersion::v2026_01_12())
+                .region(region_opt)
+                .identity_cache(IdentityCache::lazy().build())
+                .credentials_provider(credentials_provider)
+                .sleep_impl(SharedAsyncSleep::from(sleep_impl));
 
         let sdk_config: aws_config::SdkConfig = std::thread::scope(|s| {
             s.spawn(|| {
@@ -134,6 +135,17 @@ impl S3Bucket {
             .set_max_attempts(Some(1))
             .set_mode(Some(RetryMode::Adaptive));
         s3_config_builder = s3_config_builder.retry_config(retry_config.build());
+
+        // Stalled-stream protection on downloads only, as under the 2023-11-09 behavior version
+        // this code was written against: uploads are bounded by our own timeouts
+        // (`RemoteStorageConfig::timeout`), and the SDK's upload stall check would fail slow but
+        // healthy uploads on its own schedule.
+        s3_config_builder = s3_config_builder.stalled_stream_protection(
+            aws_sdk_s3::config::StalledStreamProtectionConfig::enabled()
+                .upload_enabled(false)
+                .download_enabled(true)
+                .build(),
+        );
 
         let s3_config = s3_config_builder.build();
         let client = aws_sdk_s3::Client::from_conf(s3_config);
@@ -513,10 +525,10 @@ impl S3Bucket {
                 }
                 break;
             }
-            if let Some(max_keys) = max_keys {
-                if versions_and_deletes.len() >= max_keys.get().try_into().unwrap() {
-                    return Err(DownloadError::Other(anyhow::anyhow!("too many versions")));
-                }
+            if let Some(max_keys) = max_keys
+                && versions_and_deletes.len() >= max_keys.get().try_into().unwrap()
+            {
+                return Err(DownloadError::Other(anyhow::anyhow!("too many versions")));
             }
         }
         Ok(VersionListing {

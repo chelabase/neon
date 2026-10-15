@@ -698,10 +698,10 @@ impl ValuesReconstructState {
 
     pub(crate) fn on_layer_visited(&mut self, layer: &ReadableLayer) {
         self.layers_visited += 1;
-        if let ReadableLayer::PersistentLayer(layer) = layer {
-            if layer.layer_desc().is_delta() {
-                self.delta_layers_visited += 1;
-            }
+        if let ReadableLayer::PersistentLayer(layer) = layer
+            && layer.layer_desc().is_delta()
+        {
+            self.delta_layers_visited += 1;
         }
     }
 
@@ -1063,7 +1063,7 @@ impl LayerAccessStats {
 
     fn write_bits(&self, mask: u64, value: u64) -> u64 {
         self.0
-            .fetch_update(
+            .try_update(
                 // TODO: decide what orderings are correct
                 std::sync::atomic::Ordering::Relaxed,
                 std::sync::atomic::Ordering::Relaxed,

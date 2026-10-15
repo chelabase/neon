@@ -131,10 +131,10 @@ pub async fn merge_delta_keys_buffered<'a, E: CompactionJobExecutor + 'a>(
         // Boxing and casting to LoadFuture is required to obtain the right Sync bound.
         // If we do l.load_keys(ctx).await? directly, there is a compilation error.
         let load_future: LoadFuture<'a, _> = Box::pin(l.load_keys(ctx));
-        keys.extend(load_future.await?.into_iter());
+        keys.extend(load_future.await?);
     }
     keys.sort_by_key(|k| (k.key(), k.lsn()));
-    let stream = futures::stream::iter(keys.into_iter());
+    let stream = futures::stream::iter(keys);
     Ok(stream)
 }
 

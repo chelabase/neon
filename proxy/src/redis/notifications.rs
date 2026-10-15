@@ -291,7 +291,7 @@ pub async fn task_main(
     let handler = MessageHandler::new(cache);
     // 6h - 1m.
     // There will be 1 minute overlap between two tasks. But at least we can be sure that no message is lost.
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 60 * 60 - 60));
+    let mut interval = tokio::time::interval(std::time::Duration::from_mins(359));
     loop {
         let cancellation_token = CancellationToken::new();
         interval.tick().await;
@@ -302,7 +302,7 @@ pub async fn task_main(
             cancellation_token.clone(),
         ));
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(6 * 60 * 60)).await; // 6h.
+            tokio::time::sleep(std::time::Duration::from_hours(6)).await; // 6h.
             cancellation_token.cancel();
         });
     }

@@ -449,7 +449,7 @@ impl AzureBlobStorage {
             stream.next().await.expect("At least one item required")?;
         while let Some(list) = stream.next().await {
             let list = list?;
-            combined.versions.extend(list.versions.into_iter());
+            combined.versions.extend(list.versions);
         }
         Ok(combined)
     }
@@ -703,12 +703,8 @@ impl RemoteStorage for AzureBlobStorage {
                 put_block_size / 1024 / 1024
             );
             // Wait for all blocks to be uploaded.
-            let upload_results = futures::future::try_join_all(upload_futures).await;
-            if upload_results.is_err() {
-                return Err(anyhow::anyhow!(format!(
-                    "Failed to upload all blocks {:#?}",
-                    upload_results.unwrap_err()
-                )));
+            if let Err(e) = futures::future::try_join_all(upload_futures).await {
+                return Err(anyhow::anyhow!("Failed to upload all blocks {e:#?}"));
             }
 
             // Commit the blocks.
@@ -821,10 +817,10 @@ impl RemoteStorage for AzureBlobStorage {
                         match res {
                             Ok(Ok(_v)) => Ok(()),
                             Ok(Err(azure_err)) => {
-                                if let Some(http_err) = azure_err.as_http_error() {
-                                    if http_err.status() == StatusCode::NotFound {
-                                        return Ok(());
-                                    }
+                                if let Some(http_err) = azure_err.as_http_error()
+                                    && http_err.status() == StatusCode::NotFound
+                                {
+                                    return Ok(());
                                 }
                                 Err(AzureOrTimeout::AzureError(azure_err))
                             }

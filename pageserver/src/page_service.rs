@@ -832,18 +832,17 @@ impl BatchedFeMessage {
 
                 match batching_strategy {
                     PageServiceProtocolPipelinedBatchingStrategy::UniformLsn => {
-                        if let Some(last_in_batch) = accum_pages.last() {
-                            if last_in_batch.lsn_range.effective_lsn
+                        if let Some(last_in_batch) = accum_pages.last()
+                            && last_in_batch.lsn_range.effective_lsn
                                 != this_pages[0].lsn_range.effective_lsn
-                            {
-                                trace!(
-                                    accum_lsn = %last_in_batch.lsn_range.effective_lsn,
-                                    this_lsn = %this_pages[0].lsn_range.effective_lsn,
-                                    "stopping batching because LSN changed"
-                                );
+                        {
+                            trace!(
+                                accum_lsn = %last_in_batch.lsn_range.effective_lsn,
+                                this_lsn = %this_pages[0].lsn_range.effective_lsn,
+                                "stopping batching because LSN changed"
+                            );
 
-                                return Some(GetPageBatchBreakReason::NonUniformLsn);
-                            }
+                            return Some(GetPageBatchBreakReason::NonUniformLsn);
                         }
                     }
                     PageServiceProtocolPipelinedBatchingStrategy::ScatteredLsn => {
@@ -1313,6 +1312,9 @@ impl PageServerHandler {
     /// Post-condition: `batch` is Some()
     #[instrument(skip_all, level = tracing::Level::TRACE)]
     #[allow(clippy::boxed_local)]
+    // The Err hands an unbatchable message back by value, once per message on the getpage hot
+    // path; boxing it would allocate per message.
+    #[allow(clippy::result_large_err)]
     fn pagestream_do_batch(
         batching_strategy: PageServiceProtocolPipelinedBatchingStrategy,
         max_batch_size: NonZeroUsize,
@@ -1976,6 +1978,8 @@ impl PageServerHandler {
     ///
     /// May leak tokio tasks if not polled to completion.
     #[allow(clippy::too_many_arguments)]
+    // The batching closure returns `pagestream_do_batch`'s by-value Err (see there).
+    #[allow(clippy::result_large_err)]
     async fn handle_pagerequests_pipelined<IO>(
         &mut self,
         pgb_writer: &mut PostgresBackend<IO>,
@@ -2511,8 +2515,8 @@ impl PageServerHandler {
         };
 
         let last_record_lsn = timeline.get_last_record_lsn();
-        if max_effective_lsn > last_record_lsn {
-            if let Err(e) = timeline
+        if max_effective_lsn > last_record_lsn
+            && let Err(e) = timeline
                 .wait_lsn(
                     max_effective_lsn,
                     crate::tenant::timeline::WaitLsnWaiter::PageService,
@@ -2527,14 +2531,13 @@ impl PageServerHandler {
                     )
                 })
                 .await
-            {
-                return Vec::from_iter(requests.into_iter().map(|req| {
-                    Err(BatchedPageStreamError {
-                        err: PageStreamError::from(e.clone()),
-                        req: req.req.hdr,
-                    })
-                }));
-            }
+        {
+            return Vec::from_iter(requests.into_iter().map(|req| {
+                Err(BatchedPageStreamError {
+                    err: PageStreamError::from(e.clone()),
+                    req: req.req.hdr,
+                })
+            }));
         }
 
         let results = timeline
@@ -3302,6 +3305,8 @@ pub struct GrpcPageServiceHandler {
     get_vectored_concurrent_io: GetVectoredConcurrentIo,
 }
 
+// The gRPC handler's errors are `tonic::Status` (176 bytes), returned by value as tonic's API does.
+#[allow(clippy::result_large_err)]
 impl GrpcPageServiceHandler {
     /// Spawns a gRPC server for the page service.
     ///

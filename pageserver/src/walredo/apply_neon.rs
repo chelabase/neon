@@ -317,12 +317,12 @@ pub(crate) fn apply_in_neon(
             if *clear {
                 page.clear();
             }
-            if let Some(only_if) = only_if {
-                if page != only_if.as_bytes() {
-                    return Err(anyhow::anyhow!(
-                        "the current image does not match the expected image, cannot append"
-                    ));
-                }
+            if let Some(only_if) = only_if
+                && page != only_if.as_bytes()
+            {
+                return Err(anyhow::anyhow!(
+                    "the current image does not match the expected image, cannot append"
+                ));
             }
             page.put_slice(append.as_bytes());
         }

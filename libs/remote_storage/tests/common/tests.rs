@@ -106,7 +106,7 @@ async fn pagination_should_work(ctx: &mut MaybeEnabledStorageWithTestBlobs) -> a
     while let Some(st) = nested_remote_prefixes_st.next().await {
         let st = st?;
         segment_max_size = segment_max_size.max(st.prefixes.len());
-        nested_remote_prefixes_combined.extend(st.prefixes.into_iter());
+        nested_remote_prefixes_combined.extend(st.prefixes);
         segments += 1;
     }
     assert!(segments > 1, "less than 2 segments: {segments}");

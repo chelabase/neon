@@ -12,15 +12,3 @@ impl<const A: usize> Alignment for ConstAlign<A> {
         A
     }
 }
-
-/// Alignment at run time.
-#[derive(Debug, Clone, Copy)]
-pub struct RuntimeAlign {
-    align: usize,
-}
-
-impl Alignment for RuntimeAlign {
-    fn align(&self) -> usize {
-        self.align
-    }
-}

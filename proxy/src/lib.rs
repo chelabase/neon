@@ -20,7 +20,6 @@
     clippy::rc_mutex,
     clippy::rest_pat_in_fully_bound_structs,
     clippy::string_add,
-    clippy::string_to_string,
     clippy::todo,
     clippy::unimplemented,
     clippy::unwrap_used,
@@ -54,7 +53,6 @@
     clippy::module_name_repetitions,
     clippy::needless_pass_by_value,
     clippy::redundant_closure_for_method_calls,
-    clippy::similar_names,
     clippy::single_match_else,
     clippy::struct_excessive_bools,
     clippy::struct_field_names,
@@ -69,8 +67,10 @@
     any(test, feature = "testing"),
     allow(
         clippy::needless_raw_string_hashes,
+        clippy::similar_names,
         clippy::unreadable_literal,
         clippy::unused_async,
+        clippy::unused_async_trait_impl,
     )
 )]
 // List of temporarily allowed lints to unblock beta/nightly.

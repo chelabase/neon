@@ -179,7 +179,7 @@ impl DatabaseExt for Database {
     /// it may require a proper quoting too.
     fn to_pg_options(&self) -> String {
         let mut params: String = self.options.as_pg_options();
-        write!(params, " OWNER {}", &self.owner.pg_quote())
+        write!(params, " OWNER {}", self.owner.pg_quote())
             .expect("String is documented to not to error during write operations");
 
         params
@@ -202,7 +202,7 @@ impl DatabricksSettingsExt for DatabricksSettings {
             // [Optional] databricks.workspace_url
             Some(format!(
                 "databricks.workspace_url = '{}'",
-                &self.databricks_workspace_host
+                self.databricks_workspace_host
             )),
             // todo(vikas.jain): these are not required anymore as they are moved to static
             // conf but keeping these to avoid image mismatch between hcc and pg.

@@ -28,7 +28,7 @@ mod tests {
 
     #[test]
     fn test_build_redis_key() {
-        let cancel_key: KeyPrefix = KeyPrefix::Cancel(id_to_cancel_key(12345 << 32 | 54321));
+        let cancel_key: KeyPrefix = KeyPrefix::Cancel(id_to_cancel_key(0x3039 << 32 | 0xd431));
 
         let redis_key = cancel_key.build_redis_key();
         assert_eq!(redis_key, "cancel:30390000d431");

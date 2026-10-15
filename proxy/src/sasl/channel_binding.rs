@@ -54,7 +54,7 @@ impl<T: std::fmt::Display> ChannelBinding<T> {
                 "eSws".into()
             }
             Self::Required(mode) => {
-                let mut cbind_input = format!("p={mode},,",).into_bytes();
+                let mut cbind_input = format!("p={mode},,").into_bytes();
                 cbind_input.extend_from_slice(get_cbind_data(mode)?);
                 BASE64_STANDARD.encode(&cbind_input).into()
             }

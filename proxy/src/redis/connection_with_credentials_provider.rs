@@ -194,7 +194,7 @@ impl ConnectionWithCredentialsProvider {
     ) -> ! {
         loop {
             // The connection lives for 12h, for the sanity check we refresh it every hour.
-            tokio::time::sleep(Duration::from_secs(60 * 60)).await;
+            tokio::time::sleep(Duration::from_hours(1)).await;
             match Self::refresh_token(&mut con, credentials_provider.clone()).await {
                 Ok(()) => {
                     info!("Token refreshed");

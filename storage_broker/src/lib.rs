@@ -13,6 +13,9 @@ pub mod proto {
     // we don't use these types for anything but broker data transmission,
     // so it's ok to ignore this one.
     #![allow(clippy::derive_partial_eq_without_eq)]
+    // Generated tonic clients and servers return `tonic::Status` (176 bytes) by value, as the
+    // tonic API requires.
+    #![allow(clippy::result_large_err)]
     tonic::include_proto!("storage_broker");
 }
 

@@ -34,7 +34,7 @@ type IpSubnetKey = IpNet;
 
 /// Initial period and TTL is shorter to clear keys of short-lived connections faster.
 const CANCEL_KEY_INITIAL_PERIOD: Duration = Duration::from_secs(60);
-const CANCEL_KEY_REFRESH_PERIOD: Duration = Duration::from_secs(10 * 60);
+const CANCEL_KEY_REFRESH_PERIOD: Duration = Duration::from_mins(10);
 /// `CANCEL_KEY_TTL_SLACK` is added to the periods to determine the actual TTL.
 const CANCEL_KEY_TTL_SLACK: Duration = Duration::from_secs(30);
 

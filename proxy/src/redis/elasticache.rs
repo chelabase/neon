@@ -36,7 +36,7 @@ impl AWSIRSAConfig {
             user_id: user_id.unwrap_or_default(),
             // "The IAM authentication token is valid for 15 minutes"
             // https://docs.aws.amazon.com/memorydb/latest/devguide/auth-iam.html#auth-iam-limits
-            token_ttl: Duration::from_secs(15 * 60),
+            token_ttl: Duration::from_mins(15),
             action: "connect".to_string(),
         }
     }

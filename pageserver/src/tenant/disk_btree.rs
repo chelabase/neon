@@ -30,7 +30,6 @@ use either::Either;
 use futures::{Stream, StreamExt};
 use hex;
 use thiserror::Error;
-use tracing::error;
 
 use crate::context::RequestContext;
 use crate::tenant::block_io::{BlockReader, BlockWriter};
@@ -131,7 +130,7 @@ impl<const L: usize> OnDiskNode<'_, L> {
     ///
     /// Interpret a PAGE_SZ page as a node.
     ///
-    fn deparse(buf: &[u8]) -> Result<OnDiskNode<L>> {
+    fn deparse(buf: &[u8]) -> Result<OnDiskNode<'_, L>> {
         let mut cursor = std::io::Cursor::new(buf);
         let num_children = cursor.read_u16::<BE>()?;
         let level = cursor.read_u8()?;
@@ -579,13 +578,13 @@ where
         if value > MAX_VALUE {
             return Err(DiskBtreeError::AppendOverflow(value));
         }
-        if let Some(last_key) = &self.last_key {
-            if key <= last_key {
-                return Err(DiskBtreeError::UnsortedInput {
-                    key: key.as_slice().into(),
-                    last_key: last_key.as_slice().into(),
-                });
-            }
+        if let Some(last_key) = &self.last_key
+            && key <= last_key
+        {
+            return Err(DiskBtreeError::UnsortedInput {
+                key: key.as_slice().into(),
+                last_key: last_key.as_slice().into(),
+            });
         }
         self.last_key = Some(*key);
 
@@ -846,7 +845,7 @@ pub(crate) mod tests {
         fn new() -> Self {
             Self::default()
         }
-        pub(crate) fn read_blk(&self, blknum: u32) -> io::Result<BlockLease> {
+        pub(crate) fn read_blk(&self, blknum: u32) -> io::Result<BlockLease<'_>> {
             let mut buf = [0u8; PAGE_SZ];
             buf.copy_from_slice(&self.blocks[blknum as usize]);
             Ok(std::sync::Arc::new(buf).into())

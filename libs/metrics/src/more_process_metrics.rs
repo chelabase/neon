@@ -36,11 +36,11 @@ impl prometheus::core::Collector for Collector {
             return vec![];
         };
         let mut mfs = Vec::with_capacity(NMETRICS);
-        if let Ok(status) = myself.status() {
-            if let Some(vmlck) = status.vmlck {
-                self.vmlck.set(vmlck);
-                mfs.extend(self.vmlck.collect())
-            }
+        if let Ok(status) = myself.status()
+            && let Some(vmlck) = status.vmlck
+        {
+            self.vmlck.set(vmlck);
+            mfs.extend(self.vmlck.collect())
         }
         if let Ok(stat) = myself.stat() {
             let cpu_seconds = stat.utime + stat.stime;

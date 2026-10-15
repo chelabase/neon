@@ -232,18 +232,17 @@ impl CertResolver {
                     return self.default.clone();
                 }
             }
-        } else {
-            // No SNI, use the default certificate, otherwise we can't get to
-            // options parameter which can be used to set endpoint name too.
-            // That means that non-SNI flow will not work for CNAME domains in
-            // verify-full mode.
-            //
-            // If that will be a problem we can:
-            //
-            // a) Instead of multi-cert approach use single cert with extra
-            //    domains listed in Subject Alternative Name (SAN).
-            // b) Deploy separate proxy instances for extra domains.
-            self.default.clone()
         }
+        // No SNI, use the default certificate, otherwise we can't get to
+        // options parameter which can be used to set endpoint name too.
+        // That means that non-SNI flow will not work for CNAME domains in
+        // verify-full mode.
+        //
+        // If that will be a problem we can:
+        //
+        // a) Instead of multi-cert approach use single cert with extra
+        //    domains listed in Subject Alternative Name (SAN).
+        // b) Deploy separate proxy instances for extra domains.
+        self.default.clone()
     }
 }

@@ -232,7 +232,7 @@ pub(crate) struct Manager {
 /// background tasks.
 /// Be careful, this task is not respawned on panic, so it should not panic.
 #[instrument(name = "manager", skip_all, fields(ttid = %tli.ttid))]
-pub async fn main_task(
+pub(crate) async fn main_task(
     tli: ManagerTimeline,
     conf: SafeKeeperConf,
     broker_active_set: Arc<TimelinesSet>,
@@ -385,10 +385,10 @@ pub async fn main_task(
         wal_backup::update_task(&mut mgr, storage, false, &last_state).await;
     }
 
-    if let Some(recovery_task) = &mut mgr.recovery_task {
-        if let Err(e) = recovery_task.await {
-            warn!("recovery task failed: {:?}", e);
-        }
+    if let Some(recovery_task) = &mut mgr.recovery_task
+        && let Err(e) = recovery_task.await
+    {
+        warn!("recovery task failed: {:?}", e);
     }
 
     if let Some((handle, cancel)) = &mut mgr.partial_backup_task {

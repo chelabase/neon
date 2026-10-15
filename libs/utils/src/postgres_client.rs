@@ -60,12 +60,12 @@ impl<'a> ConnectionConfigArgs<'a> {
             ),
         ];
 
-        if self.shard_number.is_some() {
+        if let Some(shard_number) = self.shard_number {
             assert!(self.shard_count.is_some());
             assert!(self.shard_stripe_size.is_some());
 
             options.push(format!("shard_count={}", self.shard_count.unwrap()));
-            options.push(format!("shard_number={}", self.shard_number.unwrap()));
+            options.push(format!("shard_number={shard_number}"));
             options.push(format!(
                 "shard_stripe_size={}",
                 self.shard_stripe_size.unwrap()

@@ -464,7 +464,7 @@ mod tests {
         assert_eq!(parquet_upload.parquet_upload_size, 100_000_000);
         assert_eq!(
             parquet_upload.parquet_upload_maximum_duration,
-            time::Duration::from_secs(20 * 60)
+            time::Duration::from_mins(20)
         );
         assert_eq!(
             parquet_upload.parquet_upload_compression,
@@ -513,7 +513,7 @@ mod tests {
         assert_eq!(parquet_upload.parquet_upload_size, 10_000_000);
         assert_eq!(
             parquet_upload.parquet_upload_maximum_duration,
-            time::Duration::from_secs(10 * 60)
+            time::Duration::from_mins(10)
         );
         assert_eq!(
             parquet_upload.parquet_upload_compression,
@@ -612,7 +612,7 @@ mod tests {
             propeties: Arc::new(WriterProperties::new()),
             rows_per_group: 2_000,
             file_size: 1_000_000,
-            max_duration: time::Duration::from_secs(20 * 60),
+            max_duration: time::Duration::from_mins(20),
             test_remote_failures: 0,
         };
 
@@ -651,7 +651,7 @@ mod tests {
             ),
             rows_per_group: 2_000,
             file_size: 1_000_000,
-            max_duration: time::Duration::from_secs(20 * 60),
+            max_duration: time::Duration::from_mins(20),
             test_remote_failures: 0,
         };
 
@@ -681,7 +681,7 @@ mod tests {
             propeties: Arc::new(WriterProperties::new()),
             rows_per_group: 2_000,
             file_size: 1_000_000,
-            max_duration: time::Duration::from_secs(20 * 60),
+            max_duration: time::Duration::from_mins(20),
             test_remote_failures: 2,
         };
 
