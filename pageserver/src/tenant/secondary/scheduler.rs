@@ -84,7 +84,7 @@ where
     _phantom: PhantomData<(PJ, RJ, C, CMD)>,
 }
 
-pub(crate) trait JobGenerator<PJ, RJ, C, CMD>
+pub(super) trait JobGenerator<PJ, RJ, C, CMD>
 where
     C: Completion,
     PJ: PendingJob,
