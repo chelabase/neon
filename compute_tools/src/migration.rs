@@ -23,6 +23,11 @@ pub enum MigrationKind {
 /// is a failure like any other.
 pub const MIGRATION_CONN_OPTIONS: &str = "-c lock_timeout=5s -c statement_timeout=2min";
 
+/// Run first on the migration connection by [`MigrationRunner::run_migrations`]
+/// (R-F3b): the migrations aren't forwarded to the control plane, as
+/// `apply_config`'s own changes aren't.
+pub const MIGRATION_SESSION_SETUP: &str = "SET neon.forward_ddl = false";
+
 /// Whether the failure of migration `failed` (0-based index into `kinds`) fails
 /// the start: the runner stops at the first failure, so the failed migration and
 /// every later one stay unapplied; the start fails when any of them is fail-open.
@@ -185,6 +190,15 @@ impl<'m> MigrationRunner<'m> {
 
     /// Run the configured set of migrations
     pub async fn run_migrations(mut self) -> Result<(), MigrationFailure> {
+        // First, before anything else on this connection: the migrations are
+        // compute_ctl's own changes, never the control plane's, so nothing is
+        // forwarded and a start never depends on the console being reachable.
+        self.client
+            .simple_query(MIGRATION_SESSION_SETUP)
+            .await
+            .context("turn DDL forwarding off for the migrations")
+            .map_err(MigrationFailure::before_migrations)?;
+
         self.prepare_database()
             .await
             .context("prepare database to handle migrations")
@@ -227,5 +241,35 @@ impl<'m> MigrationRunner<'m> {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MIGRATION_SESSION_SETUP;
+
+    /// R-F3b: the runner's first statement turns DDL forwarding off, before it
+    /// prepares the schema or runs any migration (structural: the runner needs
+    /// a live Postgres; test_ddl_forwarding_invalid_db covers the behaviour).
+    #[test]
+    fn the_runner_turns_forwarding_off_first() {
+        assert_eq!(MIGRATION_SESSION_SETUP, "SET neon.forward_ddl = false");
+        let source = include_str!("migration.rs");
+        let code = &source[..source.find("#[cfg(test)]").unwrap()];
+        let body = &code[code.find("pub async fn run_migrations").unwrap()..];
+        let first_query = body.find(".simple_query(").unwrap();
+        assert!(
+            body[first_query..].starts_with(".simple_query(MIGRATION_SESSION_SETUP)"),
+            "the first query of run_migrations must be MIGRATION_SESSION_SETUP"
+        );
+        let setup_end = first_query + body[first_query..].find('?').unwrap();
+        for later in [
+            "self.prepare_database()",
+            "self.get_migration_id()",
+            "run_migration(",
+        ] {
+            let at = body.find(later).unwrap();
+            assert!(setup_end < at, "{later} runs after the setup");
+        }
     }
 }
