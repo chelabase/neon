@@ -26,16 +26,23 @@
 #include <curl/curl.h>
 #include <unistd.h>
 
+#include "access/genam.h"
 #include "access/heapam.h"
+#include "access/htup_details.h"
+#include "access/stratnum.h"
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_db_role_setting.h"
+#include "catalog/pg_event_trigger.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_type.h"
 #include "commands/dbcommands.h"
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
+#include "commands/trigger.h"
 #include "commands/user.h"
 #include "fmgr.h"
 #include "libpq/crypt.h"
@@ -46,6 +53,9 @@
 #include "tcop/pquery.h"
 #include "tcop/utility.h"
 #include "utils/acl.h"
+#include "utils/array.h"
+#include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
@@ -69,6 +79,19 @@ static char *ConsoleURL = NULL;
 static bool ForwardDDL = true;
 static char *ProtectedDatabases = NULL;
 static bool RegressTestMode = false;
+
+/*
+ * neon.born_closed: a marker only (no runtime effect). Set as a database
+ * setting (pg_db_role_setting, setrole = 0) on a database a non-superuser
+ * created in a guarded database; the member-roles reconcile opens the
+ * database once it carries the guard, and resets the marker. PGC_SUSET, so
+ * the database's owner can neither set nor reset it.
+ */
+static bool BornClosed = false;
+
+#define BORN_CLOSED_GUC "neon.born_closed"
+/* The protected-branch schema guard's event trigger (see SessionDatabaseGuarded) */
+#define SCHEMA_GUARD_TRIGGER "chelabase_schema_guard_ddl"
 
 /*
  * CURL docs say that this buffer must exist until we call curl_easy_cleanup
@@ -455,15 +478,41 @@ PushRoleEntry(JsonbParseState **state, Outcomes *roles, ObjOutcome *o)
 }
 
 /*
+ * Every database owned by one of the roles is sent with its owner (a set
+ * with "owner", read from the catalog at commit).
+ */
+static void
+TouchDbsOwnedBy(List *owners)
+{
+	Relation	rel;
+	TableScanDesc scan;
+	HeapTuple	tuple;
+
+	if (owners == NIL)
+		return;
+	rel = table_open(DatabaseRelationId, AccessShareLock);
+	scan = table_beginscan_catalog(rel, 0, NULL);
+	while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		Form_pg_database form = (Form_pg_database) GETSTRUCT(tuple);
+
+		if (list_member_oid(owners, form->datdba))
+		{
+			(void) TouchExistingDbOid(form->oid, NameStr(form->datname));
+			DbAttrsFor(form->oid)->owner_set = true;
+		}
+	}
+	table_endscan(scan);
+	table_close(rel, AccessShareLock);
+}
+
+/*
  * The receiver keeps each database's owner by name: a database whose owner
  * was renamed is sent again with its owner (a set with "owner").
  */
 static void
 TouchDbsOfRenamedRoles(Outcomes *roles)
 {
-	Relation	rel;
-	TableScanDesc scan;
-	HeapTuple	tuple;
 	List	   *renamed = NIL;
 
 	for (int i = 0; i < roles->count; i++)
@@ -473,22 +522,7 @@ TouchDbsOfRenamedRoles(Outcomes *roles)
 		if (o->exists && o->orig_name && strcmp(o->orig_name, o->name) != 0)
 			renamed = lappend_oid(renamed, o->oid);
 	}
-	if (renamed == NIL)
-		return;
-	rel = table_open(DatabaseRelationId, AccessShareLock);
-	scan = table_beginscan_catalog(rel, 0, NULL);
-	while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
-	{
-		Form_pg_database form = (Form_pg_database) GETSTRUCT(tuple);
-
-		if (list_member_oid(renamed, form->datdba))
-		{
-			(void) TouchExistingDbOid(form->oid, NameStr(form->datname));
-			DbAttrsFor(form->oid)->owner_set = true;
-		}
-	}
-	table_endscan(scan);
-	table_close(rel, AccessShareLock);
+	TouchDbsOwnedBy(renamed);
 	list_free(renamed);
 }
 
@@ -1236,6 +1270,32 @@ HandleGrantRole(GrantRoleStmt *stmt)
 	}
 }
 
+/*
+ * REASSIGN OWNED changes the owner of the listed roles' databases without an
+ * ALTER DATABASE ... OWNER (pg_shdepend.c): every database they own before
+ * the statement is recorded, and sent with its owner as it is at commit.
+ */
+static void
+HandleReassignOwned(ReassignOwnedStmt *stmt)
+{
+	ListCell   *item;
+	List	   *owners = NIL;
+
+	foreach(item, stmt->roles)
+	{
+		RoleSpec   *spec = lfirst(item);
+		Oid			oid;
+
+		if (spec->roletype == ROLESPEC_PUBLIC)
+			continue;			/* no role; Postgres refuses it */
+		oid = get_rolespec_oid(spec, true);
+		if (OidIsValid(oid))
+			owners = lappend_oid(owners, oid);
+	}
+	TouchDbsOwnedBy(owners);
+	list_free(owners);
+}
+
 
 static void
 HandleRename(RenameStmt *stmt)
@@ -1701,6 +1761,322 @@ ProcessCreateEventTrigger(
 
 
 /*
+ * Member roles (cb_m_*, in any case) and chelabase_realtime are managed by
+ * Chelabase as a superuser: no other role may create, alter, rename, drop,
+ * grant or revoke them, or change their settings or memberships.
+ */
+static bool
+IsChelabaseManagedRole(const char *name)
+{
+	return name != NULL &&
+		(pg_strncasecmp(name, "cb_m_", 5) == 0 ||
+		 strcmp(name, "chelabase_realtime") == 0);
+}
+
+static void
+RefuseManagedRoleName(const char *name)
+{
+	if (IsChelabaseManagedRole(name))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("member role \"%s\" is managed by Chelabase", name)));
+}
+
+/* The role a RoleSpec names, whatever its kind; NULL for PUBLIC (no role) */
+static const char *
+RoleSpecName(RoleSpec *spec)
+{
+	switch (spec->roletype)
+	{
+		case ROLESPEC_CSTRING:
+			return spec->rolename;
+		case ROLESPEC_CURRENT_ROLE:
+		case ROLESPEC_CURRENT_USER:
+			return GetUserNameFromId(GetUserId(), false);
+		case ROLESPEC_SESSION_USER:
+			return GetUserNameFromId(GetSessionUserId(), false);
+		case ROLESPEC_PUBLIC:
+			return NULL;
+	}
+	return NULL;
+}
+
+static void
+RefuseManagedRoleSpec(RoleSpec *spec)
+{
+	if (spec)
+		RefuseManagedRoleName(RoleSpecName(spec));
+}
+
+static void
+RefuseManagedRoleSpecs(List *specs)
+{
+	ListCell   *item;
+
+	foreach(item, specs)
+		RefuseManagedRoleSpec(lfirst_node(RoleSpec, item));
+}
+
+/* CREATE ROLE's IN ROLE / ROLE / ADMIN lists, and ALTER GROUP ... ADD/DROP USER */
+static void
+RefuseManagedRoleOptions(List *options)
+{
+	ListCell   *option;
+
+	foreach(option, options)
+	{
+		DefElem    *defel = lfirst(option);
+
+		if (strcmp(defel->defname, "addroleto") == 0 ||
+			strcmp(defel->defname, "rolemembers") == 0 ||
+			strcmp(defel->defname, "adminmembers") == 0)
+			RefuseManagedRoleSpecs((List *) defel->arg);
+	}
+}
+
+/*
+ * Refuses a role statement that names a Chelabase-managed role unless the
+ * current user is a superuser. Runs for nested statements too (DO blocks,
+ * functions, any SPI caller), since they go through ProcessUtility_hook.
+ */
+static void
+CheckManagedRoleStatement(Node *parseTree)
+{
+	if (superuser())
+		return;
+	switch (nodeTag(parseTree))
+	{
+		case T_CreateRoleStmt:
+			{
+				CreateRoleStmt *stmt = castNode(CreateRoleStmt, parseTree);
+
+				RefuseManagedRoleName(stmt->role);
+				RefuseManagedRoleOptions(stmt->options);
+				break;
+			}
+		case T_AlterRoleStmt:
+			{
+				AlterRoleStmt *stmt = castNode(AlterRoleStmt, parseTree);
+
+				RefuseManagedRoleSpec(stmt->role);
+				RefuseManagedRoleOptions(stmt->options);
+				break;
+			}
+		case T_AlterRoleSetStmt:
+			/* role is NULL for ALTER ROLE ALL, which needs a superuser */
+			RefuseManagedRoleSpec(castNode(AlterRoleSetStmt, parseTree)->role);
+			break;
+		case T_RenameStmt:
+			{
+				RenameStmt *stmt = castNode(RenameStmt, parseTree);
+
+				if (stmt->renameType == OBJECT_ROLE)
+				{
+					RefuseManagedRoleName(stmt->subname);
+					RefuseManagedRoleName(stmt->newname);
+				}
+				break;
+			}
+		case T_DropRoleStmt:
+			RefuseManagedRoleSpecs(castNode(DropRoleStmt, parseTree)->roles);
+			break;
+		case T_GrantRoleStmt:
+			{
+				GrantRoleStmt *stmt = castNode(GrantRoleStmt, parseTree);
+				ListCell   *item;
+
+				RefuseManagedRoleSpecs(stmt->grantee_roles);
+				foreach(item, stmt->granted_roles)
+					RefuseManagedRoleName(((AccessPriv *) lfirst(item))->priv_name);
+				break;
+			}
+		default:
+			break;
+	}
+}
+
+/*
+ * Databases born closed on a protected branch.
+ *
+ * A protected branch carries the schema guard in every connectable database:
+ * an event trigger named SCHEMA_GUARD_TRIGGER, owned by a superuser and
+ * ENABLE ALWAYS. A look-alike made by a customer through this extension is
+ * owned by its creator (ProcessCreateEventTrigger), never a superuser.
+ */
+static bool
+SessionDatabaseGuarded(void)
+{
+	Oid			oid = get_event_trigger_oid(SCHEMA_GUARD_TRIGGER, true);
+	HeapTuple	tuple;
+	bool		guarded = false;
+
+	if (!OidIsValid(oid))
+		return false;
+	tuple = SearchSysCache1(EVENTTRIGGEROID, ObjectIdGetDatum(oid));
+	if (HeapTupleIsValid(tuple))
+	{
+		Form_pg_event_trigger form = (Form_pg_event_trigger) GETSTRUCT(tuple);
+
+		guarded = form->evtenabled == TRIGGER_FIRES_ALWAYS &&
+			superuser_arg(form->evtowner);
+		ReleaseSysCache(tuple);
+	}
+	return guarded;
+}
+
+/* Does the database carry neon.born_closed = on (its setrole = 0 setting)? */
+static bool
+DatabaseBornClosed(Oid dboid)
+{
+	Relation	rel;
+	ScanKeyData keys[2];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	bool		marked = false;
+	const size_t prefix_len = strlen(BORN_CLOSED_GUC "=");
+
+	rel = table_open(DbRoleSettingRelationId, AccessShareLock);
+	ScanKeyInit(&keys[0], Anum_pg_db_role_setting_setdatabase,
+				BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(dboid));
+	ScanKeyInit(&keys[1], Anum_pg_db_role_setting_setrole,
+				BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(InvalidOid));
+	scan = systable_beginscan(rel, DbRoleSettingDatidRolidIndexId, true, NULL, 2, keys);
+	tuple = systable_getnext(scan);
+	if (HeapTupleIsValid(tuple))
+	{
+		bool		isnull;
+		Datum		config = heap_getattr(tuple, Anum_pg_db_role_setting_setconfig,
+										  RelationGetDescr(rel), &isnull);
+
+		if (!isnull)
+		{
+			ArrayType  *array = DatumGetArrayTypeP(config);
+			Datum	   *elems;
+			bool	   *nulls;
+			int			count;
+
+			deconstruct_array(array, TEXTOID, -1, false, TYPALIGN_INT,
+							  &elems, &nulls, &count);
+			for (int i = 0; i < count && !marked; i++)
+			{
+				char	   *item;
+				bool		value;
+
+				if (nulls[i])
+					continue;
+				item = TextDatumGetCString(elems[i]);
+				marked = pg_strncasecmp(item, BORN_CLOSED_GUC "=", prefix_len) == 0 &&
+					parse_bool(item + prefix_len, &value) && value;
+				pfree(item);
+			}
+		}
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	return marked;
+}
+
+static void
+RefuseBornClosedOption(void)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+			 errmsg("on a protected branch, ALLOW_CONNECTIONS and IS_TEMPLATE are set by Chelabase"),
+			 errhint("chelabase:branch_protected")));
+}
+
+/*
+ * CREATE DATABASE by a non-superuser in a guarded database: ALLOW_CONNECTIONS
+ * (any value) and IS_TEMPLATE true are refused; otherwise the returned copy
+ * of the statement (the tree may be read-only) has ALLOW_CONNECTIONS false
+ * appended. The caller writes the marker once the database exists.
+ */
+static CreatedbStmt *
+BornClosedCreateDb(CreatedbStmt *stmt)
+{
+	ListCell   *option;
+	CreatedbStmt *copy;
+
+	foreach(option, stmt->options)
+	{
+		DefElem    *defel = lfirst(option);
+
+		if (strcmp(defel->defname, "allow_connections") == 0 ||
+			(strcmp(defel->defname, "is_template") == 0 && defGetBoolean(defel)))
+			RefuseBornClosedOption();
+	}
+	copy = copyObject(stmt);
+	copy->options = lappend(copy->options,
+							makeDefElem("allow_connections", (Node *) makeInteger(0), -1));
+	return copy;
+}
+
+/* Sets neon.born_closed = on for the database, as the superuser */
+static void
+WriteBornClosedMarker(Oid dboid)
+{
+	VariableSetStmt *setstmt = makeNode(VariableSetStmt);
+	A_Const    *value = makeNode(A_Const);
+	bool		sudo;
+
+#if PG_MAJORVERSION_NUM < 15
+	value->val.type = T_String;
+	value->val.val.str = pstrdup("on");
+#else
+	value->val.sval.type = T_String;
+	value->val.sval.sval = pstrdup("on");
+	value->isnull = false;
+#endif
+	value->location = -1;
+	setstmt->kind = VAR_SET_VALUE;
+	setstmt->name = pstrdup(BORN_CLOSED_GUC);
+	setstmt->args = list_make1(value);
+	setstmt->is_local = false;
+
+	sudo = switch_to_superuser();
+	PG_TRY();
+	{
+		AlterSetting(dboid, InvalidOid, setstmt);
+		CommandCounterIncrement();
+	}
+	PG_FINALLY();
+	{
+		if (sudo)
+			switch_to_original_role();
+	}
+	PG_END_TRY();
+}
+
+/*
+ * ALTER DATABASE ... ALLOW_CONNECTIONS / IS_TEMPLATE by a non-superuser is
+ * refused when the target carries the marker (whatever the session's
+ * database), or when the session's database carries the guard: on a
+ * protected branch every connectable database must carry the guard, and an
+ * owner-closed database stays closed while the branch is protected.
+ */
+static void
+CheckAlterDatabase(AlterDatabaseStmt *stmt)
+{
+	ListCell   *option;
+	bool		connections_or_template = false;
+	Oid			dboid;
+
+	foreach(option, stmt->options)
+	{
+		DefElem    *defel = lfirst(option);
+
+		if (strcmp(defel->defname, "allow_connections") == 0 ||
+			strcmp(defel->defname, "is_template") == 0)
+			connections_or_template = true;
+	}
+	if (!connections_or_template || superuser())
+		return;
+	dboid = get_database_oid(stmt->dbname, true);
+	if ((OidIsValid(dboid) && DatabaseBornClosed(dboid)) || SessionDatabaseGuarded())
+		RefuseBornClosedOption();
+}
+
+/*
  * Is "dbname" listed in neon.protected_databases (comma-separated, matched
  * exactly, no case folding)?
  */
@@ -1748,6 +2124,28 @@ NeonProcessUtility(
 				   QueryCompletion *qc)
 {
 	Node	   *parseTree = pstmt->utilityStmt;
+	bool		born_closed = false;
+
+	/* Chelabase-managed roles: before anything is recorded for forwarding */
+	CheckManagedRoleStatement(parseTree);
+
+	/*
+	 * A non-superuser's CREATE DATABASE in a guarded database runs with
+	 * ALLOW_CONNECTIONS false (a copy of the statement) and gets the marker
+	 * below.
+	 */
+	if (IsA(parseTree, CreatedbStmt) && !superuser() && SessionDatabaseGuarded())
+	{
+		PlannedStmt *copy = makeNode(PlannedStmt);
+
+		*copy = *pstmt;
+		copy->utilityStmt = (Node *) BornClosedCreateDb(castNode(CreatedbStmt, parseTree));
+		pstmt = copy;
+		parseTree = copy->utilityStmt;
+		born_closed = true;
+	}
+	else if (IsA(parseTree, AlterDatabaseStmt))
+		CheckAlterDatabase(castNode(AlterDatabaseStmt, parseTree));
 
 	/*
 	 * Refuse to drop a protected database. This runs first, before any early
@@ -1809,6 +2207,9 @@ NeonProcessUtility(
 		case T_GrantRoleStmt:
 			HandleGrantRole(castNode(GrantRoleStmt, parseTree));
 			break;
+		case T_ReassignOwnedStmt:
+			HandleReassignOwned(castNode(ReassignOwnedStmt, parseTree));
+			break;
 		case T_CreateTableSpaceStmt:
 			if (!RegressTestMode)
 			{
@@ -1850,7 +2251,17 @@ NeonProcessUtility(
 	if (IsA(parseTree, CreateRoleStmt))
 		HandleCreateRoleDone(castNode(CreateRoleStmt, parseTree));
 	else if (IsA(parseTree, CreatedbStmt))
-		HandleCreateDbDone(castNode(CreatedbStmt, parseTree));
+	{
+		CreatedbStmt *stmt = castNode(CreatedbStmt, parseTree);
+
+		HandleCreateDbDone(stmt);
+		if (born_closed)
+		{
+			Oid			dboid = get_database_oid(stmt->dbname, false);
+
+			WriteBornClosedMarker(dboid);
+		}
+	}
 }
 
 /*
@@ -1934,6 +2345,18 @@ InitDDLHandler()
 							 NULL,
 							 &ForwardDDL,
 							 true,
+							 PGC_SUSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomBoolVariable(
+							 BORN_CLOSED_GUC,
+							 "Marks a database created closed on a protected branch, until Chelabase guards and opens it",
+							 NULL,
+							 &BornClosed,
+							 false,
 							 PGC_SUSET,
 							 0,
 							 NULL,
