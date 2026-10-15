@@ -40,12 +40,16 @@
 # Caches live in three named Docker volumes: chela-neon-cargo (cargo registry and
 # git, poetry venvs), chela-neon-target (target/, pg_install/, build/ of the
 # checkout) and chela-neon-sccache (sccache's compiler cache, one for every clone
-# whatever the suffix; 40G). rustc runs through a static sccache binary that this
-# script downloads once into ${XDG_CACHE_HOME:-$HOME/.cache}/chela-neon/sccache-<version>/
-# (version and sha256 pinned here) and mounts read-only at /opt/sccache. sccache
-# skips incremental crates, so only release builds (incremental off) benefit. The
-# build and rust-tests steps print `sccache --show-stats`. No `--network host`: the test ports stay inside the container, so
-# they never clash with the chelabase Compose stack.
+# whatever the suffix; 40G; mounted at /sccache-cache). rustc runs through a static
+# sccache binary that this script downloads once into
+# ${XDG_CACHE_HOME:-$HOME/.cache}/chela-neon/sccache-<version>/ (version and sha256s
+# pinned here; the installed binary is re-checked on every run) and mounts read-only
+# at /opt/sccache. sccache skips incremental crates, so only release builds
+# (incremental off) benefit. The build and rust-tests steps print
+# `sccache --show-stats`.
+#
+# No `--network host`: the test ports stay inside the container, so they never
+# clash with the chelabase Compose stack.
 #
 # The full log and one log per step go to .ci-local/<timestamp>/ (git-ignored),
 # with the regression suite's logs in test-logs.tar.zst. The exit status is
@@ -64,6 +68,8 @@ SCCACHE_CACHE_SIZE="40G"
 # one published next to the tarball.
 SCCACHE_VERSION="0.18.0"
 SCCACHE_SHA256="45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89"
+# sha256 of the unpacked binary itself, checked on every run.
+SCCACHE_BIN_SHA256="973cb15f6a986d84ca334bbed3bbe2eb8f1ee8fd81bf9e115b8539a293bf8d59"
 MAJORS=(v14 v15 v16 v17)
 
 usage() {
@@ -258,9 +264,9 @@ docker_args() {
         --mount "${vol_t},dst=/work/target,volume-subpath=target" \
         --mount "${vol_t},dst=/work/pg_install,volume-subpath=pg_install" \
         --mount "${vol_t},dst=/work/build,volume-subpath=build" \
-        --mount "${vol_s},dst=/home/nonroot/.cache/sccache" \
+        --mount "${vol_s},dst=/sccache-cache" \
         --mount "type=bind,src=$(sccache_host_dir),dst=/opt/sccache,readonly" \
-        -e SCCACHE_DIR=/home/nonroot/.cache/sccache \
+        -e SCCACHE_DIR=/sccache-cache \
         -e "SCCACHE_CACHE_SIZE=${SCCACHE_CACHE_SIZE}" \
         -e RUSTC_WRAPPER=/opt/sccache/sccache \
         -e "PG_VERSION=$pg" \
@@ -656,38 +662,62 @@ ensure_volumes() {
                  chown nonroot:nonroot /c /t /s /c/* /t/*'
 }
 
-# ensure_sccache: downloads the pinned static sccache into sccache_host_dir once,
-# checking the published sha256 (of the tarball) before it is unpacked.
-ensure_sccache() {
-    local dir bin tmp name url
-    dir="$(sccache_host_dir)"
-    bin="$dir/sccache"
-    [[ -x "$bin" ]] && return 0
+# sccache_ok <binary>: true when it is executable and is the pinned build.
+sccache_ok() {
+    [[ -x "$1" ]] && echo "${SCCACHE_BIN_SHA256}  $1" | sha256sum --check --status 2>/dev/null
+}
+
+# install_sccache: downloads the pinned release, checks the tarball's published
+# sha256, unpacks into a temp dir next to the cache dir (same filesystem) and
+# renames the binary into place in one step. Runs under ensure_sccache's lock.
+install_sccache() {
+    local dir="$1" bin="$2" tmp name url
     name="sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl"
     url="https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/${name}.tar.gz"
     echo "ci-local.sh: downloading sccache v${SCCACHE_VERSION}"
-    tmp="$(mktemp -d)" || return 1
-    if ! curl -sSfL -o "$tmp/sccache.tar.gz" "$url"; then
+    tmp="$(mktemp -d "$(dirname "$dir")/.sccache-tmp.XXXXXX")" || return 1
+    # shellcheck disable=SC2064
+    trap "rm -rf '$tmp'" EXIT
+    if ! curl -sSfL --proto '=https' --retry 3 --max-time 120 -o "$tmp/sccache.tar.gz" "$url"; then
         echo "ci-local.sh: could not download $url" >&2
-        rm -rf "$tmp"
         return 1
     fi
     if ! echo "${SCCACHE_SHA256}  $tmp/sccache.tar.gz" | sha256sum --check --status; then
         echo "ci-local.sh: sha256 mismatch for $url (expected ${SCCACHE_SHA256})" >&2
-        rm -rf "$tmp"
         return 1
     fi
     if ! tar -xzf "$tmp/sccache.tar.gz" -C "$tmp" "$name/sccache"; then
         echo "ci-local.sh: could not unpack sccache from $url" >&2
-        rm -rf "$tmp"
         return 1
     fi
-    if ! { mkdir -p "$dir" && chmod 755 "$tmp/$name/sccache" && mv -f "$tmp/$name/sccache" "$bin"; }; then
+    if ! sccache_ok "$tmp/$name/sccache"; then
+        echo "ci-local.sh: the unpacked sccache is not the pinned build (expected sha256 ${SCCACHE_BIN_SHA256})" >&2
+        return 1
+    fi
+    chmod 755 "$tmp/$name/sccache"
+    if ! { mkdir -p "$dir" && mv -f "$tmp/$name/sccache" "$bin"; }; then
         echo "ci-local.sh: could not install sccache into $dir" >&2
-        rm -rf "$tmp"
         return 1
     fi
-    rm -rf "$tmp"
+}
+
+# ensure_sccache: makes sure sccache_host_dir holds the pinned binary. The
+# installed binary is checked against SCCACHE_BIN_SHA256 on every run; a missing
+# or damaged one is reinstalled under a lock, so concurrent first runs don't race.
+ensure_sccache() {
+    local dir bin parent
+    dir="$(sccache_host_dir)"
+    bin="$dir/sccache"
+    sccache_ok "$bin" && return 0
+    parent="$(dirname "$dir")"
+    mkdir -p "$parent" || { echo "ci-local.sh: could not create $parent" >&2; return 1; }
+    (
+        flock 8 || exit 1
+        # Another run may have installed it while this one waited.
+        sccache_ok "$bin" && exit 0
+        install_sccache "$dir" "$bin"
+    ) 8>"$parent/sccache-${SCCACHE_VERSION}.lock" || return 1
+    sccache_ok "$bin" || { echo "ci-local.sh: $bin is not the pinned sccache after install" >&2; return 1; }
 }
 
 main() {
