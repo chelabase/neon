@@ -647,7 +647,7 @@ impl PageCache {
             .iter_mut()
             .map(|chunk| {
                 // SAFETY: Each chunk has `PAGE_SZ` (8192) bytes, greater than 512, still aligned.
-                let buf = unsafe { IoPageSlice::new_unchecked(chunk.try_into().unwrap()) };
+                let buf = unsafe { IoPageSlice::new_unchecked(chunk) };
 
                 Slot {
                     inner: tokio::sync::RwLock::new(SlotInner {

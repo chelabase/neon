@@ -77,12 +77,6 @@ pub struct Persistence {
     connection_pool: Pool<AsyncPgConnection>,
 }
 
-/// Legacy format, for use in JSON compat objects in test environment
-#[derive(Serialize, Deserialize)]
-struct JsonPersistence {
-    tenants: HashMap<TenantShardId, TenantShardPersistence>,
-}
-
 #[derive(thiserror::Error, Debug)]
 pub(crate) enum DatabaseError {
     #[error(transparent)]

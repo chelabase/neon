@@ -6428,10 +6428,6 @@ impl Service {
         for target in &targets {
             let mut this_child_tsps = Vec::new();
             for child in &target.child_ids {
-                let mut child_shard = shard_ident;
-                child_shard.number = child.shard_number;
-                child_shard.count = child.shard_count;
-
                 tracing::info!(
                     "Create child shard persistence with stripe size {}",
                     shard_ident.stripe_size.0

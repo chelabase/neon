@@ -1906,8 +1906,8 @@ impl ResidentLayer {
 
     /// Loads all keys stored in the layer. Returns key, lsn and value size.
     #[tracing::instrument(level = tracing::Level::DEBUG, skip_all, fields(layer=%self))]
-    pub(crate) async fn load_keys<'a>(
-        &'a self,
+    pub(crate) async fn load_keys(
+        &self,
         ctx: &RequestContext,
     ) -> anyhow::Result<Vec<pageserver_api::key::Key>> {
         use LayerKind::*;

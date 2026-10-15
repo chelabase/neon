@@ -1687,7 +1687,7 @@ impl ComputeNode {
     ///
     /// Returns a handle to the child process and a handle to the logs thread.
     #[instrument(skip_all)]
-    pub fn start_postgres(&self, storage_auth_token: Option<String>) -> Result<PostgresHandle> {
+    fn start_postgres(&self, storage_auth_token: Option<String>) -> Result<PostgresHandle> {
         let pgdata_path = Path::new(&self.params.pgdata);
 
         let env_vars: Vec<(String, String)> = if self.params.lakebase_mode {

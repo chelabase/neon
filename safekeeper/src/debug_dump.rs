@@ -200,19 +200,20 @@ pub async fn build(args: Args, global_timelines: Arc<GlobalTimelines>) -> Result
     let timelines_count = global_timelines.timelines_count();
     let config = global_timelines.get_global_config();
 
-    let ptrs_snapshot = if args.tenant_id.is_some() && args.timeline_id.is_some() {
-        // If both tenant_id and timeline_id are specified, we can just get the
-        // timeline directly, without taking a snapshot of the whole list.
-        let ttid = TenantTimelineId::new(args.tenant_id.unwrap(), args.timeline_id.unwrap());
-        if let Ok(tli) = global_timelines.get(ttid) {
-            vec![tli]
+    let ptrs_snapshot =
+        if let (Some(tenant_id), Some(timeline_id)) = (args.tenant_id, args.timeline_id) {
+            // If both tenant_id and timeline_id are specified, we can just get the
+            // timeline directly, without taking a snapshot of the whole list.
+            let ttid = TenantTimelineId::new(tenant_id, timeline_id);
+            if let Ok(tli) = global_timelines.get(ttid) {
+                vec![tli]
+            } else {
+                vec![]
+            }
         } else {
-            vec![]
-        }
-    } else {
-        // Otherwise, take a snapshot of the whole list.
-        global_timelines.get_all()
-    };
+            // Otherwise, take a snapshot of the whole list.
+            global_timelines.get_all()
+        };
 
     let mut timelines = Vec::new();
     let runtime = Arc::new(

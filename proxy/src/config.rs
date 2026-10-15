@@ -518,7 +518,7 @@ mod tests {
             idle_ttl: _,
         } = "size=4096,ttl=5min".parse()?;
         assert_eq!(size, Some(4096));
-        assert_eq!(absolute_ttl, Some(Duration::from_secs(5 * 60)));
+        assert_eq!(absolute_ttl, Some(Duration::from_mins(5)));
 
         let CacheOptions {
             size,
@@ -526,7 +526,7 @@ mod tests {
             idle_ttl: _,
         } = "ttl=4m,size=2".parse()?;
         assert_eq!(size, Some(2));
-        assert_eq!(absolute_ttl, Some(Duration::from_secs(4 * 60)));
+        assert_eq!(absolute_ttl, Some(Duration::from_mins(4)));
 
         let CacheOptions {
             size,
@@ -555,7 +555,7 @@ mod tests {
             shards,
             timeout,
         } = "shards=32,permits=4,epoch=10m,timeout=1s".parse()?;
-        assert_eq!(epoch, Duration::from_secs(10 * 60));
+        assert_eq!(epoch, Duration::from_mins(10));
         assert_eq!(timeout, Duration::from_secs(1));
         assert_eq!(shards, 32);
         assert_eq!(limiter.initial_limit, 4);
@@ -597,7 +597,7 @@ mod tests {
             timeout,
         } = r#"{"shards":32,"initial_limit":44,"aimd":{"min":5,"max":500,"inc":10,"dec":0.9,"utilisation":0.8},"epoch":"10m","timeout":"1s"}"#
             .parse()?;
-        assert_eq!(epoch, Duration::from_secs(10 * 60));
+        assert_eq!(epoch, Duration::from_mins(10));
         assert_eq!(timeout, Duration::from_secs(1));
         assert_eq!(shards, 32);
         assert_eq!(limiter.initial_limit, 44);

@@ -6,7 +6,6 @@ use async_compression::tokio::bufread::ZstdDecoder;
 use async_compression::tokio::write::ZstdEncoder;
 use async_compression::zstd::CParameter;
 use camino::Utf8Path;
-use nix::NixPath;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncBufRead, AsyncSeekExt, AsyncWriteExt};
 use tokio_tar::{Archive, Builder, HeaderMode};

@@ -21,6 +21,8 @@ pub struct Client {
     inner: proto::PageServiceClient<InterceptedService<Channel, AuthInterceptor>>,
 }
 
+// The client's errors are `tonic::Status` (176 bytes), returned by value as tonic's API does.
+#[allow(clippy::result_large_err)]
 impl Client {
     /// Connects to the given gRPC endpoint.
     pub async fn connect<E>(

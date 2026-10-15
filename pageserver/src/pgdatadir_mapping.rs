@@ -3174,11 +3174,6 @@ pub(crate) struct RelDirectory {
     pub(crate) rels: HashSet<(Oid, u8)>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct RelSizeEntry {
-    nblocks: u32,
-}
-
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub(crate) struct SlruSegmentDirectory {
     // Set of SLRU segments that exist.

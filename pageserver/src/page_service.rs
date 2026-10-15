@@ -1312,6 +1312,9 @@ impl PageServerHandler {
     /// Post-condition: `batch` is Some()
     #[instrument(skip_all, level = tracing::Level::TRACE)]
     #[allow(clippy::boxed_local)]
+    // The Err hands an unbatchable message back by value, once per message on the getpage hot
+    // path; boxing it would allocate per message.
+    #[allow(clippy::result_large_err)]
     fn pagestream_do_batch(
         batching_strategy: PageServiceProtocolPipelinedBatchingStrategy,
         max_batch_size: NonZeroUsize,
@@ -1975,6 +1978,8 @@ impl PageServerHandler {
     ///
     /// May leak tokio tasks if not polled to completion.
     #[allow(clippy::too_many_arguments)]
+    // The batching closure returns `pagestream_do_batch`'s by-value Err (see there).
+    #[allow(clippy::result_large_err)]
     async fn handle_pagerequests_pipelined<IO>(
         &mut self,
         pgb_writer: &mut PostgresBackend<IO>,
@@ -3300,6 +3305,8 @@ pub struct GrpcPageServiceHandler {
     get_vectored_concurrent_io: GetVectoredConcurrentIo,
 }
 
+// The gRPC handler's errors are `tonic::Status` (176 bytes), returned by value as tonic's API does.
+#[allow(clippy::result_large_err)]
 impl GrpcPageServiceHandler {
     /// Spawns a gRPC server for the page service.
     ///

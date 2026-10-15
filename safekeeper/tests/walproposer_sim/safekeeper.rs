@@ -263,9 +263,7 @@ pub fn run_server(os: NodeOs, disk: Arc<SafekeeperDisk>) -> Result<()> {
 
             match event {
                 NetEvent::Message(msg) => {
-                    let res = conn.process_any(msg, &mut global);
-                    if res.is_err() {
-                        let e = res.unwrap_err();
+                    if let Err(e) = conn.process_any(msg, &mut global) {
                         let estr = e.to_string();
                         if !estr.contains("finished processing START_REPLICATION") {
                             warn!("conn {:?} error: {:?}", connection_id, e);

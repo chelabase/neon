@@ -590,7 +590,7 @@ mod tests {
         )
         .await;
         let r = std::mem::take(&mut *reports.lock().unwrap());
-        assert!(r.is_empty());
+        assert!(r.is_empty(), "unexpected reports: {r:?}");
 
         // register a new counter
 
@@ -664,7 +664,7 @@ mod tests {
         )
         .await;
         let r = std::mem::take(&mut *reports.lock().unwrap());
-        assert!(r.is_empty());
+        assert!(r.is_empty(), "unexpected reports: {r:?}");
 
         // counter is unregistered
         assert!(metrics.endpoints.is_empty());

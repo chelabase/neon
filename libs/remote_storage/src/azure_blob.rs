@@ -703,12 +703,8 @@ impl RemoteStorage for AzureBlobStorage {
                 put_block_size / 1024 / 1024
             );
             // Wait for all blocks to be uploaded.
-            let upload_results = futures::future::try_join_all(upload_futures).await;
-            if upload_results.is_err() {
-                return Err(anyhow::anyhow!(format!(
-                    "Failed to upload all blocks {:#?}",
-                    upload_results.unwrap_err()
-                )));
+            if let Err(e) = futures::future::try_join_all(upload_futures).await {
+                return Err(anyhow::anyhow!("Failed to upload all blocks {e:#?}"));
             }
 
             // Commit the blocks.

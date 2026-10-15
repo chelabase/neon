@@ -5596,7 +5596,7 @@ impl TenantShard {
     ///
     /// Future is cancellation safe. Only one calculation can be running at once per tenant.
     #[instrument(skip_all, fields(tenant_id=%self.tenant_shard_id.tenant_id, shard_id=%self.tenant_shard_id.shard_slug()))]
-    pub async fn gather_size_inputs(
+    pub(crate) async fn gather_size_inputs(
         &self,
         // `max_retention_period` overrides the cutoff that is used to calculate the size
         // (only if it is shorter than the real cutoff).
@@ -5639,7 +5639,7 @@ impl TenantShard {
     /// This is periodically called by background worker.
     /// result is cached in tenant struct
     #[instrument(skip_all, fields(tenant_id=%self.tenant_shard_id.tenant_id, shard_id=%self.tenant_shard_id.shard_slug()))]
-    pub async fn calculate_synthetic_size(
+    pub(crate) async fn calculate_synthetic_size(
         &self,
         cause: LogicalSizeCalculationCause,
         cancel: &CancellationToken,

@@ -248,12 +248,8 @@ async fn search_key(
 
     for (_key, result) in std::mem::take(&mut state.keys) {
         let state = result.collect_pending_ios().await?;
-        if state.img.is_some() {
-            eprintln!(
-                "image: {}: {:x?}",
-                state.img.as_ref().unwrap().0,
-                STANDARD.encode(state.img.as_ref().unwrap().1.clone())
-            );
+        if let Some((img_lsn, img)) = state.img.as_ref() {
+            eprintln!("image: {}: {:x?}", img_lsn, STANDARD.encode(img.clone()));
         }
         for delta in state.records.iter() {
             match &delta.1 {

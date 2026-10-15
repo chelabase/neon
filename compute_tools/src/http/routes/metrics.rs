@@ -54,6 +54,8 @@ pub(in crate::http) async fn get_metrics() -> Response {
 /// The neon extension exposes these metrics over a Unix domain socket
 /// in the data directory. That's not accessible directly from the outside
 /// world, so we have this endpoint in compute_ctl to expose it
+// An axum `Response` on both paths: the Err is no larger than the Ok, so boxing it gains nothing.
+#[allow(clippy::result_large_err)]
 pub(in crate::http) async fn get_autoscaling_metrics(
     State(compute): State<Arc<ComputeNode>>,
 ) -> Result<Response, Response> {

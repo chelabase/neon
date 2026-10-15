@@ -1919,15 +1919,14 @@ impl Timeline {
                     .iter()
                     .map(|a| a.get_lsn_range().start)
                     .reduce(min);
-                if force_compaction_lsn.is_some()
-                    && min_lsn.is_some()
-                    && min_lsn.unwrap() < force_compaction_lsn.unwrap()
+                if let (Some(force_compaction_lsn), Some(min_lsn)) = (force_compaction_lsn, min_lsn)
+                    && min_lsn < force_compaction_lsn
                 {
                     info!(
                         "forcing L0 compaction of {} L0 deltas. Min lsn: {}, force compaction lsn: {}",
                         level0_deltas.len(),
-                        min_lsn.unwrap(),
-                        force_compaction_lsn.unwrap()
+                        min_lsn,
+                        force_compaction_lsn
                     );
                 } else {
                     debug!(
@@ -3787,7 +3786,9 @@ impl Timeline {
                     )));
                 }
             } else {
-                let last_key: &mut Key = last_key.as_mut().unwrap();
+                let Some(last_key) = last_key.as_mut() else {
+                    unreachable!("the branch above handles `last_key == None`");
+                };
                 stat.on_unique_key_visited(); // TODO: adjust statistics for partial compaction
                 let retention = self
                     .generate_key_retention(

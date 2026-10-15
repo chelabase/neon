@@ -232,7 +232,7 @@ pub(crate) struct Manager {
 /// background tasks.
 /// Be careful, this task is not respawned on panic, so it should not panic.
 #[instrument(name = "manager", skip_all, fields(ttid = %tli.ttid))]
-pub async fn main_task(
+pub(crate) async fn main_task(
     tli: ManagerTimeline,
     conf: SafeKeeperConf,
     broker_active_set: Arc<TimelinesSet>,

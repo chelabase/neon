@@ -39,15 +39,12 @@ pub fn parse_relfilename(fname: &str) -> Result<(u32, u8, u32), FilePathError> {
     let forkname = caps.name("forkname").map(|f| f.as_str());
     let forknum = forkname_to_number(forkname)?;
 
-    let segno_match = caps.name("segno");
-    let segno = if segno_match.is_none() {
-        0
-    } else {
-        segno_match
-            .unwrap()
+    let segno = match caps.name("segno") {
+        None => 0,
+        Some(segno_match) => segno_match
             .as_str()
             .parse::<u32>()
-            .map_err(|_e| FilePathError::InvalidFileName)?
+            .map_err(|_e| FilePathError::InvalidFileName)?,
     };
 
     Ok((relnode, forknum, segno))

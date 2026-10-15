@@ -1669,7 +1669,7 @@ mod tests {
         ar_hrd2.begin_lsn = Lsn(4);
         ar_hrd2.end_lsn = Lsn(5);
         let append_request = AppendRequest {
-            h: ar_hdr,
+            h: ar_hrd2,
             wal_data: Bytes::from_static(b"b"),
         };
         // and now starting at 4, it must fail

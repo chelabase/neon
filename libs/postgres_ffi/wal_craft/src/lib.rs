@@ -15,6 +15,9 @@ use postgres_ffi::{
 
 macro_rules! xlog_utils_test {
     ($version:ident) => {
+        // The path is only used by the `#[cfg(test)]` file module below, so non-test builds
+        // see it as unused.
+        #[allow(unused_attributes)]
         #[path = "."]
         mod $version {
             #[allow(unused_imports)]

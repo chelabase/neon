@@ -250,9 +250,12 @@ impl ApiImpl for SimulationApi {
     }
 
     fn update_donor(&self, donor: &mut walproposer::bindings::Safekeeper, donor_lsn: u64) {
-        let mut shmem = unsafe { *self.get_shmem_state() };
+        // Write through the pointer: `*ptr` alone copies the (Copy) struct and the update
+        // would be lost.
+        let shmem = unsafe { &mut *self.get_shmem_state() };
         shmem.propEpochStartLsn.value = donor_lsn;
         shmem.donor_conninfo = donor.conninfo;
+        shmem.donor_lsn = donor_lsn;
     }
 
     fn conn_status(
