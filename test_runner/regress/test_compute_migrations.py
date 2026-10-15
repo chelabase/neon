@@ -27,6 +27,7 @@ def test_compute_migrations_retry(neon_simple_env: NeonEnv, compute_migrations_d
             with pytest.raises(Exception, match="compute startup failed"):
                 endpoint.start(env=failpoint)
             assert endpoint.log_contains(f"migration {i} was configured to fail")
+            assert endpoint.endpoint_id is not None
             env.neon_cli.endpoint_stop(
                 endpoint.endpoint_id, check_return_code=False, mode="immediate"
             )
@@ -100,6 +101,7 @@ def test_fail_open_migration_failure_fails_the_start(neon_simple_env: NeonEnv):
     endpoint.respec(skip_pg_catalog_updates=False)
     with pytest.raises(Exception, match="migration 2"):
         endpoint.start(env={"FAILPOINTS": "compute-migration=return(2)"})
+    assert endpoint.endpoint_id is not None
     env.neon_cli.endpoint_stop(endpoint.endpoint_id, check_return_code=False, mode="immediate")
     endpoint.start()
     with endpoint.cursor() as cur:

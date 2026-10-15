@@ -31,7 +31,9 @@ fn installing_twice_is_fine_and_keeps_the_first_provider() {
 
     // A second call (another startup path, a test harness) neither panics nor swaps the provider.
     http_utils::tls_certs::install_default_crypto_provider();
-    let second = CryptoProvider::get_default().expect("still installed").clone();
+    let second = CryptoProvider::get_default()
+        .expect("still installed")
+        .clone();
 
     assert!(Arc::ptr_eq(&first, &second));
 }

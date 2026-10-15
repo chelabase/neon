@@ -12,7 +12,9 @@ fn aws_config_uses_the_shared_s3_timeout_config() {
         .find("aws_config::defaults(")
         .expect("fast_import loads its AWS config through aws_config::defaults");
     let rest = &SRC[defaults_at..];
-    let load_at = rest.find(".load()").expect("the loader chain ends in .load()");
+    let load_at = rest
+        .find(".load()")
+        .expect("the loader chain ends in .load()");
     let chain = &rest[..load_at];
     assert!(
         chain.contains(".timeout_config(") && chain.contains("s3_timeout_config("),
