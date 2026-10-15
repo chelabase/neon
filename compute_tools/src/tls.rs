@@ -4,7 +4,7 @@ use std::{
     path::Path,
     sync::{
         Mutex,
-        atomic::{AtomicU64, Ordering as MemOrder},
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -217,7 +217,7 @@ fn write_private_file(dir: &Path, name: &str, data: &[u8]) -> Result<()> {
     let tmp = dir.join(format!(
         "{name}.tmp.{}.{}",
         std::process::id(),
-        TMP_SEQ.fetch_add(1, MemOrder::Relaxed)
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     let result = (|| {
         let mut file = std::fs::OpenOptions::new()
