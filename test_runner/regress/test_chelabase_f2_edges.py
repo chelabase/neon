@@ -92,13 +92,22 @@ def test_keys_with_two_unchanged_out_of_line_key_columns(vanilla_pg: VanillaPost
     """T2 I1 with two out-of-line key columns: each unchanged one comes from the old key."""
     pg = utf8_db(vanilla_pg)
     pg.safe_psql("SELECT pg_create_logical_replication_slot('k', 'chelabase_keys')")
-    pg.safe_psql("CREATE TABLE t2 (a text, b text, c int, PRIMARY KEY (a, b, c))")
+    # both key columns fit one index row (btree's 2704-byte limit) and, with the lowest
+    # toast_tuple_target, both are stored out of line
+    pg.safe_psql(
+        "CREATE TABLE t2 (a text, b text, c int, PRIMARY KEY (a, b, c))"
+        " WITH (toast_tuple_target = 128)"
+    )
     pg.safe_psql("ALTER TABLE t2 ALTER COLUMN a SET STORAGE EXTERNAL")
     pg.safe_psql("ALTER TABLE t2 ALTER COLUMN b SET STORAGE EXTERNAL")
-    pg.safe_psql("INSERT INTO t2 VALUES (repeat('x', 2500), repeat('y', 2500), 1)")
+    pg.safe_psql("INSERT INTO t2 VALUES (repeat('x', 1200), repeat('y', 1200), 1)")
+    assert pg.safe_psql(
+        "SELECT pg_column_toast_chunk_id(a) IS NOT NULL, pg_column_toast_chunk_id(b) IS NOT NULL"
+        " FROM t2"
+    ) == [(True, True)]
     pg.safe_psql("UPDATE t2 SET c = 2")
-    pg.safe_psql("UPDATE t2 SET a = repeat('z', 2500)")
-    short = {"x" * 2500: "X", "y" * 2500: "Y", "z" * 2500: "Z"}
+    pg.safe_psql("UPDATE t2 SET a = repeat('z', 1200)")
+    short = {"x" * 1200: "X", "y" * 1200: "Y", "z" * 1200: "Z"}
     assert [ops(m, short) for m in changes(pg)] == [
         [("i", [["X", "Y", "1"]])],
         [("i", [["X", "Y", "2"]]), ("d", [["X", "Y", "1"]])],
