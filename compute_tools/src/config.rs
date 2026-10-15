@@ -44,6 +44,19 @@ pub fn line_in_file(path: &Path, line: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// The `postgresql.conf` lines for a compute with TLS on: the key and certificate
+/// copied into pgdata, and `ssl_ca_file` (the CA client certificates are checked
+/// against) whenever `ca_path` is set (RT3-12).
+pub fn tls_conf_lines(tls: &TlsConfig) -> String {
+    // the file names are the defaults, but good to be explicit.
+    let mut lines =
+        format!("ssl = on\nssl_cert_file = '{SERVER_CRT}'\nssl_key_file = '{SERVER_KEY}'\n");
+    if let Some(ca_path) = &tls.ca_path {
+        lines.push_str(&format!("ssl_ca_file = {}\n", escape_conf_value(ca_path)));
+    }
+    lines
+}
+
 /// Create or completely rewrite configuration file specified by `path`
 #[allow(clippy::too_many_arguments)]
 pub fn write_postgres_conf(
@@ -176,16 +189,12 @@ pub fn write_postgres_conf(
 
     // tls
     if let Some(tls_config) = tls_config {
-        writeln!(file, "ssl = on")?;
-
         // postgres requires the keyfile to be in a secure file,
         // currently too complicated to ensure that at the VM level,
         // so we just copy them to another file instead. :shrug:
         tls::update_key_path_blocking(pgdata_path, tls_config);
 
-        // these are the default, but good to be explicit.
-        writeln!(file, "ssl_cert_file = '{SERVER_CRT}'")?;
-        writeln!(file, "ssl_key_file = '{SERVER_KEY}'")?;
+        write!(file, "{}", tls_conf_lines(tls_config))?;
     }
 
     // Locales

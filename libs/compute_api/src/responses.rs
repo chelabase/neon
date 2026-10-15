@@ -312,6 +312,10 @@ impl Default for ComputeCtlConfig {
 pub struct TlsConfig {
     pub key_path: String,
     pub cert_path: String,
+    /// CA certificate(s) Postgres uses to verify client certificates
+    /// (`ssl_ca_file`). Written whenever TLS is on and this is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_path: Option<String>,
 }
 
 /// Response of the `/computes/{compute_id}/spec` control-plane API.

@@ -4,8 +4,6 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 from fixtures.compute_migrations import COMPUTE_MIGRATIONS, NUM_COMPUTE_MIGRATIONS
-from fixtures.metrics import parse_metrics
-from fixtures.utils import wait_until
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -15,66 +13,35 @@ if TYPE_CHECKING:
 
 def test_compute_migrations_retry(neon_simple_env: NeonEnv, compute_migrations_dir: Path):
     """
-    Test that compute_ctl can recover from migration failures next time it
-    starts, and that the persisted migration ID is correct in such cases.
+    U3: a failure that leaves a fail-open migration unapplied (0001, 0002) fails the start;
+    a later one (fail-closed or skip) is logged and the compute starts. Either way the next
+    start applies the rest.
     """
     env = neon_simple_env
-
     endpoint = env.endpoints.create("main")
     endpoint.respec(skip_pg_catalog_updates=False)
 
     for i in range(1, NUM_COMPUTE_MIGRATIONS + 1):
-        endpoint.start(env={"FAILPOINTS": f"compute-migration=return({i})"})
-
-        # Check that migration failure is properly recorded in the metrics
-        #
-        # N.B. wait_for_migrations() only waits till the last successful
-        # migration is applied. It doesn't wait till the migration failure due
-        # to the failpoint. This opens a race for checking the metrics. To avoid
-        # this, we first wait until the migration failure metric is seen.
-        def check_migration_failure_metrics():
-            client = endpoint.http_client()
-            raw_metrics = client.metrics()
-            metrics = parse_metrics(raw_metrics)
-            failed_migration = metrics.query_all(
-                "compute_ctl_db_migration_failed_total",
+        failpoint = {"FAILPOINTS": f"compute-migration=return({i})"}
+        if i <= 2:
+            with pytest.raises(Exception, match="compute startup failed"):
+                endpoint.start(env=failpoint)
+            assert endpoint.log_contains(f"migration {i} was configured to fail")
+            env.neon_cli.endpoint_stop(
+                endpoint.endpoint_id, check_return_code=False, mode="immediate"
             )
-            assert len(failed_migration) == 1
-            for sample in failed_migration:
-                assert sample.value == 1
-
-        wait_until(check_migration_failure_metrics)
-
-        # Make sure that all migrations before the failed one are applied
+            continue
+        endpoint.start(env=failpoint)
         endpoint.wait_for_migrations(wait_for=i - 1)
-
-        # Confirm that we correctly recorded that in the
-        # neon_migration.migration_id table
         with endpoint.cursor() as cur:
             cur.execute("SELECT id FROM neon_migration.migration_id")
-            migration_id = cast("int", cur.fetchall()[0][0])
-            assert migration_id == i - 1
-
+            assert cast("int", cur.fetchall()[0][0]) == i - 1
         endpoint.stop()
 
     endpoint.start()
-
-    # Now wait for the rest of the migrations
-    endpoint.wait_for_migrations()
-
     with endpoint.cursor() as cur:
         cur.execute("SELECT id FROM neon_migration.migration_id")
-        migration_id = cast("int", cur.fetchall()[0][0])
-        assert migration_id == NUM_COMPUTE_MIGRATIONS
-
-    for i, m in enumerate(COMPUTE_MIGRATIONS, start=1):
-        migration_query = (compute_migrations_dir / m).read_text(encoding="utf-8")
-        if not migration_query.startswith("-- SKIP"):
-            pattern = rf"Skipping migration id={i}"
-        else:
-            pattern = rf"Running migration id={i}"
-
-        endpoint.log_contains(pattern)
+        assert cast("int", cur.fetchall()[0][0]) == NUM_COMPUTE_MIGRATIONS
 
 
 @pytest.mark.parametrize(
@@ -102,11 +69,49 @@ def test_compute_migrations_e2e(
     endpoint = env.endpoints.create("main")
     endpoint.respec(skip_pg_catalog_updates=False)
 
-    # Stop applying migrations after the one we want to test, so that we can
-    # test the state of the cluster at the given migration ID
-    endpoint.start(env={"FAILPOINTS": f"compute-migration=return({migration_id + 1})"})
-
-    endpoint.wait_for_migrations(wait_for=migration_id)
+    if migration_id + 1 == 2:
+        # U3: failing 0002 (fail-open) fails the start, so the state "after 0001" can't be
+        # held; run them all (0001's check, neon_superuser's BYPASSRLS, still holds after).
+        endpoint.start()
+        endpoint.wait_for_migrations(wait_for=NUM_COMPUTE_MIGRATIONS)
+    else:
+        # Stop applying migrations after the one we want to test, so that we can
+        # test the state of the cluster at the given migration ID
+        endpoint.start(env={"FAILPOINTS": f"compute-migration=return({migration_id + 1})"})
+        endpoint.wait_for_migrations(wait_for=migration_id)
 
     check_query = (compute_migrations_test_dir / migration_filename).read_text(encoding="utf-8")
     endpoint.safe_psql(check_query)
+
+
+def test_migrations_done_when_running(neon_simple_env: NeonEnv):
+    env = neon_simple_env
+    endpoint = env.endpoints.create("main")
+    endpoint.respec(skip_pg_catalog_updates=False)
+    endpoint.start()
+    with endpoint.cursor() as cur:
+        cur.execute("SELECT id FROM neon_migration.migration_id")
+        assert cast("int", cur.fetchall()[0][0]) == NUM_COMPUTE_MIGRATIONS
+
+
+def test_fail_open_migration_failure_fails_the_start(neon_simple_env: NeonEnv):
+    env = neon_simple_env
+    endpoint = env.endpoints.create("main")
+    endpoint.respec(skip_pg_catalog_updates=False)
+    with pytest.raises(Exception, match="migration 2"):
+        endpoint.start(env={"FAILPOINTS": "compute-migration=return(2)"})
+    env.neon_cli.endpoint_stop(endpoint.endpoint_id, check_return_code=False, mode="immediate")
+    endpoint.start()
+    with endpoint.cursor() as cur:
+        cur.execute("SELECT id FROM neon_migration.migration_id")
+        assert cast("int", cur.fetchall()[0][0]) == NUM_COMPUTE_MIGRATIONS
+
+
+def test_fail_closed_migration_failure_starts(neon_simple_env: NeonEnv):
+    env = neon_simple_env
+    endpoint = env.endpoints.create("main")
+    endpoint.respec(skip_pg_catalog_updates=False)
+    endpoint.start(env={"FAILPOINTS": f"compute-migration=return({NUM_COMPUTE_MIGRATIONS})"})
+    with endpoint.cursor() as cur:
+        cur.execute("SELECT id FROM neon_migration.migration_id")
+        assert cast("int", cur.fetchall()[0][0]) == NUM_COMPUTE_MIGRATIONS - 1

@@ -58,37 +58,64 @@ pub fn update_key_path_blocking(pg_data: &Path, tls_config: &TlsConfig) {
     }
 }
 
+/// A changed certificate (RT3-1): copy the key and certificate into `pgdata` and
+/// run `reload` (Postgres reloads its TLS files on SIGHUP). The compute's status
+/// is never touched. Fails, writing nothing, while the key doesn't match the
+/// certificate (a renewal seen half-written): the caller retries at its next poll.
+pub fn reload_tls_files(
+    pgdata: &Path,
+    tls: &TlsConfig,
+    reload: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    try_update_key_path_blocking(pgdata, tls)
+        .context("copy the TLS key and certificate into pgdata")?;
+    reload().context("reload Postgres")
+}
+
 // Postgres requires the keypath be "secure". This means
 // 1. Owned by the postgres user.
 // 2. Have permission 600.
 fn try_update_key_path_blocking(pg_data: &Path, tls_config: &TlsConfig) -> Result<()> {
-    let key = std::fs::read_to_string(&tls_config.key_path)?;
-    let crt = std::fs::read_to_string(&tls_config.cert_path)?;
+    let key = std::fs::read_to_string(&tls_config.key_path)
+        .with_context(|| format!("read {}", tls_config.key_path))?;
+    let crt = std::fs::read_to_string(&tls_config.cert_path)
+        .with_context(|| format!("read {}", tls_config.cert_path))?;
 
     // to mitigate a race condition during renewal.
     verify_key_cert(&key, &crt)?;
 
-    let mut key_file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(pg_data.join(SERVER_KEY))?;
-
-    let mut crt_file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(pg_data.join(SERVER_CRT))?;
-
-    key_file.write_all(key.as_bytes())?;
-    crt_file.write_all(crt.as_bytes())?;
+    // Each file is replaced by a rename, so Postgres never reads a truncated one,
+    // and always ends up 0600 whatever an older copy's mode was.
+    write_private_file(pg_data, SERVER_KEY, key.as_bytes())?;
+    write_private_file(pg_data, SERVER_CRT, crt.as_bytes())?;
 
     Ok(())
 }
 
-fn verify_key_cert(key: &str, cert: &str) -> Result<()> {
+fn write_private_file(dir: &Path, name: &str, data: &[u8]) -> Result<()> {
+    let tmp = dir.join(format!("{name}.tmp"));
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("remove {}", tmp.display())),
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .with_context(|| format!("create {}", tmp.display()))?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, dir.join(name))
+        .with_context(|| format!("rename {} into place", tmp.display()))?;
+    Ok(())
+}
+
+/// Checks that `key` (PEM: PKCS#8 `PRIVATE KEY` or SEC1 `EC PRIVATE KEY`, P-256)
+/// is the private key of the first certificate in `cert`.
+pub fn verify_key_cert(key: &str, cert: &str) -> Result<()> {
     use x509_cert::der::oid::db::rfc5912::ECDSA_WITH_SHA_256;
 
     let certs = Certificate::load_pem_chain(cert.as_bytes())
@@ -102,7 +129,12 @@ fn verify_key_cert(key: &str, cert: &str) -> Result<()> {
 
     match cert.signature_algorithm.oid {
         ECDSA_WITH_SHA_256 => {
-            let key = p256::SecretKey::from_sec1_pem(key).context("parse key")?;
+            let key = if key.contains("-----BEGIN PRIVATE KEY-----") {
+                use p256::pkcs8::DecodePrivateKey;
+                p256::SecretKey::from_pkcs8_pem(key.trim()).context("parse PKCS#8 key")?
+            } else {
+                p256::SecretKey::from_sec1_pem(key).context("parse key")?
+            };
 
             let a = key.public_key().to_sec1_bytes();
             let b = cert

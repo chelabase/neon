@@ -822,6 +822,7 @@ impl Endpoint {
                 offload_lfc_interval_seconds: args.offload_lfc_interval_seconds,
                 suspend_timeout_seconds: -1, // Only used in neon_local.
                 databricks_settings: None,
+                member_logins: None,
             };
 
             // this strange code is needed to support respec() in tests
@@ -1148,7 +1149,15 @@ impl Endpoint {
             let text = response.text().await.context("/terminate result")?;
             serde_json::from_str(&text).with_context(|| format!("deserializing {text}"))?
         } else {
-            self.pg_ctl(&["-m", &mode.to_string(), "stop"], &None)?;
+            if let Err(e) = self.pg_ctl(&["-m", &mode.to_string(), "stop"], &None) {
+                // A compute whose start failed has already stopped Postgres, but
+                // compute_ctl is still up (it keeps serving the error for a
+                // while): stopping the endpoint must still stop compute_ctl.
+                if self.pgdata().join("postmaster.pid").exists() {
+                    return Err(e);
+                }
+                eprintln!("postgres is not running ({e:#}), stopping compute_ctl");
+            }
             TerminateResponse { lsn: None }
         };
 
