@@ -26,10 +26,20 @@ fn timeout_config_keeps_the_other_timeouts_of_the_base() {
         .operation_attempt_timeout(Duration::from_secs(3))
         .build();
     let tc = remote_storage::s3_timeout_config(Some(&base));
-    assert_eq!(tc.connect_timeout(), Some(Duration::from_secs(10)));
+    // A connect timeout the user configured (env, profile) is theirs: 10 s only fills the unset case.
+    assert_eq!(tc.connect_timeout(), Some(Duration::from_secs(1)));
     assert_eq!(tc.read_timeout(), Some(Duration::from_secs(5)));
     assert_eq!(tc.operation_timeout(), Some(Duration::from_secs(7)));
     assert_eq!(tc.operation_attempt_timeout(), Some(Duration::from_secs(3)));
+}
+
+#[test]
+fn a_user_connect_timeout_is_not_overwritten() {
+    let base = TimeoutConfig::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .build();
+    let tc = remote_storage::s3_timeout_config(Some(&base));
+    assert_eq!(tc.connect_timeout(), Some(Duration::from_secs(30)));
 }
 
 #[tokio::test]

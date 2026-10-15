@@ -37,10 +37,10 @@ fn a_base_with_only_an_operation_timeout_keeps_it() {
 }
 
 #[test]
-fn a_longer_base_connect_timeout_is_also_set_to_ten_seconds() {
+fn a_longer_base_connect_timeout_is_kept() {
     let base = TimeoutConfig::builder()
         .connect_timeout(Duration::from_secs(60))
         .build();
     let tc = remote_storage::s3_timeout_config(Some(&base));
-    assert_eq!(tc.connect_timeout(), Some(Duration::from_secs(10)));
+    assert_eq!(tc.connect_timeout(), Some(Duration::from_secs(60)));
 }

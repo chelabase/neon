@@ -480,6 +480,42 @@ for f in $bare_builders; do
 done
 expect "every file with a provider-less rustls builder installs the default provider" "" "$bare_missing"
 
+# Invariant (F1 audit): EVERY binary target in the workspace installs the aws-lc-rs process default
+# (http_utils::tls_certs::install_default_crypto_provider()) as the first statement of main. A
+# dependency may build a provider-less rustls config at any point (redis 0.29's `rediss://`
+# connection does), which panics when ring and aws-lc-rs are both compiled in. The bin targets
+# come from `cargo metadata`; a bin whose main only calls `proxy::binary::<x>::run()` is checked
+# at the first statement of that run().
+# first_statement <file> <fn regex>: the first code line of that function's body.
+first_statement() {
+    awk -v re="$2" '
+        !found && $0 ~ re { found = 1 }
+        found && !open { if ($0 ~ /\{[[:space:]]*$/) open = 1; next }
+        found && open {
+            if ($0 ~ /^[[:space:]]*$/ || $0 ~ /^[[:space:]]*\/\// || $0 ~ /^[[:space:]]*#\[/) next
+            print; exit
+        }' "$1"
+}
+# Bins that provably never touch TLS (each with its reason); nothing else may be exempted.
+#   wal_craft: local test tool, postgres::NoTls only.
+#   compaction-simulator: pure in-memory simulation, no network.
+#   test_helper_slow_client_reads: test helper, plain tokio-postgres NoTls to a local pageserver.
+tls_free_bins=" wal_craft compaction-simulator test_helper_slow_client_reads "
+bins_listing="$(cd "$repo_root" && cargo metadata --no-deps --format-version 1 2>/dev/null |
+    jq -r '.packages[].targets[] | select(.kind | index("bin")) | "\(.name) \(.src_path)"')"
+expect "cargo metadata lists the workspace's bin targets" "yes" "$([[ "$(wc -l <<<"$bins_listing")" -ge 17 ]] && echo yes || echo no)"
+no_provider=""
+while read -r bin_name bin_src; do
+    [[ -n "$bin_name" ]] || continue
+    [[ "$tls_free_bins" == *" $bin_name "* ]] && continue
+    stmt="$(first_statement "$bin_src" 'fn main\(')"
+    if [[ "$stmt" =~ proxy::binary::([a-z_]+)::run\( ]]; then
+        stmt="$(first_statement "$repo_root/proxy/src/binary/${BASH_REMATCH[1]}.rs" 'fn run\(')"
+    fi
+    [[ "$stmt" == *install_default_crypto_provider* ]] || no_provider+=" $bin_name"
+done <<<"$bins_listing"
+expect "every bin target installs the crypto provider first in main (offenders listed)" "" "$no_provider"
+
 if ((failures > 0)); then
     echo "$failures check(s) failed"
     exit 1
