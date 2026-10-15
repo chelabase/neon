@@ -287,6 +287,199 @@ for v in v14 v15 v16; do
 done
 expect "revisions.json pins the v17 submodule" "$(git -C "$root" rev-parse HEAD:vendor/postgres-v17)" "$(jq -r '.v17[1]' "$root/vendor/revisions.json")"
 
+# F1 (round 3 final fix round): pg-check command construction, diff handling and the
+# neon_rmgr preload for chelabase_keys, all testable without Docker.
+# Pinned helpers (ci-local.sh): pg_check_diffs_file <dir>, pg_check_clean_diffs <dir>,
+# pg_check_print_diffs <dir>, pg_check_make_args <dir> <jobs>, pg_check_temp_config_content,
+# pg_check_build_targets <pg>, pg_check_require_rmgr <pg_install_dir>, lint_hakari.
+for fn in pg_check_diffs_file pg_check_clean_diffs pg_check_print_diffs pg_check_make_args \
+    pg_check_temp_config_content pg_check_build_targets pg_check_require_rmgr lint_hakari; do
+    if declare -F "$fn" >/dev/null; then
+        echo "ok: $fn is defined"
+    else
+        echo "FAIL: $fn is not defined in ci-local.sh"
+        failures=$((failures + 1))
+    fi
+done
+
+# Core's diffs are written where pg_regress runs: build/<pg>/src/test/regress; contrib's in its own dir.
+expect "core diffs file" "build/v17/src/test/regress/regression.diffs" "$(pg_check_diffs_file build/v17 2>/dev/null)"
+expect "contrib diffs file" "build/v17/contrib/chelabase_keys/regression.diffs" "$(pg_check_diffs_file build/v17/contrib/chelabase_keys 2>/dev/null)"
+expect "v16 core diffs file" "build/v16/src/test/regress/regression.diffs" "$(pg_check_diffs_file build/v16 2>/dev/null)"
+
+pgc="$(mktemp -d)"
+core_d="$pgc/build/v17"
+contrib_d="$pgc/build/v17/contrib/chelabase_keys"
+mkdir -p "$core_d/src/test/regress" "$contrib_d"
+seed_diffs() {
+    printf 'CORE-DIFF\n' >"$core_d/src/test/regress/regression.diffs"
+    printf 'CONTRIB-DIFF\n' >"$contrib_d/regression.diffs"
+}
+
+# Core failing, contrib passing (no contrib diffs): only core's diffs under the core heading.
+seed_diffs
+rm -f "$contrib_d/regression.diffs"
+out="$(pg_check_print_diffs "$core_d" 2>/dev/null)"
+if [[ "$out" == *CORE-DIFF* && "$out" != *CONTRIB-DIFF* ]]; then
+    echo "ok: core heading prints core's diffs only"
+else
+    echo "FAIL: core heading must print only core's diffs, got [$out]"
+    failures=$((failures + 1))
+fi
+# Core passing, contrib failing: the core heading prints nothing (contrib's diffs are not core's).
+seed_diffs
+rm -f "$core_d/src/test/regress/regression.diffs"
+out="$(pg_check_print_diffs "$core_d" 2>/dev/null)"
+if [[ "$out" != *CONTRIB-DIFF* ]]; then
+    echo "ok: contrib's diffs never appear under the core heading"
+else
+    echo "FAIL: contrib's diffs appeared under the core heading: [$out]"
+    failures=$((failures + 1))
+fi
+out="$(pg_check_print_diffs "$contrib_d" 2>/dev/null)"
+if [[ "$out" == *CONTRIB-DIFF* && "$out" != *CORE-DIFF* ]]; then
+    echo "ok: contrib heading prints contrib's diffs only"
+else
+    echo "FAIL: contrib heading must print only contrib's diffs, got [$out]"
+    failures=$((failures + 1))
+fi
+# No diffs file: nothing printed and no error.
+rm -f "$contrib_d/regression.diffs"
+if out="$(pg_check_print_diffs "$contrib_d" 2>&1)" && [[ -z "$out" ]]; then
+    echo "ok: no diffs file prints nothing"
+else
+    echo "FAIL: a missing diffs file must print nothing and succeed, got [$out]"
+    failures=$((failures + 1))
+fi
+
+# A stale regression.diffs from an earlier run is removed before the next make check, and
+# cleaning one directory leaves the other's file alone.
+seed_diffs
+pg_check_clean_diffs "$core_d" 2>/dev/null
+if [[ ! -e "$core_d/src/test/regress/regression.diffs" && -e "$contrib_d/regression.diffs" ]]; then
+    echo "ok: cleaning core removes core's stale diffs only"
+else
+    echo "FAIL: cleaning core must remove core's diffs and keep contrib's"
+    failures=$((failures + 1))
+fi
+seed_diffs
+pg_check_clean_diffs "$contrib_d" 2>/dev/null
+if [[ ! -e "$contrib_d/regression.diffs" && -e "$core_d/src/test/regress/regression.diffs" ]]; then
+    echo "ok: cleaning contrib removes contrib's stale diffs only"
+else
+    echo "FAIL: cleaning contrib must remove contrib's diffs and keep core's"
+    failures=$((failures + 1))
+fi
+# Cleaning a directory with nothing to clean is not an error.
+if pg_check_clean_diffs "$pgc/build/v99" 2>/dev/null; then
+    echo "ok: cleaning a directory with no diffs succeeds"
+else
+    echo "FAIL: cleaning a directory with no diffs must succeed"
+    failures=$((failures + 1))
+fi
+rm -rf "$pgc"
+
+# make arguments: parallel (-j<jobs>), the right directory; TEMP_CONFIG only for chelabase_keys.
+core_args="$(pg_check_make_args build/v17 4 2>/dev/null | paste -sd' ' -)"
+contrib_args="$(pg_check_make_args build/v17/contrib/chelabase_keys 4 2>/dev/null | paste -sd' ' -)"
+v16_args="$(pg_check_make_args build/v16 4 2>/dev/null | paste -sd' ' -)"
+expect "core make args: no TEMP_CONFIG" "-j4 -C build/v17 check" "$core_args"
+expect "v16 make args: no TEMP_CONFIG" "-j4 -C build/v16 check" "$v16_args"
+if [[ "$contrib_args" == "-j4 -C build/v17/contrib/chelabase_keys check TEMP_CONFIG="?* ]]; then
+    echo "ok: chelabase_keys make args carry TEMP_CONFIG"
+else
+    echo "FAIL: chelabase_keys make args must be '-j4 -C <dir> check TEMP_CONFIG=<file>', got [$contrib_args]"
+    failures=$((failures + 1))
+fi
+expect "jobs value is passed through" "-j1 -C build/v17 check" "$(pg_check_make_args build/v17 1 2>/dev/null | paste -sd' ' -)"
+
+# The TEMP_CONFIG preloads neon_rmgr (heap DML logs under RM_NEON_ID) and finds it in the
+# container's pg_install (the volume's /work/pg_install/v17/lib/postgresql).
+conf="$(pg_check_temp_config_content 2>/dev/null)"
+if grep -qxF "shared_preload_libraries = 'neon_rmgr'" <<<"$conf"; then
+    echo "ok: temp config preloads neon_rmgr"
+else
+    echo "FAIL: temp config must contain shared_preload_libraries = 'neon_rmgr', got [$conf]"
+    failures=$((failures + 1))
+fi
+if grep -qxF "dynamic_library_path = '\$libdir:/work/pg_install/v17/lib/postgresql'" <<<"$conf"; then
+    echo "ok: temp config finds neon_rmgr in pg_install"
+else
+    echo "FAIL: temp config must contain dynamic_library_path = '\$libdir:/work/pg_install/v17/lib/postgresql', got [$conf]"
+    failures=$((failures + 1))
+fi
+
+# pg-check needs the neon extensions built for v17 (not for other majors), alongside Postgres.
+expect "pg-check build targets for v17" "postgres-v17 neon-pg-ext-v17" "$(pg_check_build_targets v17 2>/dev/null | paste -sd' ' -)"
+expect "pg-check build targets for v16" "postgres-v16" "$(pg_check_build_targets v16 2>/dev/null | paste -sd' ' -)"
+
+# A pg_install without neon_rmgr.so fails with a clear message, not a Postgres startup error.
+inst="$(mktemp -d)"
+mkdir -p "$inst/lib/postgresql"
+if msg="$(pg_check_require_rmgr "$inst" 2>&1)"; then
+    echo "FAIL: pg_check_require_rmgr must fail without neon_rmgr.so"
+    failures=$((failures + 1))
+elif [[ "$msg" == *neon_rmgr* && "$msg" == *build* ]]; then
+    echo "ok: a missing neon_rmgr.so is reported clearly"
+else
+    echo "FAIL: the message must name neon_rmgr and the build step, got [$msg]"
+    failures=$((failures + 1))
+fi
+: >"$inst/lib/postgresql/neon_rmgr.so"
+if pg_check_require_rmgr "$inst" >/dev/null 2>&1; then
+    echo "ok: an installed neon_rmgr.so passes"
+else
+    echo "FAIL: pg_check_require_rmgr must pass when neon_rmgr.so is installed"
+    failures=$((failures + 1))
+fi
+rm -rf "$inst"
+
+# T0b m2: the lint step verifies workspace_hack (hakari) is up to date and consistent.
+hk="$(declare -f lint_hakari 2>/dev/null)"
+if [[ "$hk" == *"cargo hakari generate --diff"* && "$hk" == *"cargo hakari verify"* ]]; then
+    echo "ok: lint_hakari runs generate --diff and verify"
+else
+    echo "FAIL: lint_hakari must run 'cargo hakari generate --diff' and 'cargo hakari verify'"
+    failures=$((failures + 1))
+fi
+if [[ "$(declare -f step_lint)" == *lint_hakari* ]]; then
+    echo "ok: the lint step runs lint_hakari"
+else
+    echo "FAIL: step_lint must run lint_hakari"
+    failures=$((failures + 1))
+fi
+# The pg-check step uses the helpers (no hand-built make line, no unbounded find).
+pgstep="$(declare -f step_pg_check)"
+for want in pg_check_make_args pg_check_clean_diffs pg_check_print_diffs pg_check_build_targets pg_check_require_rmgr; do
+    if [[ "$pgstep" == *"$want"* ]]; then
+        echo "ok: step_pg_check uses $want"
+    else
+        echo "FAIL: step_pg_check must use $want"
+        failures=$((failures + 1))
+    fi
+done
+if [[ "$pgstep" != *"find "* ]]; then
+    echo "ok: step_pg_check no longer searches for regression.diffs"
+else
+    echo "FAIL: step_pg_check must not use find for regression.diffs"
+    failures=$((failures + 1))
+fi
+
+# T0b C1: with both rustls crypto providers compiled in, a provider-less
+# ServerConfig::builder() / ClientConfig::builder() panics at runtime. Every source file that
+# uses one must install the process default (http_utils::tls_certs::install_default_crypto_provider);
+# the *_with_provider builders are fine. (Workspace crates only; vendor/ and target/ are not ours to scan here.)
+bare_builders="$(grep -rlE '(Server|Client)Config::builder\(\)' --include='*.rs' \
+    "$repo_root/pageserver" "$repo_root/safekeeper" "$repo_root/storage_controller" \
+    "$repo_root/storage_broker" "$repo_root/storage_scrubber" "$repo_root/proxy" \
+    "$repo_root/compute_tools" "$repo_root/control_plane" "$repo_root/endpoint_storage" \
+    "$repo_root/libs" 2>/dev/null | grep -v '/tests/tls_provider_startup.rs$' | sort)"
+bare_missing=""
+for f in $bare_builders; do
+    grep -q 'install_default_crypto_provider' "$f" || bare_missing+=" ${f#"$repo_root"/}"
+done
+expect "every file with a provider-less rustls builder installs the default provider" "" "$bare_missing"
+
 if ((failures > 0)); then
     echo "$failures check(s) failed"
     exit 1
