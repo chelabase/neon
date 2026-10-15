@@ -666,6 +666,9 @@ struct RemoteAddr(SocketAddr);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Before any TLS use: rustls has no implicit default with two providers compiled in.
+    http_utils::tls_certs::install_default_crypto_provider();
+
     let args = Args::parse();
 
     // important to keep the order of:

@@ -76,6 +76,9 @@ fn cli() -> clap::Command {
 }
 
 pub async fn run() -> anyhow::Result<()> {
+    // Before any TLS use: rustls has no implicit default with two providers compiled in.
+    http_utils::tls_certs::install_default_crypto_provider();
+
     let _logging_guard = crate::logging::init()?;
     let _panic_hook_guard = utils::logging::replace_panic_hook_with_tracing_panic_hook();
     let _sentry_guard = init_sentry(Some(GIT_VERSION.into()), &[]);

@@ -26,6 +26,7 @@ use aws_smithy_async::rt::sleep::TokioSleep;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
 use aws_smithy_types::date_time::ConversionError;
+use aws_smithy_types::timeout::TimeoutConfig;
 use bytes::Bytes;
 use futures::stream::Stream;
 use futures_util::StreamExt;
@@ -58,6 +59,25 @@ pub struct S3Bucket {
     concurrency_limiter: ConcurrencyLimiter,
     // Per-request timeout. Accessible for tests.
     pub timeout: Duration,
+}
+
+/// Connect timeout for S3 clients. Behavior version 2026-01-12 defaults it to 3.1 s, too short
+/// for S3-compatible stores on slow links.
+pub const S3_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The timeout config for an S3 client: `base` with [`S3_CONNECT_TIMEOUT`] as its connect
+/// timeout when `base` has none. A connect timeout `base` carries (the caller's choice) and
+/// every other timeout of `base` are kept, since setting a timeout config on an SDK config
+/// builder replaces the whole config.
+///
+/// Pass it to `aws_config::defaults(..).timeout_config(..)` before `load()`: the loader fills
+/// only the unset fields from the SDK's defaults, so the 10 s then wins over their 3.1 s.
+pub fn s3_timeout_config(base: Option<&TimeoutConfig>) -> TimeoutConfig {
+    let builder = base.map(TimeoutConfig::to_builder).unwrap_or_default();
+    match base.and_then(TimeoutConfig::connect_timeout) {
+        Some(_) => builder.build(),
+        None => builder.connect_timeout(S3_CONNECT_TIMEOUT).build(),
+    }
 }
 
 struct GetObjectRequest {
@@ -96,13 +116,17 @@ impl S3Bucket {
 
         // The current behavior version (the older ones are deprecated). Where it changed a
         // default this code relies on, the old behavior is set explicitly below (retries,
-        // stalled-stream protection).
+        // stalled-stream protection, and the connect timeout: its 3.1 s default is raised to
+        // 10 s for S3-compatible stores on slow links, see [`s3_timeout_config`]).
         let sdk_config_loader: aws_config::ConfigLoader =
             aws_config::defaults(BehaviorVersion::v2026_01_12())
                 .region(region_opt)
                 .identity_cache(IdentityCache::lazy().build())
                 .credentials_provider(credentials_provider)
-                .sleep_impl(SharedAsyncSleep::from(sleep_impl));
+                .sleep_impl(SharedAsyncSleep::from(sleep_impl))
+                // Set before loading: the loader fills only unset fields from the SDK's
+                // defaults (3.1 s connect), and the S3 client below inherits this config.
+                .timeout_config(s3_timeout_config(None));
 
         let sdk_config: aws_config::SdkConfig = std::thread::scope(|s| {
             s.spawn(|| {
@@ -177,6 +201,11 @@ impl S3Bucket {
             upload_storage_class: remote_storage_config.upload_storage_class.clone(),
             timeout,
         })
+    }
+
+    /// The timeout config the S3 client was built with.
+    pub fn client_timeout_config(&self) -> Option<TimeoutConfig> {
+        self.client.config().timeout_config().cloned()
     }
 
     fn s3_object_to_relative_path(&self, key: &str) -> RemotePath {

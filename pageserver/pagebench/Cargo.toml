@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+http-utils.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 camino.workspace = true

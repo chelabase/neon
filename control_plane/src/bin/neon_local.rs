@@ -746,6 +746,9 @@ impl RepoLock {
 //   * Providing CLI api to the pageserver
 //   * TODO: export/import to/from usual postgres
 fn main() -> Result<()> {
+    // Before any TLS use: rustls has no implicit default with two providers compiled in.
+    http_utils::tls_certs::install_default_crypto_provider();
+
     let cli = Cli::parse();
 
     // Check for 'neon init' command first.

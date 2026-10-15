@@ -74,6 +74,9 @@ fn version() -> String {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Before any TLS use: rustls has no implicit default with two providers compiled in.
+    http_utils::tls_certs::install_default_crypto_provider();
+
     let launch_ts = Box::leak(Box::new(LaunchTimestamp::generate()));
 
     let arg_matches = cli().get_matches();

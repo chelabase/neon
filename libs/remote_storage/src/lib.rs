@@ -51,7 +51,7 @@ use tracing::info;
 pub use self::azure_blob::AzureBlobStorage;
 pub use self::gcs_bucket::GCSBucket;
 pub use self::local_fs::LocalFs;
-pub use self::s3_bucket::S3Bucket;
+pub use self::s3_bucket::{S3_CONNECT_TIMEOUT, S3Bucket, s3_timeout_config};
 pub use self::simulate_failures::UnreliableWrapper;
 pub use crate::config::{AzureConfig, GCSConfig, RemoteStorageConfig, RemoteStorageKind, S3Config};
 

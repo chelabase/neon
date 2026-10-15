@@ -191,6 +191,9 @@ fn get_internal_http_port(cli: &Cli) -> u16 {
 }
 
 fn main() -> Result<()> {
+    // Before any TLS use: rustls has no implicit default with two providers compiled in.
+    http_utils::tls_certs::install_default_crypto_provider();
+
     let cli = Cli::parse();
 
     let scenario = failpoint_support::init();
