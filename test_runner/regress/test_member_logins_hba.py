@@ -95,7 +95,7 @@ def certs(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def setup(pg: VanillaPostgres, certs: Path, cidr: str):
+def setup_hba(pg: VanillaPostgres, certs: Path, cidr: str):
     pg.configure(
         [
             "ssl = on",
@@ -132,7 +132,7 @@ def member(pg: VanillaPostgres, certs: Path, cert: str | None, **kw):
 def test_member_logins_need_the_certificate_and_the_address(
     vanilla_pg: VanillaPostgres, certs: Path
 ):
-    setup(vanilla_pg, certs, "127.0.0.1/32")
+    setup_hba(vanilla_pg, certs, "127.0.0.1/32")
     vanilla_pg.start()
     vanilla_pg.safe_psql(f"CREATE ROLE {MEMBER} LOGIN PASSWORD 'pw'")
     vanilla_pg.safe_psql("CREATE ROLE plain LOGIN PASSWORD 'pw'")
@@ -169,7 +169,7 @@ def test_member_logins_need_the_certificate_and_the_address(
 
 @run_only_on_postgres([PgVersion.V17], "the hba map change is v17 only")
 def test_an_empty_list_is_no_address_rule(vanilla_pg: VanillaPostgres, certs: Path):
-    setup(vanilla_pg, certs, "all")
+    setup_hba(vanilla_pg, certs, "all")
     vanilla_pg.start()
     vanilla_pg.safe_psql(f"CREATE ROLE {MEMBER} LOGIN PASSWORD 'pw'")
     assert member(vanilla_pg, certs, "orchestrator") == MEMBER
@@ -177,17 +177,15 @@ def test_an_empty_list_is_no_address_rule(vanilla_pg: VanillaPostgres, certs: Pa
 
 @run_only_on_postgres([PgVersion.V17], "the hba map change is v17 only")
 def test_map_without_verify_full_stays_refused(vanilla_pg: VanillaPostgres, certs: Path):
-    setup(vanilla_pg, certs, "127.0.0.1/32")
+    setup_hba(vanilla_pg, certs, "127.0.0.1/32")
     vanilla_pg.start()
     with open(vanilla_pg.pgdatadir / "pg_hba.conf", "a") as f:
         f.write("hostssl\tall\tbad_map\t127.0.0.1/32\tscram-sha-256\tmap=chelabase_member\n")
         f.write(
             "hostssl\tall\tgood_map\t127.0.0.1/32\tscram-sha-256\tmap=chelabase_member\tclientcert=verify-full\n"
         )
-    rows = dict(
-        vanilla_pg.safe_psql(
-            "SELECT user_name[1], coalesce(error, '') FROM pg_hba_file_rules WHERE user_name[1] IN ('bad_map', 'good_map')"
-        )
+    rows = vanilla_pg.safe_psql(
+        "SELECT coalesce(user_name[1], ''), coalesce(error, '') FROM pg_hba_file_rules ORDER BY line_number DESC LIMIT 2"
     )
-    assert 'authentication option "map" is only valid' in rows["bad_map"]
-    assert rows["good_map"] == ""
+    assert rows[0] == ("good_map", ""), rows
+    assert rows[1][0] == "" and 'authentication option "map" is only valid' in rows[1][1], rows
