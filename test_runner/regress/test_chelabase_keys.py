@@ -21,9 +21,11 @@ RT = "chelabase_realtime"
 def rt_dsn(node: PgProtocol, **kw: Any) -> str:
     """chelabase_realtime's connection string. PgProtocol.conn_options adds
     `options=-cstatement_timeout=120s` to every connection, a setting the role may not send
-    (T3 m1), so this one is built from the node's defaults without it."""
-    opts = {**node.default_options, "user": RT, **kw}
+    (T3 m1), so this one is built from the node's defaults without their options; options
+    the caller passes are sent."""
+    opts = {**node.default_options, "user": RT}
     opts.pop("options", None)
+    opts.update(kw)
     return str(make_dsn(**{k: v for k, v in opts.items() if v is not None}))
 
 

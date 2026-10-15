@@ -74,9 +74,11 @@ def pg(vpg: VanillaPostgres) -> VanillaPostgres:
 def rt_dsn(node: PgProtocol, **kw: Any) -> str:
     """chelabase_realtime's connection string. PgProtocol.conn_options adds
     `options=-cstatement_timeout=120s` to every connection, a setting the role may not send
-    (T3 m1), so this one is built from the node's defaults without it."""
-    opts = {**node.default_options, "user": RT, **kw}
+    (T3 m1), so this one is built from the node's defaults without their options; options
+    the caller passes are sent."""
+    opts = {**node.default_options, "user": RT}
     opts.pop("options", None)
+    opts.update(kw)
     return str(make_dsn(**{k: v for k, v in opts.items() if v is not None}))
 
 
@@ -610,24 +612,34 @@ def test_feedback_still_reaches_a_physical_slot_and_a_slotless_walsender(pg: Van
     ) == [(str(xid),)]
 
 
-# ---- T3 I2 / U7: only the walproposer is a synchronous standby ----
+# ---- T3 I2 / U7, U7b: on a compute only the walproposer is a synchronous standby ----
+#
+# U7b: the restriction holds only where the neon walproposer runs in the server: the neon
+# extension sets the core global `chelabase_walproposer_active` (replication/chelabase.h) in
+# the postmaster when it registers the walproposer background worker, and every backend
+# inherits it. It is no GUC, so no session can change it. Without it (plain Postgres),
+# synchronous replication is stock.
+
+WALPROPOSER_FLAG = "chelabase_walproposer_active"
 
 
 @pytest.mark.parametrize(
-    "ssn, name",
+    "ssn, name, state",
     [
-        ("*", "walproposer"),
-        ("*", "rt-worker"),
-        ("FIRST 1 (walproposer)", "walproposer"),
-        ("ANY 1 (x)", "x"),
-        ("walproposer", "WalProposer"),
+        ("*", "walproposer", "sync"),
+        ("*", "rt-worker", "sync"),
+        ("FIRST 1 (walproposer)", "walproposer", "sync"),
+        ("ANY 1 (x)", "x", "quorum"),
+        ("walproposer", "WalProposer", "sync"),
     ],
     ids=["star-walproposer", "star-other", "first-walproposer", "any-x", "name-case"],
 )
-def test_client_walsenders_are_never_synchronous(vpg: VanillaPostgres, ssn: str, name: str):
-    """Sync priority comes from the process (the in-process walproposer), never from the
-    application_name a client sends: every client walsender is async, even one that reports
-    flush positions as a standby does."""
+def test_without_a_walproposer_sync_replication_is_stock(
+    vpg: VanillaPostgres, ssn: str, name: str, state: str
+):
+    """U7b: plain Postgres (no walproposer registered): a client walsender named in
+    synchronous_standby_names that reports flush positions becomes a synchronous standby
+    (each client here is the only one connected), whatever its kind or role."""
     pg = prepare(vpg, [f"synchronous_standby_names = '{ssn}'", "synchronous_commit = local"])
     flush = pg.safe_psql("SELECT pg_current_wal_flush_lsn()::text")[0][0]
     clients: list[tuple[str, str, dict[str, str], str | None, str]] = [
@@ -664,15 +676,29 @@ def test_client_walsenders_are_never_synchronous(vpg: VanillaPostgres, ssn: str,
         assert len(rows) == 1, (user, kind, rows)
         seen.append((user, kind, *rows[0]))
         s.close()
-    assert seen == [(user, kind, 0, "async") for user, kind, *_ in clients]
+    assert seen == [(user, kind, 1, state) for user, kind, *_ in clients]
+
+
+def test_the_walproposer_flag_is_no_setting(pg: VanillaPostgres):
+    """U7b: no session can see or flip the flag: there is no such parameter, not through
+    SQL, not in a startup packet."""
+    for sql in [f"SHOW {WALPROPOSER_FLAG}", f"SET {WALPROPOSER_FLAG} = on"]:
+        with pytest.raises(psycopg2.errors.UndefinedObject):
+            pg.safe_psql(sql)
+    with pytest.raises(RawError) as e:
+        Raw(pg, {**walsender_params(pg, "repl"), WALPROPOSER_FLAG: "on"})
+    assert e.value.message == f'unrecognized configuration parameter "{WALPROPOSER_FLAG}"', e.value
 
 
 def test_the_walproposer_stays_the_synchronous_standby(neon_env: NeonEnv):
     """On a compute (synchronous_standby_names = 'walproposer'), a client walsender that
     names itself walproposer and reports flush positions stays async; the walproposer
-    stays the synchronous standby."""
+    stays the synchronous standby. No session can turn the restriction off."""
     endpoint = neon_env.endpoints.create_start("main")
     endpoint.safe_psql("CREATE TABLE w (id int)")
+    for sql in [f"SHOW {WALPROPOSER_FLAG}", f"SET {WALPROPOSER_FLAG} = off"]:
+        with pytest.raises(psycopg2.errors.UndefinedObject):
+            endpoint.safe_psql(sql)
     s = Raw(
         endpoint,
         {
@@ -709,7 +735,10 @@ def test_the_walproposer_stays_the_synchronous_standby(neon_env: NeonEnv):
 # confirmed position: whatever it sends (startup parameters, replication commands, SQL,
 # status updates, hot-standby feedback, unknown or truncated messages, CopyDone,
 # Terminate), every other slot is unchanged, its own slot never gets an xmin, its
-# catalog_xmin moves only with a confirmation, and it is never a synchronous standby.
+# catalog_xmin moves only with a confirmation, and disallowed startup parameters are
+# refused. Synchronous replication is the one exception, by design (U7b): this server runs
+# no walproposer, so a realtime walsender named in synchronous_standby_names is a stock
+# synchronous standby here (on a compute it never is: the walproposer test above).
 
 OWN = "rt_inv"
 SLOT_COLUMNS = [
@@ -743,6 +772,8 @@ class Act:
     refused: bool = False
     confirms: bool = False
     leaves_copy: bool = False
+    # (sync_priority, sync_state) after a confirmation; None: never a candidate
+    sync: tuple[int, str] | None = None
 
 
 def data(build: Callable[[int, int, int], bytes]) -> Message:
@@ -750,7 +781,10 @@ def data(build: Callable[[int, int, int], bytes]) -> Message:
 
 
 ACTIONS = [
-    pytest.param(Act(startup={"application_name": "walproposer"}), id="startup-walproposer"),
+    pytest.param(
+        Act(startup={"application_name": "walproposer"}, sync=(1, "sync")),
+        id="startup-walproposer",
+    ),
     pytest.param(Act(startup={"application_name": "rt-worker"}), id="startup-application_name"),
     pytest.param(Act(startup={"client_encoding": "UTF8"}), id="startup-client_encoding"),
     *[
@@ -918,4 +952,7 @@ def test_realtime_changes_nothing_beyond_its_own_slot_position(vpg: VanillaPostg
         after = server_state(pg)
     assert outcome == ("refused" if action.refused else "allowed")
     assert beyond_own_position(before, after, action.confirms) == []
-    assert all(p[0] == 0 for p in priorities), priorities
+    if action.sync is None:
+        assert all(p[0] == 0 for p in priorities), priorities
+    else:
+        assert [tuple(p) for p in priorities] == [action.sync]
