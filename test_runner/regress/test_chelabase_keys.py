@@ -53,7 +53,12 @@ def test_keys_over_replication_and_restart(neon_simple_env: NeonEnv):
     )
     endpoint.stop()
     endpoint.start()
-    assert endpoint.safe_psql("SELECT count(*) FROM pg_replication_slots")[0][0] == 0
+    assert (
+        endpoint.safe_psql("SELECT count(*) FROM pg_replication_slots WHERE slot_type = 'logical'")[
+            0
+        ][0]
+        == 0
+    )
     try:
         cur.read_message()
         conn.poll()
