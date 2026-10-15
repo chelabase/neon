@@ -139,7 +139,7 @@ impl NeonControlPlaneClient {
                     .endpoint
                     .get_path("get_endpoint_access_control")
                     .header(X_REQUEST_ID, ctx.session_id().to_string())
-                    .header(AUTHORIZATION, format!("Bearer {}", &self.jwt))
+                    .header(AUTHORIZATION, format!("Bearer {}", self.jwt))
                     .query(&[("session_id", ctx.session_id())])
                     .query(&[
                         ("application_name", ctx.console_application_name().as_str()),
@@ -230,7 +230,7 @@ impl NeonControlPlaneClient {
                         .push("jwks");
                 })
                 .header(X_REQUEST_ID, &request_id)
-                .header(AUTHORIZATION, format!("Bearer {}", &self.jwt))
+                .header(AUTHORIZATION, format!("Bearer {}", self.jwt))
                 .query(&[("session_id", ctx.session_id())])
                 .build()
                 .map_err(GetEndpointJwksError::RequestBuild)?;
@@ -281,7 +281,7 @@ impl NeonControlPlaneClient {
                 .endpoint
                 .get_path("wake_compute")
                 .header("X-Request-ID", &request_id)
-                .header("Authorization", format!("Bearer {}", &self.jwt))
+                .header("Authorization", format!("Bearer {}", self.jwt))
                 .query(&[("session_id", ctx.session_id())])
                 .query(&[
                     ("application_name", application_name.as_str()),

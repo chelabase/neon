@@ -10,7 +10,7 @@ use num_traits::Num;
 use pageserver_api::shard::TenantShardId;
 use tokio_epoll_uring::{BoundedBuf, Slice};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info_span};
+use tracing::info_span;
 use utils::id::TimelineId;
 use utils::sync::gate::GateGuard;
 

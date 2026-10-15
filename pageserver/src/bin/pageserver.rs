@@ -454,7 +454,7 @@ fn start_pageserver(
         .with_context(|| {
             format!(
                 "create broker client for uri={:?} keepalive_interval={:?}",
-                &conf.broker_endpoint, conf.broker_keepalive_interval,
+                conf.broker_endpoint, conf.broker_keepalive_interval,
             )
         })?;
 

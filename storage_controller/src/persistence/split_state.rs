@@ -7,16 +7,11 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, FromSqlRow, AsExpression)]
 #[diesel(sql_type = SplitStateSQLRepr)]
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Default)]
 pub enum SplitState {
+    #[default]
     Idle = 0,
     Splitting = 1,
-}
-
-impl Default for SplitState {
-    fn default() -> Self {
-        Self::Idle
-    }
 }
 
 type SplitStateSQLRepr = Int2;

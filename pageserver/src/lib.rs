@@ -148,8 +148,8 @@ pub async fn shutdown_pageserver(
             // shut down yet, it's quite likely that we're not going
             // to get Poll::Pending once.
             let mut futs: FuturesUnordered<_> = managers
-                .into_iter()
-                .filter_map(|(_, mgr)| mgr.upgrade())
+                .into_values()
+                .filter_map(|mgr| mgr.upgrade())
                 .map(|mgr| async move { tokio::task::unconstrained(mgr.shutdown()).await })
                 .collect();
             info!(count=%futs.len(), "built FuturesUnordered");

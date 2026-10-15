@@ -848,7 +848,7 @@ async fn collect_eviction_candidates(
                 "timeline resident layers count: {}", info.resident_layers.len()
             );
 
-            tenant_candidates.extend(info.resident_layers.into_iter());
+            tenant_candidates.extend(info.resident_layers);
             max_layer_size = max_layer_size.max(info.max_layer_size.unwrap_or(0));
 
             if cancel.is_cancelled() {
@@ -866,7 +866,7 @@ async fn collect_eviction_candidates(
                 "timeline resident layers count: {}", info.resident_layers.len()
             );
 
-            tenant_candidates.extend(info.resident_layers.into_iter());
+            tenant_candidates.extend(info.resident_layers);
             max_layer_size = max_layer_size.max(info.max_layer_size.unwrap_or(0));
 
             if cancel.is_cancelled() {

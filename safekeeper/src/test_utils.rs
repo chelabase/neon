@@ -168,10 +168,10 @@ impl Env {
             let msg = ProposerAcceptorMessage::AppendRequest(req);
             msg_tx.send(msg).await?;
             while let Some(reply) = reply_rx.recv().await {
-                if let AcceptorProposerMessage::AppendResponse(resp) = reply {
-                    if resp.flush_lsn >= end_lsn {
-                        break;
-                    }
+                if let AcceptorProposerMessage::AppendResponse(resp) = reply
+                    && resp.flush_lsn >= end_lsn
+                {
+                    break;
                 }
             }
         }

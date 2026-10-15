@@ -1,17 +1,12 @@
 use desim::proto::SimEvent;
 use tracing::debug;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 enum NodeKind {
+    #[default]
     Unknown,
     Safekeeper,
     WalProposer,
-}
-
-impl Default for NodeKind {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 /// Simulation state of walproposer/safekeeper, derived from the simulation logs.

@@ -148,7 +148,7 @@ impl Slot {
     fn inc_usage_count(&self) {
         let _ = self
             .usage_count
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
                 if val == MAX_USAGE_COUNT {
                     None
                 } else {
@@ -160,11 +160,11 @@ impl Slot {
     /// Decrement usage count on the buffer, unless it's already zero.  Returns
     /// the old usage count.
     fn dec_usage_count(&self) -> u8 {
-        let count_res =
-            self.usage_count
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
-                    if val == 0 { None } else { Some(val - 1) }
-                });
+        let count_res = self
+            .usage_count
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
+                if val == 0 { None } else { Some(val - 1) }
+            });
 
         match count_res {
             Ok(usage_count) => usage_count,
@@ -324,7 +324,7 @@ impl PageCache {
         file_id: FileId,
         blkno: u32,
         ctx: &RequestContext,
-    ) -> anyhow::Result<ReadBufResult> {
+    ) -> anyhow::Result<ReadBufResult<'_>> {
         self.lock_for_read(&(CacheKey::ImmutableFilePage { file_id, blkno }), ctx)
             .await
     }
@@ -364,7 +364,7 @@ impl PageCache {
         &self,
         cache_key: &CacheKey,
         permit: &mut Option<PinnedSlotsPermit>,
-    ) -> Option<PageReadGuard> {
+    ) -> Option<PageReadGuard<'_>> {
         if let Some(slot_idx) = self.search_mapping(cache_key) {
             // The page was found in the mapping. Lock the slot, and re-check
             // that it's still what we expected (because we released the mapping
@@ -415,7 +415,7 @@ impl PageCache {
         &self,
         cache_key: &CacheKey,
         ctx: &RequestContext,
-    ) -> anyhow::Result<ReadBufResult> {
+    ) -> anyhow::Result<ReadBufResult<'_>> {
         let mut permit = Some(self.try_get_pinned_slot_permit().await?);
 
         let (read_access, hit) = match cache_key {
@@ -551,7 +551,7 @@ impl PageCache {
     async fn find_victim(
         &self,
         _permit_witness: &PinnedSlotsPermit,
-    ) -> anyhow::Result<(usize, tokio::sync::RwLockWriteGuard<SlotInner>)> {
+    ) -> anyhow::Result<(usize, tokio::sync::RwLockWriteGuard<'_, SlotInner>)> {
         let iter_limit = self.slots.len() * 10;
         let mut iters = 0;
         loop {
@@ -642,7 +642,9 @@ impl PageCache {
         size_metrics.current_bytes_immutable.set_page_sz(0);
 
         let slots = page_buffer
-            .chunks_exact_mut(PAGE_SZ)
+            .as_chunks_mut::<PAGE_SZ>()
+            .0
+            .iter_mut()
             .map(|chunk| {
                 // SAFETY: Each chunk has `PAGE_SZ` (8192) bytes, greater than 512, still aligned.
                 let buf = unsafe { IoPageSlice::new_unchecked(chunk.try_into().unwrap()) };

@@ -71,7 +71,7 @@ impl ScenarioBuilder {
 
     pub fn calculate(&mut self, retention_period: u64) -> (StorageModel, SizeResult) {
         // Phase 1: Mark all the segments that need to be retained
-        for (_branch, &last_seg_id) in self.branches.iter() {
+        for &last_seg_id in self.branches.values() {
             let last_seg = &self.segments[last_seg_id];
             let cutoff_lsn = last_seg.lsn.saturating_sub(retention_period);
             let mut seg_id = last_seg_id;

@@ -231,20 +231,16 @@ struct Cli {
     handle_ps_local_disk_loss: bool,
 }
 
+#[derive(Default)]
 enum StrictMode {
     /// In strict mode, we will require that all secrets are loaded, i.e. security features
     /// may not be implicitly turned off by omitting secrets in the environment.
+    #[default]
     Strict,
     /// In dev mode, secrets are optional, and omitting a particular secret will implicitly
     /// disable the auth related to it (e.g. no pageserver jwt key -> send unauthenticated
     /// requests, no public key -> don't authenticate incoming requests).
     Dev,
-}
-
-impl Default for StrictMode {
-    fn default() -> Self {
-        Self::Strict
-    }
 }
 
 /// Secrets may either be provided on the command line (for testing), or loaded from AWS SecretManager: this

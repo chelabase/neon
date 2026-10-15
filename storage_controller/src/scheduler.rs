@@ -342,16 +342,11 @@ impl std::ops::Add for AffinityScore {
 
 /// Hint for whether this is a sincere attempt to schedule, or a speculative
 /// check for where we _would_ schedule (done during optimization)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) enum ScheduleMode {
+    #[default]
     Normal,
     Speculative,
-}
-
-impl Default for ScheduleMode {
-    fn default() -> Self {
-        Self::Normal
-    }
 }
 
 // For carrying state between multiple calls to [`TenantShard::schedule`], e.g. when calling
@@ -386,10 +381,10 @@ impl ScheduleContext {
     pub(crate) fn project_detach(&self, shard: &TenantShard) -> Self {
         let mut new_context = self.clone();
 
-        if let Some(attached) = shard.intent.get_attached() {
-            if let Some(score) = new_context.nodes.get_mut(attached) {
-                score.dec();
-            }
+        if let Some(attached) = shard.intent.get_attached()
+            && let Some(score) = new_context.nodes.get_mut(attached)
+        {
+            score.dec();
         }
 
         for secondary in shard.intent.get_secondary() {

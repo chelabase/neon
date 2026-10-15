@@ -305,25 +305,23 @@ impl TryFrom<ComputeSpec> for ParsedSpec {
         // the pageserver connection info from the `pageserver_connstr` field instead, or
         // if that's missing too, from the GUC in the cluster.settings field.
         let mut pageserver_conninfo = spec.pageserver_connection_info.clone();
-        if pageserver_conninfo.is_none() {
-            if let Some(pageserver_connstr_field) = &spec.pageserver_connstring {
-                pageserver_conninfo = Some(PageserverConnectionInfo::from_connstr(
-                    pageserver_connstr_field,
-                    spec.shard_stripe_size,
-                )?);
-            }
+        if pageserver_conninfo.is_none()
+            && let Some(pageserver_connstr_field) = &spec.pageserver_connstring
+        {
+            pageserver_conninfo = Some(PageserverConnectionInfo::from_connstr(
+                pageserver_connstr_field,
+                spec.shard_stripe_size,
+            )?);
         }
-        if pageserver_conninfo.is_none() {
-            if let Some(guc) = spec.cluster.settings.find("neon.pageserver_connstring") {
-                let stripe_size = if let Some(guc) = spec.cluster.settings.find("neon.stripe_size")
-                {
-                    Some(ShardStripeSize(u32::from_str(&guc)?))
-                } else {
-                    None
-                };
-                pageserver_conninfo =
-                    Some(PageserverConnectionInfo::from_connstr(&guc, stripe_size)?);
-            }
+        if pageserver_conninfo.is_none()
+            && let Some(guc) = spec.cluster.settings.find("neon.pageserver_connstring")
+        {
+            let stripe_size = if let Some(guc) = spec.cluster.settings.find("neon.stripe_size") {
+                Some(ShardStripeSize(u32::from_str(&guc)?))
+            } else {
+                None
+            };
+            pageserver_conninfo = Some(PageserverConnectionInfo::from_connstr(&guc, stripe_size)?);
         }
         let pageserver_conninfo = pageserver_conninfo.ok_or(anyhow::anyhow!(
             "pageserver connection information should be provided"
@@ -2296,10 +2294,10 @@ LIMIT 100",
 
         if let Ok(raw_rows) = result {
             for message in raw_rows.iter() {
-                if let postgres::SimpleQueryMessage::Row(row) = message {
-                    if let Some(json) = row.get(0) {
-                        result_rows.push(json.to_string());
-                    }
+                if let postgres::SimpleQueryMessage::Row(row) = message
+                    && let Some(json) = row.get(0)
+                {
+                    result_rows.push(json.to_string());
                 }
             }
 
@@ -2727,21 +2725,21 @@ LIMIT 100",
 
     pub fn update_attached_metric(params: &ComputeNodeParams, state: &mut ComputeState) {
         // Update the pg_cctl_attached gauge when all identifiers are available.
-        if let Some(instance_id) = &params.instance_id {
-            if let Some(pspec) = &state.pspec {
-                // Clear all values in the metric
-                COMPUTE_ATTACHED.reset();
+        if let Some(instance_id) = &params.instance_id
+            && let Some(pspec) = &state.pspec
+        {
+            // Clear all values in the metric
+            COMPUTE_ATTACHED.reset();
 
-                // Set new metric value
-                COMPUTE_ATTACHED
-                    .with_label_values(&[
-                        &params.compute_id,
-                        instance_id,
-                        &pspec.tenant_id.to_string(),
-                        &pspec.timeline_id.to_string(),
-                    ])
-                    .set(1);
-            }
+            // Set new metric value
+            COMPUTE_ATTACHED
+                .with_label_values(&[
+                    &params.compute_id,
+                    instance_id,
+                    &pspec.tenant_id.to_string(),
+                    &pspec.timeline_id.to_string(),
+                ])
+                .set(1);
         }
     }
 }

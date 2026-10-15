@@ -449,7 +449,7 @@ impl AzureBlobStorage {
             stream.next().await.expect("At least one item required")?;
         while let Some(list) = stream.next().await {
             let list = list?;
-            combined.versions.extend(list.versions.into_iter());
+            combined.versions.extend(list.versions);
         }
         Ok(combined)
     }
@@ -821,10 +821,10 @@ impl RemoteStorage for AzureBlobStorage {
                         match res {
                             Ok(Ok(_v)) => Ok(()),
                             Ok(Err(azure_err)) => {
-                                if let Some(http_err) = azure_err.as_http_error() {
-                                    if http_err.status() == StatusCode::NotFound {
-                                        return Ok(());
-                                    }
+                                if let Some(http_err) = azure_err.as_http_error()
+                                    && http_err.status() == StatusCode::NotFound
+                                {
+                                    return Ok(());
                                 }
                                 Err(AzureOrTimeout::AzureError(azure_err))
                             }

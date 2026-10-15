@@ -431,29 +431,29 @@ impl WalIngest {
             );
             return Ok(());
         };
-        if let Some(blknum) = new_vm_blk {
-            if blknum >= vm_size {
-                critical_timeline!(
-                    modification.tline.tenant_shard_id,
-                    modification.tline.timeline_id,
-                    // Hadron: No need to raise the corruption flag here; the caller of `ingest_record()` will do it.
-                    None::<&AtomicBool>,
-                    "new_vm_blk {blknum} not in {vm_rel} of size {vm_size}"
-                );
-                new_vm_blk = None;
-            }
+        if let Some(blknum) = new_vm_blk
+            && blknum >= vm_size
+        {
+            critical_timeline!(
+                modification.tline.tenant_shard_id,
+                modification.tline.timeline_id,
+                // Hadron: No need to raise the corruption flag here; the caller of `ingest_record()` will do it.
+                None::<&AtomicBool>,
+                "new_vm_blk {blknum} not in {vm_rel} of size {vm_size}"
+            );
+            new_vm_blk = None;
         }
-        if let Some(blknum) = old_vm_blk {
-            if blknum >= vm_size {
-                critical_timeline!(
-                    modification.tline.tenant_shard_id,
-                    modification.tline.timeline_id,
-                    // Hadron: No need to raise the corruption flag here; the caller of `ingest_record()` will do it.
-                    None::<&AtomicBool>,
-                    "old_vm_blk {blknum} not in {vm_rel} of size {vm_size}"
-                );
-                old_vm_blk = None;
-            }
+        if let Some(blknum) = old_vm_blk
+            && blknum >= vm_size
+        {
+            critical_timeline!(
+                modification.tline.tenant_shard_id,
+                modification.tline.timeline_id,
+                // Hadron: No need to raise the corruption flag here; the caller of `ingest_record()` will do it.
+                None::<&AtomicBool>,
+                "old_vm_blk {blknum} not in {vm_rel} of size {vm_size}"
+            );
+            old_vm_blk = None;
         }
 
         if new_vm_blk.is_none() && old_vm_blk.is_none() {
@@ -1177,10 +1177,10 @@ impl WalIngest {
             }
         });
 
-        if let Some(max_xid) = max_mbr_xid {
-            if self.checkpoint.update_next_xid(max_xid) {
-                self.checkpoint_modified = true;
-            }
+        if let Some(max_xid) = max_mbr_xid
+            && self.checkpoint.update_next_xid(max_xid)
+        {
+            self.checkpoint_modified = true;
         }
         Ok(())
     }
@@ -1283,12 +1283,12 @@ impl WalIngest {
                 cp.wal_level = rec.wal_level;
                 self.checkpoint_modified = true;
             }
-        } else if info == pg_constants::XLOG_END_OF_RECOVERY {
-            if let CheckPoint::V17(cp) = &mut self.checkpoint {
-                let rec = v17::XlEndOfRecovery::decode(&mut buf);
-                cp.wal_level = rec.wal_level;
-                self.checkpoint_modified = true;
-            }
+        } else if info == pg_constants::XLOG_END_OF_RECOVERY
+            && let CheckPoint::V17(cp) = &mut self.checkpoint
+        {
+            let rec = v17::XlEndOfRecovery::decode(&mut buf);
+            cp.wal_level = rec.wal_level;
+            self.checkpoint_modified = true;
         }
 
         enum_pgversion_dispatch!(&mut self.checkpoint, CheckPoint, cp, {
@@ -1581,10 +1581,11 @@ impl WalIngest {
                 }
 
                 static LOGGED: RateLimitPerPgVersion = RateLimitPerPgVersion::new();
-                if let Some(rate_limiter) = LOGGED.rate_limiter(modification.tline.pg_version) {
-                    if let Ok(mut locked) = rate_limiter.try_lock() {
-                        locked.call(|| {
-                            info!(
+                if let Some(rate_limiter) = LOGGED.rate_limiter(modification.tline.pg_version)
+                    && let Ok(mut locked) = rate_limiter.try_lock()
+                {
+                    locked.call(|| {
+                        info!(
                                 lsn=%modification.get_lsn(),
                                 pg_version=%modification.tline.pg_version,
                                 rel=%rel,
@@ -1592,8 +1593,7 @@ impl WalIngest {
                                 gap_blocks_filled,
                                 new_nblocks,
                                 old_nblocks);
-                        });
-                    }
+                    });
                 }
             }
         }

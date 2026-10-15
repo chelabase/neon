@@ -171,7 +171,7 @@ mod test {
         let mut s = String::new();
         for (line, gen_, expected) in examples {
             s.clear();
-            write!(s, "{}", &gen_.get_suffix()).expect("string grows");
+            write!(s, "{}", gen_.get_suffix()).expect("string grows");
             assert_eq!(s, expected, "example on {line}");
         }
     }

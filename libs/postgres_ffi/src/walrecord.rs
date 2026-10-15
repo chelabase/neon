@@ -1014,15 +1014,12 @@ impl XlXactParsedRecord {
         } else {
             0
         };
-        let db_id;
-        let ts_id;
-        if xinfo & pg_constants::XACT_XINFO_HAS_DBINFO != 0 {
-            db_id = buf.get_u32_le();
-            ts_id = buf.get_u32_le();
+
+        let (db_id, ts_id) = if xinfo & pg_constants::XACT_XINFO_HAS_DBINFO != 0 {
+            (buf.get_u32_le(), buf.get_u32_le())
         } else {
-            db_id = 0;
-            ts_id = 0;
-        }
+            (0, 0)
+        };
         let mut subxacts = Vec::<TransactionId>::new();
         if xinfo & pg_constants::XACT_XINFO_HAS_SUBXACTS != 0 {
             let nsubxacts = buf.get_i32_le();

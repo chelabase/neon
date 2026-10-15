@@ -553,10 +553,7 @@ impl Endpoint {
 
                 let connstr = format!(
                     "host={} port={} options='-c timeline_id={} tenant_id={}' application_name=replica replication=true",
-                    sk_hosts,
-                    sk_ports,
-                    &self.timeline_id.to_string(),
-                    &self.tenant_id.to_string(),
+                    sk_hosts, sk_ports, self.timeline_id, self.tenant_id,
                 );
 
                 let slot_name = format!("repl_{}_", self.timeline_id);

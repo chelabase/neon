@@ -375,7 +375,7 @@ pub trait RemoteStorage: Send + Sync + 'static {
         let mut combined = stream.next().await.expect("At least one item required")?;
         while let Some(list) = stream.next().await {
             let list = list?;
-            combined.keys.extend(list.keys.into_iter());
+            combined.keys.extend(list.keys);
             combined.prefixes.extend_from_slice(&list.prefixes);
         }
         Ok(combined)

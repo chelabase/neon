@@ -202,7 +202,7 @@ use remote_storage::{
 };
 use scopeguard::ScopeGuard;
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, debug, error, info, info_span, instrument, warn};
+use tracing::{Instrument, debug, info, info_span, instrument, warn};
 pub(crate) use upload::upload_initdb_dir;
 use utils::backoff::{
     self, DEFAULT_BASE_BACKOFF_SECONDS, DEFAULT_MAX_BACKOFF_SECONDS, exponential_backoff,
@@ -1159,11 +1159,11 @@ impl RemoteTimelineClient {
             let mut guard = self.upload_queue.lock().unwrap();
             let upload_queue = guard.initialized_mut()?;
 
-            if let index::GcBlockingReason::DetachAncestor = reason {
-                if upload_queue.dirty.metadata.ancestor_timeline().is_none() {
-                    drop(guard);
-                    panic!("cannot start detach ancestor if there is nothing to detach from");
-                }
+            if let index::GcBlockingReason::DetachAncestor = reason
+                && upload_queue.dirty.metadata.ancestor_timeline().is_none()
+            {
+                drop(guard);
+                panic!("cannot start detach ancestor if there is nothing to detach from");
             }
 
             let wanted = |x: Option<&index::GcBlocking>| x.is_some_and(|x| x.blocked_by(reason));
@@ -1221,11 +1221,11 @@ impl RemoteTimelineClient {
             let mut guard = self.upload_queue.lock().unwrap();
             let upload_queue = guard.initialized_mut()?;
 
-            if let index::GcBlockingReason::DetachAncestor = reason {
-                if !upload_queue.clean.0.lineage.is_detached_from_ancestor() {
-                    drop(guard);
-                    panic!("cannot complete timeline_ancestor_detach while not detached");
-                }
+            if let index::GcBlockingReason::DetachAncestor = reason
+                && !upload_queue.clean.0.lineage.is_detached_from_ancestor()
+            {
+                drop(guard);
+                panic!("cannot complete timeline_ancestor_detach while not detached");
             }
 
             let wanted = |x: Option<&index::GcBlocking>| {

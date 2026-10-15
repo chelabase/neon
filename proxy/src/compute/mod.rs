@@ -13,7 +13,7 @@ use postgres_client::maybe_tls_stream::MaybeTlsStream;
 use postgres_client::tls::MakeTlsConnect;
 use thiserror::Error;
 use tokio::net::{TcpStream, lookup_host};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::auth::backend::ComputeCredentialKeys;
 use crate::auth::parse_endpoint_param;

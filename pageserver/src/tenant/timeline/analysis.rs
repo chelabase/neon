@@ -59,7 +59,7 @@ impl Timeline {
                 .filter(|(key_range, img_lsn)| key_range.contains(&start) && img_lsn <= &lsn)
                 .cloned()
                 .collect::<Vec<_>>();
-            maybe_image_layers.sort_by(|a, b| a.1.cmp(&b.1));
+            maybe_image_layers.sort_by_key(|a| a.1);
             let image_layer = maybe_image_layers.last().cloned();
             let lsn_filter_start = image_layer
                 .as_ref()

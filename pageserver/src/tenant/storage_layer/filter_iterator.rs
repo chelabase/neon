@@ -29,7 +29,7 @@ impl<'a> FilterIterator<'a> {
         let mut retain_key_filters = Vec::new();
         retain_key_filters.extend(dense_keyspace.ranges);
         retain_key_filters.extend(sparse_keyspace.0.ranges);
-        retain_key_filters.sort_by(|a, b| a.start.cmp(&b.start));
+        retain_key_filters.sort_by_key(|a| a.start);
         // Verify key filters are non-overlapping and sorted
         for window in retain_key_filters.windows(2) {
             if window[0].end > window[1].start {
