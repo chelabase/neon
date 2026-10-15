@@ -618,6 +618,9 @@ pub(crate) async fn main() -> anyhow::Result<()> {
                     .with_initial_backoff(std::time::Duration::from_millis(200)) // Start with 200ms delay
                     .with_max_backoff(std::time::Duration::from_secs(5)), // Cap at 5 seconds
             )
+            // 10 s connect timeout instead of the behavior version's 3.1 s, for S3-compatible
+            // stores on slow links (the same as remote_storage's S3 client).
+            .timeout_config(remote_storage::s3_timeout_config(None))
             .load()
             .await;
 

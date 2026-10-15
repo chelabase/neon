@@ -26,6 +26,7 @@ use aws_smithy_async::rt::sleep::TokioSleep;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
 use aws_smithy_types::date_time::ConversionError;
+use aws_smithy_types::timeout::TimeoutConfig;
 use bytes::Bytes;
 use futures::stream::Stream;
 use futures_util::StreamExt;
@@ -58,6 +59,20 @@ pub struct S3Bucket {
     concurrency_limiter: ConcurrencyLimiter,
     // Per-request timeout. Accessible for tests.
     pub timeout: Duration,
+}
+
+/// Connect timeout for S3 clients. Behavior version 2026-01-12 defaults it to 3.1 s, too short
+/// for S3-compatible stores on slow links.
+pub const S3_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The timeout config for an S3 client: `base` (the loaded SDK config's, if any) with the
+/// connect timeout set to [`S3_CONNECT_TIMEOUT`]. Every other timeout of `base` is kept, since
+/// setting a timeout config on an SDK config builder replaces the whole config.
+pub fn s3_timeout_config(base: Option<&TimeoutConfig>) -> TimeoutConfig {
+    base.map(TimeoutConfig::to_builder)
+        .unwrap_or_default()
+        .connect_timeout(S3_CONNECT_TIMEOUT)
+        .build()
 }
 
 struct GetObjectRequest {
@@ -96,7 +111,8 @@ impl S3Bucket {
 
         // The current behavior version (the older ones are deprecated). Where it changed a
         // default this code relies on, the old behavior is set explicitly below (retries,
-        // stalled-stream protection).
+        // stalled-stream protection, and the connect timeout: its 3.1 s default is raised to
+        // 10 s for S3-compatible stores on slow links, see [`s3_timeout_config`]).
         let sdk_config_loader: aws_config::ConfigLoader =
             aws_config::defaults(BehaviorVersion::v2026_01_12())
                 .region(region_opt)
@@ -135,6 +151,11 @@ impl S3Bucket {
             .set_max_attempts(Some(1))
             .set_mode(Some(RetryMode::Adaptive));
         s3_config_builder = s3_config_builder.retry_config(retry_config.build());
+
+        // `timeout_config` replaces the whole timeout config, so start from the loaded one to
+        // keep its other timeouts.
+        s3_config_builder =
+            s3_config_builder.timeout_config(s3_timeout_config(sdk_config.timeout_config()));
 
         // Stalled-stream protection on downloads only, as under the 2023-11-09 behavior version
         // this code was written against: uploads are bounded by our own timeouts
@@ -177,6 +198,11 @@ impl S3Bucket {
             upload_storage_class: remote_storage_config.upload_storage_class.clone(),
             timeout,
         })
+    }
+
+    /// The timeout config the S3 client was built with.
+    pub fn client_timeout_config(&self) -> Option<TimeoutConfig> {
+        self.client.config().timeout_config().cloned()
     }
 
     fn s3_object_to_relative_path(&self, key: &str) -> RemotePath {

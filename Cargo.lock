@@ -2029,16 +2029,6 @@ dependencies = [
 
 [[package]]
 name = "deranged"
-version = "0.3.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b42b6fa04a440b495c8b04d0e71b707c585f83cb9cb28cf8cd0d976c315e31b4"
-dependencies = [
- "powerfmt",
- "serde",
-]
-
-[[package]]
-name = "deranged"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
@@ -7795,7 +7785,7 @@ version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cdb87b95ec50ddfa440816d227a17b2ccbdda963a316a727fda0fc4334f7d134"
 dependencies = [
- "deranged 0.5.8",
+ "deranged",
  "js-sys",
  "num-conv",
  "powerfmt",
@@ -9319,11 +9309,12 @@ dependencies = [
  "clap",
  "clap_builder",
  "const-oid 0.9.6",
+ "crc32fast",
  "crossbeam-epoch",
  "crossbeam-utils",
  "crypto-bigint",
  "der",
- "deranged 0.3.11",
+ "deranged",
  "digest 0.10.7",
  "ecdsa",
  "either",
@@ -9344,7 +9335,6 @@ dependencies = [
  "hashbrown 0.14.5",
  "hex",
  "hmac 0.12.1",
- "hyper 0.14.30",
  "hyper 1.12.0",
  "hyper-util",
  "indexmap 2.10.0",
@@ -9367,7 +9357,6 @@ dependencies = [
  "p256",
  "parquet",
  "portable-atomic",
- "prettyplease 0.2.34",
  "proc-macro2",
  "prost 0.13.5",
  "quote",
@@ -9382,6 +9371,7 @@ dependencies = [
  "scopeguard",
  "sec1",
  "serde",
+ "serde_core",
  "serde_json",
  "sha2 0.10.8",
  "signature",
@@ -9390,7 +9380,7 @@ dependencies = [
  "stable_deref_trait",
  "subtle",
  "syn 2.0.119",
- "sync_wrapper 0.1.2",
+ "syn 3.0.6",
  "thiserror 2.0.11",
  "tikv-jemalloc-ctl",
  "tikv-jemalloc-sys",
@@ -9407,7 +9397,9 @@ dependencies = [
  "tracing-core",
  "tracing-log",
  "tracing-subscriber",
+ "typenum",
  "url",
+ "zerocopy 0.8.59",
  "zeroize",
  "zstd",
  "zstd-safe",

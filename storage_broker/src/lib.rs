@@ -56,12 +56,11 @@ where
     // If schema starts with https, start encrypted connection; do plain text
     // otherwise.
     if let Some("https") = tonic_endpoint.uri().scheme_str() {
-        // if there's no default provider and both ring+aws-lc-rs are enabled
-        // this the tls settings on tonic will not work.
-        // erroring is ok.
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .ok();
+        // tonic's client TLS uses the process-default crypto provider and falls back to ring
+        // when none is installed. Binaries install aws-lc-rs as the default at start; this
+        // makes library users (tests, benches) that didn't use the same provider, and never
+        // replaces one installed earlier (installing ring here used to race the binaries).
+        http_utils::tls_certs::install_default_crypto_provider();
         tonic_endpoint = tonic_endpoint.tls_config(tls_config)?;
     }
     tonic_endpoint = tonic_endpoint
