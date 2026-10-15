@@ -139,11 +139,13 @@ def test_member_logins_need_the_certificate_and_the_address(
     vanilla_pg.safe_psql(f"CREATE ROLE {MEMBER} LOGIN PASSWORD 'pw'")
     vanilla_pg.safe_psql("CREATE ROLE plain LOGIN PASSWORD 'pw'")
     assert member(vanilla_pg, certs, "orchestrator") == MEMBER
-    for cert, kw, needle in [
+    cases: list[tuple[str | None, dict[str, Any], str]] = [
         (None, {}, "connection requires a valid client certificate"),
         # A CN the map doesn't name fails after the password check; the client sees only the
         # generic auth failure (auth.c:645-653, :2785-2805 logs the CN mismatch server-side).
         ("compute", {}, "password authentication failed"),
+        # T4 m2: the orchestrator's certificate doesn't stand in for the password
+        ("orchestrator", {"password": "wrong"}, "password authentication failed"),
         (
             "orchestrator",
             {"sslmode": "disable", "sslrootcert": None},
@@ -154,7 +156,8 @@ def test_member_logins_need_the_certificate_and_the_address(
             {"host": "/tmp", "sslmode": "disable", "sslrootcert": None},
             "pg_hba.conf rejects connection",
         ),
-    ]:
+    ]
+    for cert, kw, needle in cases:
         with pytest.raises(psycopg2.OperationalError) as e:
             member(vanilla_pg, certs, cert, **kw)
         assert needle in str(e.value), (cert, kw, str(e.value))
@@ -183,11 +186,16 @@ def test_map_without_verify_full_stays_refused(vanilla_pg: VanillaPostgres, cert
     vanilla_pg.start()
     with open(vanilla_pg.pgdatadir / "pg_hba.conf", "a") as f:
         f.write("hostssl\tall\tbad_map\t127.0.0.1/32\tscram-sha-256\tmap=chelabase_member\n")
+        # T4 m1: verify-ca checks the chain but not the name, so it doesn't make map valid
+        f.write(
+            "hostssl\tall\tca_map\t127.0.0.1/32\tscram-sha-256\tclientcert=verify-ca\tmap=chelabase_member\n"
+        )
         f.write(
             "hostssl\tall\tgood_map\t127.0.0.1/32\tscram-sha-256\tmap=chelabase_member\tclientcert=verify-full\n"
         )
     rows = vanilla_pg.safe_psql(
-        "SELECT coalesce(user_name[1], ''), coalesce(error, '') FROM pg_hba_file_rules ORDER BY line_number DESC LIMIT 2"
+        "SELECT coalesce(user_name[1], ''), coalesce(error, '') FROM pg_hba_file_rules ORDER BY line_number DESC LIMIT 3"
     )
     assert rows[0] == ("good_map", ""), rows
-    assert rows[1][0] == "" and 'authentication option "map" is only valid' in rows[1][1], rows
+    for row in rows[1:]:
+        assert row[0] == "" and 'authentication option "map" is only valid' in row[1], rows

@@ -26,6 +26,9 @@
 #include "access/xlog.h"
 #include "libpq/pqformat.h"
 #include "replication/slot.h"
+#if PG_VERSION_NUM >= 170000
+#include "replication/chelabase.h"
+#endif
 #include "replication/walreceiver.h"
 #include "replication/walsender_private.h"
 #include "postmaster/bgworker.h"
@@ -702,6 +705,15 @@ walprop_register_bgworker(void)
 	bgw.bgw_main_arg = (Datum) 0;
 
 	RegisterBackgroundWorker(&bgw);
+
+#if PG_VERSION_NUM >= 170000
+	/*
+	 * U7b: the walproposer runs in this server, so only it can be a
+	 * synchronous standby (syncrep.c).  Set in the postmaster; every child
+	 * inherits it.
+	 */
+	chelabase_walproposer_active = true;
+#endif
 }
 
 /* shmem handling */
