@@ -34,7 +34,9 @@ def test_keys_over_replication_and_restart(neon_simple_env: NeonEnv):
         endpoint.connstr(user="chelabase_realtime"), connection_factory=LogicalReplicationConnection
     )
     cur = conn.cursor()
-    cur.execute("CREATE_REPLICATION_SLOT rt_t TEMPORARY LOGICAL chelabase_keys (SNAPSHOT 'nothing')")
+    cur.execute(
+        "CREATE_REPLICATION_SLOT rt_t TEMPORARY LOGICAL chelabase_keys (SNAPSHOT 'nothing')"
+    )
     cur.fetchall()
     cur.start_replication_expert("START_REPLICATION SLOT rt_t LOGICAL 0/0", decode=True)
     endpoint.safe_psql("INSERT INTO t VALUES (1, 0), (2, 0)")
@@ -43,7 +45,12 @@ def test_keys_over_replication_and_restart(neon_simple_env: NeonEnv):
     assert msg["changes"] == [
         {"rel": msg["changes"][0]["rel"], "s": "public", "t": "t", "op": "i", "k": [["1"], ["2"]]}
     ]
-    assert endpoint.safe_psql("SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'rt_t'")[0][0] == 1
+    assert (
+        endpoint.safe_psql("SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'rt_t'")[0][
+            0
+        ]
+        == 1
+    )
     endpoint.stop()
     endpoint.start()
     assert endpoint.safe_psql("SELECT count(*) FROM pg_replication_slots")[0][0] == 0
