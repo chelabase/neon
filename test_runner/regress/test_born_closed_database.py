@@ -120,7 +120,8 @@ def test_no_guard_no_change(neon_pg: VanillaPostgres):
     as_owner(neon_pg, "CREATE DATABASE n1")
     assert state(neon_pg, "n1") == (True, None)
     neon_pg.safe_psql("DROP EVENT TRIGGER chelabase_schema_guard_ddl")
-    # Owned by a non-superuser: not the guard.
+    # Owned by a non-superuser: not the guard. (PG15+: public has no CREATE for ordinary roles.)
+    neon_pg.safe_psql("GRANT CREATE ON SCHEMA public TO owner")
     as_owner(
         neon_pg,
         "CREATE FUNCTION g1() RETURNS event_trigger LANGUAGE plpgsql AS $$BEGIN END$$;"
