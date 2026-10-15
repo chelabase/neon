@@ -17,8 +17,10 @@ def test_a_superuser_connects_to_a_closed_non_template_database(vanilla_pg: Vani
     vanilla_pg.safe_psql("CREATE DATABASE c1")
     vanilla_pg.safe_psql("ALTER DATABASE c1 ALLOW_CONNECTIONS false")
     vanilla_pg.safe_psql("CREATE ROLE plain LOGIN")
+    # T3 m2: a closed template other than template0 stays closed to a superuser too
+    vanilla_pg.safe_psql("CREATE DATABASE tpl IS_TEMPLATE true ALLOW_CONNECTIONS false")
     assert vanilla_pg.safe_psql("SELECT current_database()", dbname="c1")[0][0] == "c1"
-    for kw in [{"dbname": "template0"}, {"dbname": "c1", "user": "plain"}]:
+    for kw in [{"dbname": "template0"}, {"dbname": "tpl"}, {"dbname": "c1", "user": "plain"}]:
         with pytest.raises(psycopg2.OperationalError) as e:
             vanilla_pg.safe_psql("SELECT 1", **kw)
         assert "is not currently accepting connections" in str(e.value), kw
