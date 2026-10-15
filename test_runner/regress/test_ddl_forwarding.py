@@ -1080,3 +1080,16 @@ def test_ddl_forwarding_role_specs(neon_simple_env: NeonEnv):
         # ROLESPEC_PUBLIC
         with pytest.raises(UndefinedObject):
             cur.execute("ALTER ROLE public WITH PASSWORD 'dork'")
+
+
+def test_reassign_owned_reports_database_owner(ddl: DdlForwardingContext):
+    ddl.send_and_wait("CREATE ROLE ra WITH PASSWORD 'a'")
+    ddl.send_and_wait("CREATE ROLE rb WITH PASSWORD 'b'")
+    ddl.send_and_wait("CREATE DATABASE rdb OWNER ra")
+    assert ddl.dbs == {"rdb": "ra"}
+    ddl.send_and_wait("REASSIGN OWNED BY ra TO rb")
+    assert ddl.dbs == {"rdb": "rb"}
+    ddl.send_and_wait("DROP DATABASE rdb")
+    ddl.send_and_wait("DROP ROLE ra")
+    ddl.send_and_wait("DROP ROLE rb")
+    assert ddl.dbs == {} and ddl.roles == {}
