@@ -51,7 +51,7 @@ CI quarantines known test failures in `test_runner/known_failures.txt`, each wit
 
 ## Checks
 
-The gate for every PR is `.github/scripts/ci-local.sh`: lint (self-tests, actionlint, fmt, clippy, cargo deny, ruff, mypy), build, and the Rust tests. It runs on a developer machine inside the same `ghcr.io/chelabase/neon-build-tools` image as `.github/workflows/pr.yml` (pulling the image needs no login: the GHCR packages are public), with caches in the Docker volumes `chela-neon-cargo` and `chela-neon-target` and logs under `.ci-local/` (git-ignored). Use `--pg v14|v15|v16` for the older majors.
+The gate for every PR is `.github/scripts/ci-local.sh`: lint (self-tests, actionlint, fmt, clippy, cargo deny, ruff, mypy), build, and the Rust tests. It runs on a developer machine inside the same `ghcr.io/chelabase/neon-build-tools` image as `.github/workflows/pr.yml` (pulling the image needs no login: the GHCR packages are public), with caches in the Docker volumes `chela-neon-cargo`, `chela-neon-target` and `chela-neon-sccache` (the last is shared by every clone whatever the suffix: sccache wraps rustc, so a task clone reuses the compiled crates of the others; the script downloads a pinned static sccache once into `${XDG_CACHE_HOME:-$HOME/.cache}/chela-neon/`, checks its sha256 and mounts it read-only; release builds only, since sccache skips incremental crates; the build and rust-tests steps print `sccache --show-stats`) and logs under `.ci-local/` (git-ignored). Use `--pg v14|v15|v16` for the older majors.
 
 GitHub CI is manual-only, as standing policy: `pr.yml` is `workflow_dispatch` only, and branch protection on `main` requires a PR but no status check. `images.yml` runs only for `v*` tags and the platform images, by hand.
 

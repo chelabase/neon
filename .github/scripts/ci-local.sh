@@ -37,9 +37,14 @@
 #               --reruns 2, deselecting test_runner/known_failures.txt and
 #               test_runner/known_failures.local.txt
 #
-# Caches live in two named Docker volumes: chela-neon-cargo (cargo registry and
-# git, poetry venvs) and chela-neon-target (target/, pg_install/, build/ of the
-# checkout). No `--network host`: the test ports stay inside the container, so
+# Caches live in three named Docker volumes: chela-neon-cargo (cargo registry and
+# git, poetry venvs), chela-neon-target (target/, pg_install/, build/ of the
+# checkout) and chela-neon-sccache (sccache's compiler cache, one for every clone
+# whatever the suffix; 40G). rustc runs through a static sccache binary that this
+# script downloads once into ${XDG_CACHE_HOME:-$HOME/.cache}/chela-neon/sccache-<version>/
+# (version and sha256 pinned here) and mounts read-only at /opt/sccache. sccache
+# skips incremental crates, so only release builds (incremental off) benefit. The
+# build and rust-tests steps print `sccache --show-stats`. No `--network host`: the test ports stay inside the container, so
 # they never clash with the chelabase Compose stack.
 #
 # The full log and one log per step go to .ci-local/<timestamp>/ (git-ignored),
@@ -52,6 +57,13 @@
 IMAGE_REPO="ghcr.io/chelabase/neon-build-tools"
 CARGO_VOLUME="chela-neon-cargo"
 TARGET_VOLUME="chela-neon-target"
+# One compiler cache for every clone and suffix (rustc outputs are keyed by content).
+SCCACHE_VOLUME="chela-neon-sccache"
+SCCACHE_CACHE_SIZE="40G"
+# The official static (musl) release of github.com/mozilla/sccache; the sha256 is the
+# one published next to the tarball.
+SCCACHE_VERSION="0.18.0"
+SCCACHE_SHA256="45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89"
 MAJORS=(v14 v15 v16 v17)
 
 usage() {
@@ -218,6 +230,11 @@ build_versions() {
     if [[ "$1" == "v17" ]]; then echo "v17"; else echo "$1 v17"; fi
 }
 
+# sccache_host_dir: where the pinned sccache binary lives on the host.
+sccache_host_dir() {
+    echo "${XDG_CACHE_HOME:-$HOME/.cache}/chela-neon/sccache-${SCCACHE_VERSION}"
+}
+
 # docker_args <repo root> <pg> <build type> <step> [run dir name]: the `docker run`
 # options (one per line) shared by every step.
 docker_args() {
@@ -226,6 +243,7 @@ docker_args() {
     local seccomp=(--security-opt seccomp=unconfined)
     [[ "$step" == lint ]] && seccomp=(--label chela-neon-ci=lint)
     local vol_c="type=volume,src=${CARGO_VOLUME}" vol_t="type=volume,src=${TARGET_VOLUME}"
+    local vol_s="type=volume,src=${SCCACHE_VOLUME}"
     printf '%s\n' \
         --rm --init \
         --name "chela-neon-ci-${step}-$$" \
@@ -240,6 +258,11 @@ docker_args() {
         --mount "${vol_t},dst=/work/target,volume-subpath=target" \
         --mount "${vol_t},dst=/work/pg_install,volume-subpath=pg_install" \
         --mount "${vol_t},dst=/work/build,volume-subpath=build" \
+        --mount "${vol_s},dst=/home/nonroot/.cache/sccache" \
+        --mount "type=bind,src=$(sccache_host_dir),dst=/opt/sccache,readonly" \
+        -e SCCACHE_DIR=/home/nonroot/.cache/sccache \
+        -e "SCCACHE_CACHE_SIZE=${SCCACHE_CACHE_SIZE}" \
+        -e RUSTC_WRAPPER=/opt/sccache/sccache \
         -e "PG_VERSION=$pg" \
         -e "BUILD_TYPE=$bt" \
         -e "CI_LOCAL_RUN=$run" \
@@ -339,6 +362,7 @@ step_build() {
         BUILD_TYPE="$BUILD_TYPE" CARGO_BUILD_FLAGS="$CARGO_FLAGS" all
     df -h /work /work/target
     du -sh target pg_install build 2>/dev/null || true
+    /opt/sccache/sccache --show-stats || true
     echo "build took $(($(date +%s) - start))s"
 }
 
@@ -366,6 +390,7 @@ step_rust_tests() {
     local nx_args
     mapfile -t nx_args < <(nextest_args)
     mold -run cargo nextest "${nx_args[@]}"
+    /opt/sccache/sccache --show-stats || true
     echo "rust tests took $(($(date +%s) - start))s"
 }
 
@@ -626,9 +651,43 @@ sync_build_state() {
 
 ensure_volumes() {
     docker run --rm --user root \
-        -v "${CARGO_VOLUME}:/c" -v "${TARGET_VOLUME}:/t" "$IMAGE" \
+        -v "${CARGO_VOLUME}:/c" -v "${TARGET_VOLUME}:/t" -v "${SCCACHE_VOLUME}:/s" "$IMAGE" \
         bash -c 'mkdir -p /c/registry /c/git /c/poetry /t/target /t/pg_install /t/build &&
-                 chown nonroot:nonroot /c /t /c/* /t/*'
+                 chown nonroot:nonroot /c /t /s /c/* /t/*'
+}
+
+# ensure_sccache: downloads the pinned static sccache into sccache_host_dir once,
+# checking the published sha256 (of the tarball) before it is unpacked.
+ensure_sccache() {
+    local dir bin tmp name url
+    dir="$(sccache_host_dir)"
+    bin="$dir/sccache"
+    [[ -x "$bin" ]] && return 0
+    name="sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl"
+    url="https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/${name}.tar.gz"
+    echo "ci-local.sh: downloading sccache v${SCCACHE_VERSION}"
+    tmp="$(mktemp -d)" || return 1
+    if ! curl -sSfL -o "$tmp/sccache.tar.gz" "$url"; then
+        echo "ci-local.sh: could not download $url" >&2
+        rm -rf "$tmp"
+        return 1
+    fi
+    if ! echo "${SCCACHE_SHA256}  $tmp/sccache.tar.gz" | sha256sum --check --status; then
+        echo "ci-local.sh: sha256 mismatch for $url (expected ${SCCACHE_SHA256})" >&2
+        rm -rf "$tmp"
+        return 1
+    fi
+    if ! tar -xzf "$tmp/sccache.tar.gz" -C "$tmp" "$name/sccache"; then
+        echo "ci-local.sh: could not unpack sccache from $url" >&2
+        rm -rf "$tmp"
+        return 1
+    fi
+    if ! { mkdir -p "$dir" && chmod 755 "$tmp/$name/sccache" && mv -f "$tmp/$name/sccache" "$bin"; }; then
+        echo "ci-local.sh: could not install sccache into $dir" >&2
+        rm -rf "$tmp"
+        return 1
+    fi
+    rm -rf "$tmp"
 }
 
 main() {
@@ -657,6 +716,7 @@ main() {
     echo "ci-local: $IMAGE, pg=$PG, build=$BUILD_TYPE, regress=$REGRESS, workers=$WORKERS, -k [${KEXPR}]"
     ensure_submodules
     ensure_image
+    ensure_sccache || exit 1
     ensure_volumes
     sync_build_state
 
