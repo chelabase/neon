@@ -61,11 +61,7 @@ impl std::fmt::Display for MigrationFailure {
         if self.in_migration {
             write!(f, "migration {id} failed: {:#}", self.error)
         } else {
-            write!(
-                f,
-                "migrations could not run (next: migration {id}): {:#}",
-                self.error
-            )
+            write!(f, "migrations could not run: {:#}", self.error)
         }
     }
 }

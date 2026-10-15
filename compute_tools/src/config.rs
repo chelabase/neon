@@ -384,6 +384,16 @@ pub fn write_postgres_conf(
         writeln!(file, "# Databricks settings end")?;
     }
 
+    // U14: the branch's protection, read by the neon extension's DDL handler
+    // (PGC_SIGHUP, so no session can change it). Written after the spec's own
+    // `postgresql_conf` and `settings` (and the Databricks settings), so none of
+    // them can override it.
+    writeln!(
+        file,
+        "neon.branch_protected={}",
+        if spec.branch_protected { "on" } else { "off" }
+    )?;
+
     // This is essential to keep this line at the end of the file,
     // because it is intended to override any settings above.
     writeln!(file, "include_if_exists = 'compute_ctl_temp_override.conf'")?;

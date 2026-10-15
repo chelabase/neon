@@ -228,8 +228,88 @@ pub fn member_ident_lines(member_logins: Option<&MemberLogins>) -> Result<String
     Ok(lines)
 }
 
-/// Check `pg_hba.conf` and update if needed: the member-login block first (once),
-/// then the databricks include, then the catch-all `md5` line last.
+const MEMBER_IDENT_HEAD: &str = "# chelabase: member certificate map (chelabase_member)";
+const MEMBER_IDENT_TAIL: &str = "# chelabase: end of member certificate map";
+
+/// `current` with the text from the `head` line through the `tail` line (both
+/// included) replaced by `block`; without either marker, `block` goes first. A
+/// block cut short (one marker without the other, a marker twice, the end
+/// before the start) is an error naming `file`: nothing is guessed.
+fn replace_marked_block(
+    current: &str,
+    head: &str,
+    tail: &str,
+    block: &str,
+    file: &str,
+) -> Result<String> {
+    let mut heads = Vec::new();
+    let mut tails = Vec::new();
+    let mut offset = 0;
+    for line in current.split_inclusive('\n') {
+        let text = line.strip_suffix('\n').unwrap_or(line);
+        let text = text.strip_suffix('\r').unwrap_or(text);
+        if text == head {
+            heads.push(offset);
+        } else if text == tail {
+            tails.push(offset + line.len());
+        }
+        offset += line.len();
+    }
+    match (heads.as_slice(), tails.as_slice()) {
+        ([], []) => Ok(format!("{block}{current}")),
+        ([start], [end]) if start < end => {
+            Ok(format!("{}{block}{}", &current[..*start], &current[*end..]))
+        }
+        _ => bail!(
+            "{file}: the chelabase block is cut short or repeated ({} start and {} end markers, \
+             expected one of each, in order); fix the file by hand",
+            heads.len(),
+            tails.len()
+        ),
+    }
+}
+
+/// Writes `text` to `path` through a temporary file and a rename, so Postgres
+/// never reads a half-written file; does nothing when the content is already
+/// `text`.
+fn write_conf_file(path: &Path, current: &str, text: &str) -> Result<bool> {
+    if current == text {
+        return Ok(false);
+    }
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
+    if let Ok(meta) = fs::metadata(path) {
+        let _ = fs::set_permissions(&tmp, meta.permissions());
+    }
+    fs::rename(&tmp, path).with_context(|| format!("rename {} into place", tmp.display()))?;
+    Ok(true)
+}
+
+fn read_conf_file(path: &Path) -> Result<String> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+/// The major version in `<pgdata>/PG_VERSION`, when it can be read.
+fn pgdata_major_version(pgdata_path: &Path) -> Option<u32> {
+    fs::read_to_string(pgdata_path.join("PG_VERSION"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Check `pg_hba.conf` and update if needed: the member-login block first
+/// (replaced between its markers when it's there, the rest of the file kept byte
+/// for byte), then the databricks include, then the catch-all `md5` line last.
+///
+/// The block's `hostssl … clientcert=verify-full map=…` lines need v17 (older
+/// majors refuse `map=` with a client certificate check); below v17, or when
+/// `PG_VERSION` can't be read, the block holds only the `reject` lines: member
+/// logins are refused (fails closed).
 pub fn update_pg_hba(
     pgdata_path: &Path,
     databricks_pg_hba: Option<&String>,
@@ -239,20 +319,31 @@ pub fn update_pg_hba(
     // XXX: consider making it a part of config.json
     let pghba_path = pgdata_path.join("pg_hba.conf");
 
+    let major = pgdata_major_version(pgdata_path);
+    let member_tls = tls && major.is_some_and(|v| v >= 17);
+    if tls && !member_tls && member_logins.is_some() {
+        tracing::warn!(
+            ?major,
+            "member logins need PostgreSQL 17 or later: pg_hba.conf only rejects them"
+        );
+    }
+
     // Postgres uses the first matching line, so the member block goes before the
     // basebackup's `trust` lines: loopback and the Unix socket don't admit member
     // roles either.
-    let block = member_hba_block(member_logins, tls)?;
-    let current = match fs::read_to_string(&pghba_path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e).context("read pg_hba.conf"),
-    };
-    if current.lines().any(|line| line == MEMBER_HBA_HEAD) {
-        info!("pg_hba.conf already has the member-login block");
+    let block = member_hba_block(member_logins, member_tls)?;
+    let current = read_conf_file(&pghba_path)?;
+    let updated = replace_marked_block(
+        &current,
+        MEMBER_HBA_HEAD,
+        MEMBER_HBA_TAIL,
+        &block,
+        "pg_hba.conf",
+    )?;
+    if write_conf_file(&pghba_path, &current, &updated)? {
+        info!("updated the member-login block in pg_hba.conf");
     } else {
-        fs::write(&pghba_path, format!("{block}{current}")).context("write pg_hba.conf")?;
-        info!("added the member-login block to pg_hba.conf");
+        info!("pg_hba.conf already has the member-login block");
     }
 
     // Update pg_hba to contains databricks specfic settings before adding neon settings
@@ -279,8 +370,10 @@ pub fn update_pg_hba(
     Ok(())
 }
 
-/// Check `pg_ident.conf` and update if needed: the member-login map lines, and
-/// the databricks include.
+/// Check `pg_ident.conf` and update if needed: the member-login map lines
+/// (between their markers, replaced as a whole so a CN dropped from
+/// `client_cns` stops mapping; the rest of the file kept), and the databricks
+/// include.
 pub fn update_pg_ident(
     pgdata_path: &Path,
     databricks_pg_ident: Option<&String>,
@@ -289,10 +382,33 @@ pub fn update_pg_ident(
     info!("checking pg_ident.conf");
     let pghba_path = pgdata_path.join("pg_ident.conf");
 
-    for line in member_ident_lines(member_logins)?.lines() {
-        if config::line_in_file(&pghba_path, line)? {
-            info!("added {line:?} to pg_ident.conf");
-        }
+    let block = format!(
+        "{MEMBER_IDENT_HEAD}\n{}{MEMBER_IDENT_TAIL}\n",
+        member_ident_lines(member_logins)?
+    );
+    let current = read_conf_file(&pghba_path)?;
+    let has_markers = current
+        .lines()
+        .any(|l| l == MEMBER_IDENT_HEAD || l == MEMBER_IDENT_TAIL);
+    // A file written before the markers existed: its unmarked member map lines
+    // go, the block replaces them.
+    let base = if has_markers {
+        current.clone()
+    } else {
+        current
+            .split_inclusive('\n')
+            .filter(|l| l.split_whitespace().next() != Some(MEMBER_IDENT_MAP))
+            .collect()
+    };
+    let updated = replace_marked_block(
+        &base,
+        MEMBER_IDENT_HEAD,
+        MEMBER_IDENT_TAIL,
+        &block,
+        "pg_ident.conf",
+    )?;
+    if write_conf_file(&pghba_path, &current, &updated)? {
+        info!("updated the member certificate map in pg_ident.conf");
     }
 
     // Update pg_ident to contains databricks specfic settings

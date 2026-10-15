@@ -216,6 +216,13 @@ pub struct ComputeSpec {
     /// logins are refused.
     #[serde(default)]
     pub member_logins: Option<MemberLogins>,
+
+    /// The branch is protected (U14): compute_ctl writes it into
+    /// `postgresql.conf` as `neon.branch_protected`, and while it's on every
+    /// non-superuser `CREATE DATABASE` is born closed and `ALTER DATABASE ...
+    /// ALLOW_CONNECTIONS/IS_TEMPLATE` is refused. Absent: false.
+    #[serde(default)]
+    pub branch_protected: bool,
 }
 
 /// Who may log in as a member role (`cb_m_*`): `allowed_cidrs` are the source

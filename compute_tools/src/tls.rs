@@ -1,46 +1,118 @@
-use std::{io::Write, os::unix::fs::OpenOptionsExt, path::Path, time::Duration};
+use std::{
+    io::Write,
+    os::unix::fs::OpenOptionsExt,
+    path::Path,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use compute_api::responses::TlsConfig;
 use ring::digest;
 use x509_cert::Certificate;
 
+/// The SHA-256 digest of a certificate file's bytes.
 #[derive(Clone, Copy)]
 pub struct CertDigest(digest::Digest);
 
-pub async fn watch_cert_for_changes(cert_path: String) -> tokio::sync::watch::Receiver<CertDigest> {
-    let mut digest = compute_digest(&cert_path).await;
-    let (tx, rx) = tokio::sync::watch::channel(digest);
-    tokio::spawn(async move {
-        while !tx.is_closed() {
-            let new_digest = compute_digest(&cert_path).await;
-            if digest.0.as_ref() != new_digest.0.as_ref() {
-                digest = new_digest;
-                _ = tx.send(digest);
-            }
-
-            tokio::time::sleep(Duration::from_secs(60)).await
-        }
-    });
-    rx
+impl CertDigest {
+    pub fn of(data: &[u8]) -> CertDigest {
+        // sha256 is extremely collision resistent. can safely assume the digest to be unique
+        CertDigest(digest::digest(&digest::SHA256, data))
+    }
 }
 
-async fn compute_digest(cert_path: &str) -> CertDigest {
-    loop {
-        match try_compute_digest(cert_path).await {
-            Ok(d) => break d,
+impl PartialEq for CertDigest {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_ref() == other.0.as_ref()
+    }
+}
+
+impl Eq for CertDigest {}
+
+impl std::fmt::Debug for CertDigest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CertDigest(")?;
+        for b in self.0.as_ref() {
+            write!(f, "{b:02x}")?;
+        }
+        f.write_str(")")
+    }
+}
+
+/// The outcome of one [`CertWatch::poll`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertPoll {
+    /// The certificate is the one loaded and no reload is pending.
+    Unchanged,
+    /// The reload ran and succeeded.
+    Reloaded,
+    /// The reload failed; it runs again at the next poll, whatever the digest then.
+    Retry,
+}
+
+/// The certificate watcher's state (RT3-1, T6 m5): the digest Postgres was last
+/// loaded with, and whether a reload is pending after a failure.
+#[derive(Debug)]
+pub struct CertWatch {
+    loaded: CertDigest,
+    pending: bool,
+}
+
+impl CertWatch {
+    /// Starts from the certificate Postgres was started with.
+    pub fn new(loaded: CertDigest) -> CertWatch {
+        CertWatch {
+            loaded,
+            pending: false,
+        }
+    }
+
+    /// One poll: runs `reload` when `now` differs from the loaded digest or an
+    /// earlier reload failed (it may have written files before failing, so pgdata
+    /// no longer matches what Postgres serves); never otherwise.
+    pub fn poll(&mut self, now: CertDigest, reload: impl FnOnce() -> Result<()>) -> CertPoll {
+        if !self.pending && now == self.loaded {
+            return CertPoll::Unchanged;
+        }
+        match reload() {
+            Ok(()) => {
+                self.loaded = now;
+                self.pending = false;
+                CertPoll::Reloaded
+            }
             Err(e) => {
-                tracing::error!("could not read cert file {e:?}");
-                tokio::time::sleep(Duration::from_secs(1)).await
+                tracing::warn!(
+                    error = ?e,
+                    "could not reload the changed TLS certificate, retrying at the next poll"
+                );
+                self.pending = true;
+                CertPoll::Retry
             }
         }
     }
 }
 
-async fn try_compute_digest(cert_path: &str) -> Result<CertDigest> {
-    let data = tokio::fs::read(cert_path).await?;
-    // sha256 is extremely collision resistent. can safely assume the digest to be unique
-    Ok(CertDigest(digest::digest(&digest::SHA256, &data)))
+/// Reads `cert_path` and digests it.
+pub fn read_cert_digest(cert_path: &str) -> Result<CertDigest> {
+    let data = std::fs::read(cert_path).with_context(|| format!("read {cert_path}"))?;
+    Ok(CertDigest::of(&data))
+}
+
+/// Waits until `cert_path` can be read and returns its digest.
+pub async fn wait_for_cert(cert_path: &str) -> CertDigest {
+    loop {
+        match tokio::fs::read(cert_path).await {
+            Ok(data) => break CertDigest::of(&data),
+            Err(e) => {
+                tracing::error!("could not read cert file {cert_path}: {e:?}");
+                tokio::time::sleep(Duration::from_secs(1)).await
+            }
+        }
+    }
 }
 
 pub const SERVER_CRT: &str = "server.crt";
@@ -60,8 +132,10 @@ pub fn update_key_path_blocking(pg_data: &Path, tls_config: &TlsConfig) {
 
 /// A changed certificate (RT3-1): copy the key and certificate into `pgdata` and
 /// run `reload` (Postgres reloads its TLS files on SIGHUP). The compute's status
-/// is never touched. Fails, writing nothing, while the key doesn't match the
-/// certificate (a renewal seen half-written): the caller retries at its next poll.
+/// is never touched. Fails, writing nothing and reloading nothing, while the key
+/// doesn't match the certificate or (with `ca_path`) the certificate doesn't chain
+/// to the CA file (a renewal or CA rotation seen half-written): the caller
+/// retries at its next poll.
 pub fn reload_tls_files(
     pgdata: &Path,
     tls: &TlsConfig,
@@ -72,10 +146,16 @@ pub fn reload_tls_files(
     reload().context("reload Postgres")
 }
 
+/// Serialises copies into pgdata within this process (the certificate watcher
+/// and a reconfigure), so the key and certificate written are always one pair.
+static COPY_LOCK: Mutex<()> = Mutex::new(());
+
 // Postgres requires the keypath be "secure". This means
 // 1. Owned by the postgres user.
 // 2. Have permission 600.
 fn try_update_key_path_blocking(pg_data: &Path, tls_config: &TlsConfig) -> Result<()> {
+    let _guard = COPY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
     let key = std::fs::read_to_string(&tls_config.key_path)
         .with_context(|| format!("read {}", tls_config.key_path))?;
     let crt = std::fs::read_to_string(&tls_config.cert_path)
@@ -83,6 +163,11 @@ fn try_update_key_path_blocking(pg_data: &Path, tls_config: &TlsConfig) -> Resul
 
     // to mitigate a race condition during renewal.
     verify_key_cert(&key, &crt)?;
+    if let Some(ca_path) = &tls_config.ca_path {
+        let ca = std::fs::read_to_string(ca_path).with_context(|| format!("read {ca_path}"))?;
+        verify_cert_chains_to_ca(&crt, &ca)
+            .with_context(|| format!("{} doesn't chain to {ca_path}", tls_config.cert_path))?;
+    }
 
     // Each file is replaced by a rename, so Postgres never reads a truncated one,
     // and always ends up 0600 whatever an older copy's mode was.
@@ -92,25 +177,103 @@ fn try_update_key_path_blocking(pg_data: &Path, tls_config: &TlsConfig) -> Resul
     Ok(())
 }
 
+/// Distinguishes temporary files written at the same time in this process.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
 fn write_private_file(dir: &Path, name: &str, data: &[u8]) -> Result<()> {
-    let tmp = dir.join(format!("{name}.tmp"));
-    match std::fs::remove_file(&tmp) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("remove {}", tmp.display())),
+    // A unique name per write: two writers (in this process or another) never
+    // share a temporary file.
+    let tmp = dir.join(format!(
+        "{name}.tmp.{}.{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, dir.join(name))
+            .with_context(|| format!("rename {} into place", tmp.display()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)
-        .with_context(|| format!("create {}", tmp.display()))?;
-    file.write_all(data)?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(&tmp, dir.join(name))
-        .with_context(|| format!("rename {} into place", tmp.display()))?;
-    Ok(())
+    result
+}
+
+/// The longest issuer chain followed from the server certificate to the CA file.
+const MAX_CHAIN_DEPTH: usize = 8;
+
+/// Checks that the first certificate in `cert` (the server's, followed by any
+/// intermediates) chains to a certificate in the PEM bundle `ca`: each link's
+/// issuer names the next certificate's subject and its signature verifies with
+/// that certificate's key. Only P-256 ECDSA (SHA-256) is accepted, as for keys.
+pub fn verify_cert_chains_to_ca(cert: &str, ca: &str) -> Result<()> {
+    let chain = Certificate::load_pem_chain(cert.as_bytes())
+        .context("decoding PEM encoded certificates")?;
+    let cas =
+        Certificate::load_pem_chain(ca.as_bytes()).context("decoding the PEM encoded CA file")?;
+    let Some(mut current) = chain.first() else {
+        bail!("no certificates found");
+    };
+    if cas.is_empty() {
+        bail!("no CA certificates found");
+    }
+    let intermediates = &chain[1..];
+    for _ in 0..MAX_CHAIN_DEPTH {
+        let issued_by = |c: &&Certificate| {
+            c.tbs_certificate.subject == current.tbs_certificate.issuer
+                && signed_by(current, c).is_ok()
+        };
+        if cas.iter().any(|c| issued_by(&c)) {
+            return Ok(());
+        }
+        match intermediates.iter().find(issued_by) {
+            Some(next) => current = next,
+            None => break,
+        }
+    }
+    bail!("the certificate isn't signed by any certificate in the CA file")
+}
+
+/// Verifies `cert`'s signature with `issuer`'s public key.
+fn signed_by(cert: &Certificate, issuer: &Certificate) -> Result<()> {
+    use x509_cert::der::Encode;
+    use x509_cert::der::oid::db::rfc5912::{ECDSA_WITH_SHA_256, ID_EC_PUBLIC_KEY, SECP_256_R_1};
+
+    if cert.signature_algorithm.oid != ECDSA_WITH_SHA_256 {
+        bail!("unsupported certificate signature algorithm");
+    }
+    let spki = &issuer.tbs_certificate.subject_public_key_info;
+    let curve = spki
+        .algorithm
+        .parameters
+        .as_ref()
+        .and_then(|p| p.decode_as::<x509_cert::der::oid::ObjectIdentifier>().ok());
+    if spki.algorithm.oid != ID_EC_PUBLIC_KEY || curve != Some(SECP_256_R_1) {
+        bail!("unsupported CA key type");
+    }
+    let tbs = cert
+        .tbs_certificate
+        .to_der()
+        .context("encode the certificate")?;
+    let signature = cert
+        .signature
+        .as_bytes()
+        .context("the certificate signature isn't a whole number of bytes")?;
+    let key = spki
+        .subject_public_key
+        .as_bytes()
+        .context("the CA key isn't a whole number of bytes")?;
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_ASN1, key)
+        .verify(&tbs, signature)
+        .map_err(|_| anyhow::anyhow!("signature mismatch"))
 }
 
 /// Checks that `key` (PEM: PKCS#8 `PRIVATE KEY` or SEC1 `EC PRIVATE KEY`, P-256)
