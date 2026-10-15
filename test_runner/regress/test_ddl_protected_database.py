@@ -161,3 +161,47 @@ def test_ddl_protected_database_list_parsing(
             for name in unprotected:
                 owner.execute(f"DROP DATABASE {name}")
                 assert db_connlimit(admin, name) is None
+
+
+def test_a_protected_database_cant_be_renamed(
+    httpserver: HTTPServer,
+    vanilla_pg: VanillaPostgres,
+    httpserver_listen_address: ListenAddress,
+):
+    """
+    R-F3c: renaming would get around the DROP refusal (ALTER DATABASE maindb
+    RENAME TO x; DROP DATABASE x), so a non-superuser can't rename a protected
+    database, nor rename another database to a protected name. A superuser can.
+    """
+    (host, port) = httpserver_listen_address
+    start_with_protected(httpserver, vanilla_pg, host, port, f"{MAIN_DB},spare")
+
+    with vanilla_pg.cursor() as admin:
+        admin.execute("CREATE ROLE neon_superuser NOLOGIN CREATEDB CREATEROLE")
+        admin.execute("CREATE ROLE owner LOGIN NOSUPERUSER CREATEDB PASSWORD 'pw'")
+        admin.execute(f"CREATE DATABASE {MAIN_DB} OWNER owner")
+        admin.execute("CREATE DATABASE other OWNER owner")
+
+        with vanilla_pg.cursor(user="owner", password="pw") as owner:
+            for sql in [
+                f"ALTER DATABASE {MAIN_DB} RENAME TO renamed",
+                "ALTER DATABASE other RENAME TO spare",
+                f"DO $$BEGIN EXECUTE 'ALTER DATABASE {MAIN_DB} RENAME TO renamed'; END$$",
+            ]:
+                with pytest.raises(InsufficientPrivilege) as exc_info:
+                    owner.execute(sql)
+                assert exc_info.value.pgcode == "42501", sql
+            for name in [MAIN_DB, "other"]:
+                assert db_connlimit(admin, name) is not None, name
+            for name in ["renamed", "spare"]:
+                assert db_connlimit(admin, name) is None, name
+            # An unprotected database renames to an unprotected name.
+            owner.execute("ALTER DATABASE other RENAME TO other2")
+            assert db_connlimit(admin, "other2") is not None
+
+        # A superuser can, both ways.
+        admin.execute(f"ALTER DATABASE {MAIN_DB} RENAME TO renamed")
+        admin.execute("ALTER DATABASE other2 RENAME TO spare")
+        admin.execute(f"ALTER DATABASE renamed RENAME TO {MAIN_DB}")
+        assert db_connlimit(admin, MAIN_DB) is not None
+        assert db_connlimit(admin, "spare") is not None

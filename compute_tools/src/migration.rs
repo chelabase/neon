@@ -246,30 +246,31 @@ impl<'m> MigrationRunner<'m> {
 
 #[cfg(test)]
 mod tests {
-    use super::MIGRATION_SESSION_SETUP;
+    use super::MIGRATION_CONN_OPTIONS;
 
-    /// R-F3b: the runner's first statement turns DDL forwarding off, before it
-    /// prepares the schema or runs any migration (structural: the runner needs
-    /// a live Postgres; test_ddl_forwarding_invalid_db covers the behaviour).
+    /// R-F3b, audit hardening 5: the migration connection starts with DDL
+    /// forwarding off (a startup option in its connection options, which
+    /// `apply_config` appends to the connection), not a SET run on it
+    /// (structural: the runner needs a live Postgres; test_ddl_forwarding_invalid_db
+    /// covers the behaviour).
     #[test]
-    fn the_runner_turns_forwarding_off_first() {
-        assert_eq!(MIGRATION_SESSION_SETUP, "SET neon.forward_ddl = false");
+    fn the_migration_connection_starts_with_forwarding_off() {
+        let options: Vec<&str> = MIGRATION_CONN_OPTIONS.split_whitespace().collect();
+        assert!(
+            options
+                .windows(2)
+                .any(|w| w == ["-c", "neon.forward_ddl=off"]),
+            "{MIGRATION_CONN_OPTIONS:?} lacks -c neon.forward_ddl=off"
+        );
         let source = include_str!("migration.rs");
         let code = &source[..source.find("#[cfg(test)]").unwrap()];
-        let body = &code[code.find("pub async fn run_migrations").unwrap()..];
-        let first_query = body.find(".simple_query(").unwrap();
         assert!(
-            body[first_query..].starts_with(".simple_query(MIGRATION_SESSION_SETUP)"),
-            "the first query of run_migrations must be MIGRATION_SESSION_SETUP"
+            !code.contains("SET neon.forward_ddl"),
+            "forwarding is turned off at connect, not by a SET"
         );
-        let setup_end = first_query + body[first_query..].find('?').unwrap();
-        for later in [
-            "self.prepare_database()",
-            "self.get_migration_id()",
-            "run_migration(",
-        ] {
-            let at = body.find(later).unwrap();
-            assert!(setup_end < at, "{later} runs after the setup");
-        }
+        let compute = include_str!("compute.rs");
+        assert!(
+            compute.contains("append_conn_options(&mut migration_conf, MIGRATION_CONN_OPTIONS)")
+        );
     }
 }

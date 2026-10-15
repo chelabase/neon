@@ -288,7 +288,7 @@ fn only_a_failure_that_leaves_a_fail_open_migration_unapplied_is_fatal() {
     assert!(fatal_failure(&[Skip, FailClosed, FailOpen], 0));
     assert_eq!(
         MIGRATION_CONN_OPTIONS,
-        "-c lock_timeout=5s -c statement_timeout=2min"
+        "-c lock_timeout=5s -c statement_timeout=2min -c neon.forward_ddl=off"
     );
 }
 
