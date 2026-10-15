@@ -2206,6 +2206,30 @@ NeonProcessUtility(
 	}
 
 	/*
+	 * Nor renamed (R-F3c): ALTER DATABASE main RENAME TO x; DROP DATABASE x
+	 * would get around the refusal above. Renaming another database to a
+	 * protected name is refused too, so the protection can't be moved onto
+	 * it. Superusers can still do both.
+	 */
+	if (IsA(parseTree, RenameStmt) &&
+		castNode(RenameStmt, parseTree)->renameType == OBJECT_DATABASE &&
+		!superuser())
+	{
+		RenameStmt *renamestmt = castNode(RenameStmt, parseTree);
+
+		if (IsProtectedDatabase(renamestmt->subname))
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("the branch's main database \"%s\" can't be renamed",
+							renamestmt->subname)));
+		if (IsProtectedDatabase(renamestmt->newname))
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("a database can't be renamed to the branch's main database name \"%s\"",
+							renamestmt->newname)));
+	}
+
+	/*
 	 * The process utility hook for CREATE EVENT TRIGGER is its own
 	 * implementation and warrant being addressed separately from here.
 	 */

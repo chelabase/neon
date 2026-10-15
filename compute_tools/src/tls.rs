@@ -4,17 +4,17 @@ use std::{
     path::Path,
     sync::{
         Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering as MemOrder},
     },
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
+use aws_lc_rs::digest;
 use compute_api::responses::TlsConfig;
-use ring::digest;
 use x509_cert::Certificate;
 
-/// The SHA-256 digest of a certificate file's bytes.
+/// A SHA-256 digest of the TLS files' bytes.
 #[derive(Clone, Copy)]
 pub struct CertDigest(digest::Digest);
 
@@ -73,12 +73,15 @@ impl CertWatch {
 
     /// One poll: runs `reload` when `now` differs from the loaded digest or an
     /// earlier reload failed (it may have written files before failing, so pgdata
-    /// no longer matches what Postgres serves); never otherwise.
+    /// no longer matches what Postgres serves); never otherwise. A `reload` that
+    /// panics counts as a failed one: retried at the next poll.
     pub fn poll(&mut self, now: CertDigest, reload: impl FnOnce() -> Result<()>) -> CertPoll {
         if !self.pending && now == self.loaded {
             return CertPoll::Unchanged;
         }
-        match reload() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(reload))
+            .unwrap_or_else(|panic| Err(panicked(&*panic)));
+        match result {
             Ok(()) => {
                 self.loaded = now;
                 self.pending = false;
@@ -96,19 +99,41 @@ impl CertWatch {
     }
 }
 
-/// Reads `cert_path` and digests it.
-pub fn read_cert_digest(cert_path: &str) -> Result<CertDigest> {
-    let data = std::fs::read(cert_path).with_context(|| format!("read {cert_path}"))?;
-    Ok(CertDigest::of(&data))
+/// The error for a reload that panicked, with the panic's message.
+fn panicked(panic: &(dyn std::any::Any + Send)) -> anyhow::Error {
+    let what = panic
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_default();
+    anyhow::anyhow!("the reload panicked: {what}")
 }
 
-/// Waits until `cert_path` can be read and returns its digest.
-pub async fn wait_for_cert(cert_path: &str) -> CertDigest {
+/// One digest of the key, the certificate and (with `ca_path`) the CA file,
+/// each prefixed by its length, so a change to any of them (a CA-only rotation
+/// included) changes it. An unreadable file is an error.
+pub fn read_tls_digest(tls: &TlsConfig) -> Result<CertDigest> {
+    let mut ctx = digest::Context::new(&digest::SHA256);
+    let paths = [
+        Some(&tls.key_path),
+        Some(&tls.cert_path),
+        tls.ca_path.as_ref(),
+    ];
+    for path in paths.into_iter().flatten() {
+        let data = std::fs::read(path).with_context(|| format!("read {path}"))?;
+        ctx.update(&(data.len() as u64).to_be_bytes());
+        ctx.update(&data);
+    }
+    Ok(CertDigest(ctx.finish()))
+}
+
+/// Waits until [`read_tls_digest`] succeeds and returns its digest.
+pub async fn wait_for_tls(tls: &TlsConfig) -> CertDigest {
     loop {
-        match tokio::fs::read(cert_path).await {
-            Ok(data) => break CertDigest::of(&data),
+        match read_tls_digest(tls) {
+            Ok(digest) => break digest,
             Err(e) => {
-                tracing::error!("could not read cert file {cert_path}: {e:?}");
+                tracing::error!(error = ?e, "could not read the TLS files");
                 tokio::time::sleep(Duration::from_secs(1)).await
             }
         }
@@ -144,6 +169,12 @@ pub fn reload_tls_files(
     try_update_key_path_blocking(pgdata, tls)
         .context("copy the TLS key and certificate into pgdata")?;
     reload().context("reload Postgres")
+}
+
+/// One attempt at copying the key and certificate into `pgdata` (checked as
+/// [`reload_tls_files`] checks them); nothing is written on failure.
+pub(crate) fn copy_tls_files(pgdata: &Path, tls: &TlsConfig) -> Result<()> {
+    try_update_key_path_blocking(pgdata, tls)
 }
 
 /// Serialises copies into pgdata within this process (the certificate watcher
@@ -186,7 +217,7 @@ fn write_private_file(dir: &Path, name: &str, data: &[u8]) -> Result<()> {
     let tmp = dir.join(format!(
         "{name}.tmp.{}.{}",
         std::process::id(),
-        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        TMP_SEQ.fetch_add(1, MemOrder::Relaxed)
     ));
     let result = (|| {
         let mut file = std::fs::OpenOptions::new()
@@ -214,6 +245,7 @@ const MAX_CHAIN_DEPTH: usize = 8;
 /// intermediates) chains to a certificate in the PEM bundle `ca`: each link's
 /// issuer names the next certificate's subject and its signature verifies with
 /// that certificate's key. Only P-256 ECDSA (SHA-256) is accepted, as for keys.
+/// The server certificate must be valid now (not expired, not yet to come).
 pub fn verify_cert_chains_to_ca(cert: &str, ca: &str) -> Result<()> {
     let chain = Certificate::load_pem_chain(cert.as_bytes())
         .context("decoding PEM encoded certificates")?;
@@ -222,6 +254,20 @@ pub fn verify_cert_chains_to_ca(cert: &str, ca: &str) -> Result<()> {
     let Some(mut current) = chain.first() else {
         bail!("no certificates found");
     };
+    let validity = &current.tbs_certificate.validity;
+    let now = std::time::SystemTime::now();
+    if now < validity.not_before.to_system_time() {
+        bail!(
+            "the certificate isn't valid yet (not before {:?})",
+            validity.not_before
+        );
+    }
+    if now > validity.not_after.to_system_time() {
+        bail!(
+            "the certificate has expired (not after {:?})",
+            validity.not_after
+        );
+    }
     if cas.is_empty() {
         bail!("no CA certificates found");
     }
@@ -271,7 +317,8 @@ fn signed_by(cert: &Certificate, issuer: &Certificate) -> Result<()> {
         .subject_public_key
         .as_bytes()
         .context("the CA key isn't a whole number of bytes")?;
-    ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_ASN1, key)
+    use aws_lc_rs::signature::{ECDSA_P256_SHA256_ASN1, UnparsedPublicKey};
+    UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, key)
         .verify(&tbs, signature)
         .map_err(|_| anyhow::anyhow!("signature mismatch"))
 }

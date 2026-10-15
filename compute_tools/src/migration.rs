@@ -20,13 +20,11 @@ pub enum MigrationKind {
 
 /// Options of the connection the migrations run on (RT3-14): a migration waiting
 /// on a customer's lock, or running away, can't hold the start forever. A timeout
-/// is a failure like any other.
-pub const MIGRATION_CONN_OPTIONS: &str = "-c lock_timeout=5s -c statement_timeout=2min";
-
-/// Run first on the migration connection by [`MigrationRunner::run_migrations`]
-/// (R-F3b): the migrations aren't forwarded to the control plane, as
-/// `apply_config`'s own changes aren't.
-pub const MIGRATION_SESSION_SETUP: &str = "SET neon.forward_ddl = false";
+/// is a failure like any other. DDL forwarding is off from the connection's start
+/// (R-F3b): the migrations are compute_ctl's own changes, never the control
+/// plane's, so a start never depends on the console being reachable.
+pub const MIGRATION_CONN_OPTIONS: &str =
+    "-c lock_timeout=5s -c statement_timeout=2min -c neon.forward_ddl=off";
 
 /// Whether the failure of migration `failed` (0-based index into `kinds`) fails
 /// the start: the runner stops at the first failure, so the failed migration and
@@ -190,15 +188,6 @@ impl<'m> MigrationRunner<'m> {
 
     /// Run the configured set of migrations
     pub async fn run_migrations(mut self) -> Result<(), MigrationFailure> {
-        // First, before anything else on this connection: the migrations are
-        // compute_ctl's own changes, never the control plane's, so nothing is
-        // forwarded and a start never depends on the console being reachable.
-        self.client
-            .simple_query(MIGRATION_SESSION_SETUP)
-            .await
-            .context("turn DDL forwarding off for the migrations")
-            .map_err(MigrationFailure::before_migrations)?;
-
         self.prepare_database()
             .await
             .context("prepare database to handle migrations")

@@ -62,7 +62,7 @@ use crate::rsyslog::{
 use crate::spec::*;
 use crate::swap::resize_swap;
 use crate::sync_sk::{check_if_synced, ping_safekeeper};
-use crate::tls::{CertPoll, CertWatch, read_cert_digest, reload_tls_files, wait_for_cert};
+use crate::tls::{CertPoll, CertWatch, read_tls_digest, reload_tls_files, wait_for_tls};
 use crate::{config, extension_server, local_proxy};
 
 pub static SYNC_SAFEKEEPERS_PID: AtomicU32 = AtomicU32::new(0);
@@ -2087,32 +2087,19 @@ impl ComputeNode {
         let conf = PostgresLogsRsyslogConfig::new(spec.logs_export_host.as_deref());
         configure_postgres_logs_export(conf)?;
 
-        // Write new config
+        // Write the new config: postgresql.conf, the member-login block and the
+        // ident lines (E-m3), all-or-nothing, so a failure leaves the running
+        // config's files as they were; the reload below makes Postgres read them.
         let pgdata_path = Path::new(&self.params.pgdata);
         let postgres_port = self.params.connstr.port();
-        config::write_postgres_conf(
+        config::rewrite_config_files(
             pgdata_path,
             &self.params,
             &spec,
             postgres_port,
             self.params.internal_http_port,
             tls_config,
-            spec.databricks_settings.as_ref(),
             self.params.lakebase_mode,
-        )?;
-        // The member-login block and ident lines follow the new spec (E-m3); the
-        // reload below makes Postgres read them.
-        let databricks_settings = spec.databricks_settings.as_ref();
-        update_pg_hba(
-            pgdata_path,
-            databricks_settings.map(|s| &s.databricks_pg_hba),
-            spec.member_logins.as_ref(),
-            tls_config.is_some(),
-        )?;
-        update_pg_ident(
-            pgdata_path,
-            databricks_settings.map(|s| &s.databricks_pg_ident),
-            spec.member_logins.as_ref(),
         )?;
 
         self.pg_reload_conf()?;
@@ -2183,18 +2170,23 @@ impl ComputeNode {
         Ok(())
     }
 
-    /// Waits until the certificate exists (Postgres can't start without it), then
-    /// watches it: on a change, copies the new key and certificate into pgdata and
-    /// reloads Postgres; the compute's status is never touched (RT3-1). A reload
-    /// that fails (e.g. a renewal seen with the new certificate but the old key)
-    /// stays pending and is retried at every poll until it succeeds, even if the
-    /// certificate doesn't change again ([`CertWatch`]).
+    /// Waits until the TLS files can be read (Postgres can't start without them),
+    /// then watches the key, certificate and CA file together: on a change to any
+    /// of them, copies the new key and certificate into pgdata and reloads
+    /// Postgres; the compute's status is never touched (RT3-1). A reload that
+    /// fails or panics (e.g. a renewal seen with the new certificate but the old
+    /// key) stays pending and is retried at every poll until it succeeds, even if
+    /// the files don't change again ([`CertWatch`]). The loop ends only when the
+    /// compute terminates.
     pub async fn watch_cert_for_changes(self: Arc<Self>, tls_config: TlsConfig) {
-        let loaded = wait_for_cert(&tls_config.cert_path).await;
+        let loaded = wait_for_tls(&tls_config).await;
 
         tokio::spawn(async move {
             let pgdata = Path::new(&self.params.pgdata).to_owned();
-            let mut watch = CertWatch::new(loaded);
+            // Shared with each blocking step, so a step that panics (the
+            // reload's own panics are a failed reload inside CertWatch::poll)
+            // loses nothing: the loop goes on from the same state.
+            let watch = Arc::new(Mutex::new(CertWatch::new(loaded)));
             loop {
                 tokio::time::sleep(CERT_RELOAD_RETRY).await;
 
@@ -2214,31 +2206,30 @@ impl ComputeNode {
                     | ComputeStatus::RefreshConfigurationPending => {}
                 }
 
-                let now = match read_cert_digest(&tls_config.cert_path) {
+                let now = match read_tls_digest(&tls_config) {
                     Ok(now) => now,
                     Err(e) => {
-                        warn!(error = ?e, "could not read the TLS certificate, retrying at the next poll");
+                        warn!(error = ?e, "could not read the TLS files, retrying at the next poll");
                         continue;
                     }
                 };
                 let (this, tls, pgdata) = (self.clone(), tls_config.clone(), pgdata.clone());
+                let watch = watch.clone();
                 let step = tokio::task::spawn_blocking(move || {
-                    let poll = watch.poll(now, || {
-                        reload_tls_files(&pgdata, &tls, || this.pg_reload_conf())
-                    });
+                    let poll = watch
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .poll(now, || {
+                            reload_tls_files(&pgdata, &tls, || this.pg_reload_conf())
+                        });
                     if poll == CertPoll::Reloaded {
-                        info!("reloaded Postgres with the changed TLS certificate");
+                        info!("reloaded Postgres with the changed TLS files");
                         this.refresh_tls_consumers();
                     }
-                    watch
                 })
                 .await;
-                match step {
-                    Ok(next) => watch = next,
-                    Err(e) => {
-                        error!(error = ?e, "the TLS certificate watcher failed");
-                        break;
-                    }
+                if let Err(e) = step {
+                    error!(error = ?e, "a TLS watcher step failed, going on at the next poll");
                 }
             }
         });

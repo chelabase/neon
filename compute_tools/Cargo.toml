@@ -13,6 +13,8 @@ testing = ["fail/failpoints"]
 async-compression.workspace = true
 base64.workspace = true
 aws-config.workspace = true
+# The TLS checks' digests and signatures (aws-lc-rs over ring).
+aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys"] }
 aws-sdk-s3.workspace = true
 aws-sdk-kms.workspace = true
 aws-smithy-types.workspace = true
@@ -46,7 +48,6 @@ pageserver_page_api.workspace = true
 postgres.workspace = true
 regex.workspace = true
 reqwest = { workspace = true, features = ["json"] }
-ring = "0.17"
 scopeguard.workspace = true
 serde.workspace = true
 serde_with.workspace = true

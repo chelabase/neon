@@ -15,7 +15,6 @@ use tokio_postgres::Client;
 use tracing::{error, info, instrument};
 
 use crate::compute::ComputeNodeParams;
-use crate::config;
 use crate::metrics::{CPLANE_REQUESTS_TOTAL, CPlaneRequestRPC, UNKNOWN_HTTP_STATUS};
 use crate::migration::{MigrationFailure, MigrationKind, MigrationRunner};
 use crate::params::PG_HBA_ALL_MD5;
@@ -316,6 +315,61 @@ pub fn update_pg_hba(
     member_logins: Option<&MemberLogins>,
     tls: bool,
 ) -> Result<()> {
+    plan_pg_hba(pgdata_path, databricks_pg_hba, member_logins, tls)?.write()?;
+    Ok(())
+}
+
+/// Check `pg_ident.conf` and update if needed: the member-login map lines
+/// (between their markers, replaced as a whole so a CN dropped from
+/// `client_cns` stops mapping; the rest of the file kept), and the databricks
+/// include.
+pub fn update_pg_ident(
+    pgdata_path: &Path,
+    databricks_pg_ident: Option<&String>,
+    member_logins: Option<&MemberLogins>,
+) -> Result<()> {
+    plan_pg_ident(pgdata_path, databricks_pg_ident, member_logins)?.write()?;
+    Ok(())
+}
+
+/// A configuration file's new content, computed and checked but not written yet,
+/// so several files can be rewritten all-or-nothing.
+pub(crate) struct ConfRewrite {
+    path: std::path::PathBuf,
+    current: String,
+    updated: String,
+}
+
+impl ConfRewrite {
+    /// Writes the new content (through a temporary file and a rename) when it
+    /// differs from the file's; returns whether it wrote.
+    pub(crate) fn write(&self) -> Result<bool> {
+        let wrote = write_conf_file(&self.path, &self.current, &self.updated)?;
+        if wrote {
+            info!("updated {}", self.path.display());
+        }
+        Ok(wrote)
+    }
+}
+
+/// `text` with `line` (compared without its line end) added at the end unless a
+/// line of `text` already equals it.
+fn with_line(text: String, line: &str) -> String {
+    let bare = line.trim_end_matches('\n');
+    if text.lines().any(|l| l == bare) {
+        return text;
+    }
+    let sep = if text.is_empty() { "" } else { "\n" };
+    format!("{text}{sep}{line}")
+}
+
+/// The new `pg_hba.conf` (see [`update_pg_hba`]), not written.
+pub(crate) fn plan_pg_hba(
+    pgdata_path: &Path,
+    databricks_pg_hba: Option<&String>,
+    member_logins: Option<&MemberLogins>,
+    tls: bool,
+) -> Result<ConfRewrite> {
     // XXX: consider making it a part of config.json
     let pghba_path = pgdata_path.join("pg_hba.conf");
 
@@ -340,46 +394,33 @@ pub fn update_pg_hba(
         &block,
         "pg_hba.conf",
     )?;
-    if write_conf_file(&pghba_path, &current, &updated)? {
-        info!("updated the member-login block in pg_hba.conf");
-    } else {
-        info!("pg_hba.conf already has the member-login block");
-    }
 
     // Update pg_hba to contains databricks specfic settings before adding neon settings
     // PG uses the first record that matches to perform authentication, so we need to have
     // our rules before the default ones from neon.
     // See https://www.postgresql.org/docs/current/auth-pg-hba-conf.html
-    if let Some(databricks_pg_hba) = databricks_pg_hba {
-        if config::line_in_file(
-            &pghba_path,
+    let updated = match databricks_pg_hba {
+        Some(databricks_pg_hba) => with_line(
+            updated,
             &format!("include_if_exists {}\n", *databricks_pg_hba),
-        )? {
-            info!("updated pg_hba.conf to include databricks_pg_hba.conf");
-        } else {
-            info!("pg_hba.conf already included databricks_pg_hba.conf");
-        }
-    }
+        ),
+        None => updated,
+    };
+    let updated = with_line(updated, PG_HBA_ALL_MD5);
 
-    if config::line_in_file(&pghba_path, PG_HBA_ALL_MD5)? {
-        info!("updated pg_hba.conf to allow external connections");
-    } else {
-        info!("pg_hba.conf is up-to-date");
-    }
-
-    Ok(())
+    Ok(ConfRewrite {
+        path: pghba_path,
+        current,
+        updated,
+    })
 }
 
-/// Check `pg_ident.conf` and update if needed: the member-login map lines
-/// (between their markers, replaced as a whole so a CN dropped from
-/// `client_cns` stops mapping; the rest of the file kept), and the databricks
-/// include.
-pub fn update_pg_ident(
+/// The new `pg_ident.conf` (see [`update_pg_ident`]), not written.
+pub(crate) fn plan_pg_ident(
     pgdata_path: &Path,
     databricks_pg_ident: Option<&String>,
     member_logins: Option<&MemberLogins>,
-) -> Result<()> {
-    info!("checking pg_ident.conf");
+) -> Result<ConfRewrite> {
     let pgident_path = pgdata_path.join("pg_ident.conf");
 
     let block = format!(
@@ -407,23 +448,21 @@ pub fn update_pg_ident(
         &block,
         "pg_ident.conf",
     )?;
-    if write_conf_file(&pgident_path, &current, &updated)? {
-        info!("updated the member certificate map in pg_ident.conf");
-    }
 
     // Update pg_ident to contains databricks specfic settings
-    if let Some(databricks_pg_ident) = databricks_pg_ident {
-        if config::line_in_file(
-            &pgident_path,
+    let updated = match databricks_pg_ident {
+        Some(databricks_pg_ident) => with_line(
+            updated,
             &format!("include_if_exists {}\n", *databricks_pg_ident),
-        )? {
-            info!("updated pg_ident.conf to include databricks_pg_ident.conf");
-        } else {
-            info!("pg_ident.conf already included databricks_pg_ident.conf");
-        }
-    }
+        ),
+        None => updated,
+    };
 
-    Ok(())
+    Ok(ConfRewrite {
+        path: pgident_path,
+        current,
+        updated,
+    })
 }
 
 /// Copy tls key_file and cert_file from k8s secret mount directory
