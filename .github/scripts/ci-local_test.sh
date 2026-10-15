@@ -263,6 +263,30 @@ else
 fi
 rm -rf "$fake_cache"
 
+# RT3-6 (T7): chelabase_keys is installed into pg_install for v17 only. The install recipe is
+# printed with MAKE=echo (its recursive $(MAKE) lines run even under -n) and its
+# prerequisites treated as done (-o).
+install_recipe() {
+    make -s -f "$root/postgres.mk" POSTGRES_VERSIONS="v14 v15 v16 v17" BUILD_DIR=/x \
+        POSTGRES_INSTALL_DIR=/y MAKE=echo -o "postgres-configure-$1" \
+        -o "postgres-headers-install-$1" "postgres-install-$1" 2>&1
+}
+if install_recipe v17 | grep -q 'contrib/chelabase_keys install'; then
+    echo "ok: v17 installs chelabase_keys"
+else
+    echo "FAIL: v17 must install chelabase_keys"
+    failures=$((failures + 1))
+fi
+for v in v14 v15 v16; do
+    if install_recipe "$v" | grep -q 'chelabase_keys'; then
+        echo "FAIL: $v must not install chelabase_keys"
+        failures=$((failures + 1))
+    else
+        echo "ok: $v skips chelabase_keys"
+    fi
+done
+expect "revisions.json pins the v17 submodule" "$(git -C "$root" rev-parse HEAD:vendor/postgres-v17)" "$(jq -r '.v17[1]' "$root/vendor/revisions.json")"
+
 if ((failures > 0)); then
     echo "$failures check(s) failed"
     exit 1
