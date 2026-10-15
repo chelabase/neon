@@ -218,6 +218,24 @@ else
     echo "ok: --test-filter needs rust-tests even with pg-check"
 fi
 
+# Shared compiler cache (round 3, T1b): every container mounts one sccache volume, whatever
+# CHELA_NEON_VOLUME_SUFFIX is, and wraps rustc with a static sccache binary mounted read-only.
+for step in build rust-tests pg-check; do
+    args="$(CHELA_NEON_VOLUME_SUFFIX=t9 docker_args /r v17 release "$step" | paste -sd' ' -)"
+    for want in \
+        "type=volume,src=chela-neon-sccache,dst=/home/nonroot/.cache/sccache" \
+        "SCCACHE_DIR=/home/nonroot/.cache/sccache" \
+        "RUSTC_WRAPPER=/opt/sccache/sccache" \
+        "dst=/opt/sccache,readonly"; do
+        if [[ "$args" == *"$want"* ]]; then
+            echo "ok: $step args carry $want"
+        else
+            echo "FAIL: $step args must carry $want"
+            failures=$((failures + 1))
+        fi
+    done
+done
+
 if ((failures > 0)); then
     echo "$failures check(s) failed"
     exit 1
