@@ -210,6 +210,21 @@ pub struct ComputeSpec {
 
     // Databricks specific options for compute instance.
     pub databricks_settings: Option<DatabricksSettings>,
+
+    /// Member roles (`cb_m_*`) log in only over TLS, from these source addresses,
+    /// with a client certificate whose CN is in `client_cns`. Absent: member
+    /// logins are refused.
+    #[serde(default)]
+    pub member_logins: Option<MemberLogins>,
+}
+
+/// Who may log in as a member role (`cb_m_*`): `allowed_cidrs` are the source
+/// addresses (`<ip>/<prefix>`; empty means any address), `client_cns` the client
+/// certificate CNs mapped to the member roles (must not be empty).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MemberLogins {
+    pub allowed_cidrs: Vec<String>,
+    pub client_cns: Vec<String>,
 }
 
 /// Feature flag to signal `compute_ctl` to enable certain experimental functionality.

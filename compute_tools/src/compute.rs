@@ -51,6 +51,7 @@ use crate::installed_extensions::get_installed_extensions;
 use crate::logger::{self, startup_context_from_env};
 use crate::lsn_lease::launch_lsn_lease_bg_task_for_static;
 use crate::metrics::COMPUTE_CTL_UP;
+use crate::migration::{MIGRATION_CONN_OPTIONS, MigrationFailure, fatal_failure};
 use crate::monitor::launch_monitor;
 use crate::pg_helpers::*;
 use crate::pgbouncer::*;
@@ -61,7 +62,7 @@ use crate::rsyslog::{
 use crate::spec::*;
 use crate::swap::resize_swap;
 use crate::sync_sk::{check_if_synced, ping_safekeeper};
-use crate::tls::watch_cert_for_changes;
+use crate::tls::{reload_tls_files, watch_cert_for_changes};
 use crate::{config, extension_server, local_proxy};
 
 pub static SYNC_SAFEKEEPERS_PID: AtomicU32 = AtomicU32::new(0);
@@ -78,6 +79,20 @@ pub static BUILD_TAG: Lazy<String> = Lazy::new(|| {
         .to_string()
 });
 const DEFAULT_INSTALLED_EXTENSIONS_COLLECTION_INTERVAL: u64 = 3600;
+
+/// How long a pending certificate reload waits before it is retried when the
+/// certificate doesn't change again (the watcher's poll interval).
+const CERT_RELOAD_RETRY: Duration = Duration::from_secs(60);
+
+/// Appends `extra` to the connection's `options`, keeping the ones it has (later
+/// `-c` settings win over earlier ones).
+fn append_conn_options(conf: &mut tokio_postgres::Config, extra: &str) {
+    let options = match conf.get_options() {
+        Some(options) if !options.is_empty() => format!("{options} {extra}"),
+        _ => extra.to_string(),
+    };
+    conf.options(&options);
+}
 
 /// Static configuration params that don't change after startup. These mostly
 /// come from the CLI args, or are derived from them.
@@ -1506,6 +1521,7 @@ impl ComputeNode {
 
         let tls_config = self.tls_config(&pspec.spec);
         let databricks_settings = spec.databricks_settings.as_ref();
+        let member_logins = spec.member_logins.as_ref();
         let postgres_port = self.params.connstr.port();
 
         // Remove/create an empty pgdata directory and put configuration there.
@@ -1558,11 +1574,21 @@ impl ComputeNode {
             )?;
 
             // Update pg_hba.conf received with basebackup including additional databricks settings.
-            update_pg_hba(pgdata_path, Some(&settings.databricks_pg_hba))?;
-            update_pg_ident(pgdata_path, Some(&settings.databricks_pg_ident))?;
+            update_pg_hba(
+                pgdata_path,
+                Some(&settings.databricks_pg_hba),
+                member_logins,
+                tls_config.is_some(),
+            )?;
+            update_pg_ident(
+                pgdata_path,
+                Some(&settings.databricks_pg_ident),
+                member_logins,
+            )?;
         } else {
             // Update pg_hba.conf received with basebackup.
-            update_pg_hba(pgdata_path, None)?;
+            update_pg_hba(pgdata_path, None, member_logins, tls_config.is_some())?;
+            update_pg_ident(pgdata_path, None, member_logins)?;
         }
 
         if let Some(databricks_settings) = spec.databricks_settings.as_ref() {
@@ -1878,7 +1904,8 @@ impl ComputeNode {
             // used in apply_spec_sql() should not take long (they are just creating users and installing
             // extensions). If any of them are stuck for an extended period of time it usually indicates a
             // pageserver connectivity problem and we should bail out.
-            conf.options("-c statement_timeout=2min");
+            // Appended, so the connection keeps its role/search_path/... options.
+            append_conn_options(&mut conf, "-c statement_timeout=2min");
         }
 
         let conf = Arc::new(conf);
@@ -1911,32 +1938,35 @@ impl ComputeNode {
             local_proxy::configure(&local_proxy).context("apply_config local_proxy")?;
         }
 
-        // Run migrations separately to not hold up cold starts
+        // Run the migrations before the compute reports `running` (D6), so nothing
+        // that waits for `running` overlaps them. A failure that leaves a
+        // fail-open migration unapplied fails the start (U3); any other failure
+        // is logged and counted, and the next start retries.
         let lakebase_mode = self.params.lakebase_mode;
         let params = self.params.clone();
-        tokio::spawn(async move {
-            let mut conf = conf.as_ref().clone();
-            conf.application_name("compute_ctl:migrations");
-
-            match conf.connect(NoTls).await {
-                Ok((mut client, connection)) => {
-                    tokio::spawn(async move {
-                        if let Err(e) = connection.await {
-                            eprintln!("connection error: {e}");
-                        }
-                    });
-                    if let Err(e) = handle_migrations(params, &mut client, lakebase_mode).await {
-                        error!("Failed to run migrations: {}", e);
-                    }
+        let mut migration_conf = conf.as_ref().clone();
+        migration_conf.application_name("compute_ctl:migrations");
+        append_conn_options(&mut migration_conf, MIGRATION_CONN_OPTIONS);
+        let result = tokio::runtime::Handle::current().block_on(async move {
+            let (mut client, connection) = migration_conf.connect(NoTls).await.map_err(|e| {
+                MigrationFailure::before_migrations(
+                    anyhow::Error::new(e).context("connect to the compute for running migrations"),
+                )
+            })?;
+            tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    error!("migration connection error: {e}");
                 }
-                Err(e) => {
-                    error!(
-                        "Failed to connect to the compute for running migrations: {}",
-                        e
-                    );
-                }
-            };
+            });
+            handle_migrations(params, &mut client, lakebase_mode).await
         });
+        if let Err(failure) = result {
+            if fatal_failure(&migration_kinds(), failure.index) {
+                error!("{failure}; a fail-open migration is left unapplied, failing the start");
+                return Err(anyhow::anyhow!("{failure}"));
+            }
+            error!("{failure}; no fail-open migration is left unapplied, starting anyway");
+        }
 
         Ok::<(), anyhow::Error>(())
     }
@@ -2118,48 +2148,93 @@ impl ComputeNode {
             // wait until the cert exists.
             let mut cert_watch = watch_cert_for_changes(tls_config.cert_path.clone()).await;
 
+            // On a change, copy the new key and certificate into pgdata and reload
+            // Postgres; the compute's status is never touched (RT3-1). A reload
+            // that fails (e.g. a renewal seen with the new certificate but the old
+            // key) stays pending and is retried at every poll until it succeeds,
+            // even if the certificate doesn't change again.
             tokio::task::spawn_blocking(move || {
                 let handle = tokio::runtime::Handle::current();
-                'cert_update: loop {
-                    // let postgres/pgbouncer/local_proxy know the new cert/key exists.
-                    // we need to wait until it's configurable first.
-
-                    let mut state = self.state.lock().unwrap();
-                    'status_update: loop {
-                        match state.status {
-                            // let's update the state to config pending
-                            ComputeStatus::ConfigurationPending | ComputeStatus::Running => {
-                                state.set_status(
-                                    ComputeStatus::ConfigurationPending,
-                                    &self.state_changed,
-                                );
-                                break 'status_update;
-                            }
-
-                            // exit loop
-                            ComputeStatus::Failed
-                            | ComputeStatus::TerminationPendingFast
-                            | ComputeStatus::TerminationPendingImmediate
-                            | ComputeStatus::Terminated => break 'cert_update,
-
-                            // wait
-                            ComputeStatus::Init
-                            | ComputeStatus::Configuration
-                            | ComputeStatus::RefreshConfiguration
-                            | ComputeStatus::RefreshConfigurationPending
-                            | ComputeStatus::Empty => {
-                                state = self.state_changed.wait(state).unwrap();
-                            }
+                let pgdata = Path::new(&self.params.pgdata).to_owned();
+                let mut pending = false;
+                loop {
+                    if pending {
+                        let next = handle.block_on(tokio::time::timeout(
+                            CERT_RELOAD_RETRY,
+                            cert_watch.changed(),
+                        ));
+                        if matches!(next, Ok(Err(_))) {
+                            break;
                         }
-                    }
-                    drop(state);
-
-                    // wait for a new certificate update
-                    if handle.block_on(cert_watch.changed()).is_err() {
+                    } else if handle.block_on(cert_watch.changed()).is_err() {
                         break;
+                    }
+
+                    match self.get_status() {
+                        ComputeStatus::TerminationPendingFast
+                        | ComputeStatus::TerminationPendingImmediate
+                        | ComputeStatus::Terminated => break,
+                        // Postgres isn't up yet (start_compute copies the files
+                        // itself): try again at the next poll.
+                        ComputeStatus::Init | ComputeStatus::Empty => {
+                            pending = true;
+                            continue;
+                        }
+                        ComputeStatus::Running
+                        | ComputeStatus::Failed
+                        | ComputeStatus::ConfigurationPending
+                        | ComputeStatus::Configuration
+                        | ComputeStatus::RefreshConfiguration
+                        | ComputeStatus::RefreshConfigurationPending => {}
+                    }
+
+                    match reload_tls_files(&pgdata, &tls_config, || self.pg_reload_conf()) {
+                        Ok(()) => {
+                            info!("reloaded Postgres with the changed TLS certificate");
+                            pending = false;
+                            self.refresh_tls_consumers();
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = ?e,
+                                "could not reload the changed TLS certificate, retrying at the next poll"
+                            );
+                            pending = true;
+                        }
                     }
                 }
             });
+        }
+    }
+
+    /// After a certificate change: let pgbouncer and local_proxy, when the spec
+    /// configures them, pick up the new files too.
+    fn refresh_tls_consumers(&self) {
+        let Some(spec) = self
+            .state
+            .lock()
+            .unwrap()
+            .pspec
+            .as_ref()
+            .map(|p| p.spec.clone())
+        else {
+            return;
+        };
+        let tls_config = self.tls_config(&spec).clone();
+        if let Some(pgbouncer_settings) = spec.pgbouncer_settings.clone() {
+            let tls_config = tls_config.clone();
+            tokio::spawn(async move {
+                if let Err(err) = tune_pgbouncer(pgbouncer_settings, tls_config).await {
+                    error!("error while tuning pgbouncer after a certificate change: {err:?}");
+                }
+            });
+        }
+        if let Some(local_proxy) = &spec.local_proxy_config {
+            let mut local_proxy = local_proxy.clone();
+            local_proxy.tls = tls_config;
+            if let Err(err) = local_proxy::configure(&local_proxy) {
+                error!("error while configuring local_proxy after a certificate change: {err:?}");
+            }
         }
     }
 

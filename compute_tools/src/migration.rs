@@ -5,6 +5,71 @@ use tracing::{error, info};
 
 use crate::metrics::DB_MIGRATION_FAILED;
 
+/// What a migration's failure means for the compute's start (U3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationKind {
+    /// Removes a privilege or an attribute: left unapplied, a role keeps more
+    /// rights than intended, so the start fails.
+    FailOpen,
+    /// Only grants: left unapplied, the owner has fewer rights; logged, the
+    /// compute starts and the next start retries.
+    FailClosed,
+    /// `-- SKIP`: only the id is recorded.
+    Skip,
+}
+
+/// Options of the connection the migrations run on (RT3-14): a migration waiting
+/// on a customer's lock, or running away, can't hold the start forever. A timeout
+/// is a failure like any other.
+pub const MIGRATION_CONN_OPTIONS: &str = "-c lock_timeout=5s -c statement_timeout=2min";
+
+/// Whether the failure of migration `failed` (0-based index into `kinds`) fails
+/// the start: the runner stops at the first failure, so the failed migration and
+/// every later one stay unapplied; the start fails when any of them is fail-open.
+pub fn fatal_failure(kinds: &[MigrationKind], failed: usize) -> bool {
+    kinds
+        .get(failed..)
+        .is_some_and(|unapplied| unapplied.contains(&MigrationKind::FailOpen))
+}
+
+/// A failed migration run: `index` is the 0-based index of the first migration
+/// left unapplied (the failed one, or the next one when the failure came before
+/// any migration ran, e.g. connecting or preparing the schema).
+#[derive(Debug)]
+pub struct MigrationFailure {
+    pub index: usize,
+    /// True when migration `index` itself failed.
+    pub in_migration: bool,
+    pub error: anyhow::Error,
+}
+
+impl MigrationFailure {
+    /// A failure before any migration ran, with nothing known about the
+    /// applied migrations: every migration counts as unapplied.
+    pub fn before_migrations(error: anyhow::Error) -> Self {
+        Self {
+            index: 0,
+            in_migration: false,
+            error,
+        }
+    }
+}
+
+impl std::fmt::Display for MigrationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let id = self.index + 1;
+        if self.in_migration {
+            write!(f, "migration {id} failed: {:#}", self.error)
+        } else {
+            write!(
+                f,
+                "migrations could not run (next: migration {id}): {:#}",
+                self.error
+            )
+        }
+    }
+}
+
 /// Runs a series of migrations on a target database
 pub(crate) struct MigrationRunner<'m> {
     client: &'m mut Client,
@@ -123,12 +188,17 @@ impl<'m> MigrationRunner<'m> {
     }
 
     /// Run the configured set of migrations
-    pub async fn run_migrations(mut self) -> Result<()> {
+    pub async fn run_migrations(mut self) -> Result<(), MigrationFailure> {
         self.prepare_database()
             .await
-            .context("prepare database to handle migrations")?;
+            .context("prepare database to handle migrations")
+            .map_err(MigrationFailure::before_migrations)?;
 
-        let mut current_migration = self.get_migration_id().await? as usize;
+        let mut current_migration =
+            self.get_migration_id()
+                .await
+                .context("read neon_migration.migration_id")
+                .map_err(MigrationFailure::before_migrations)? as usize;
         while current_migration < self.migrations.len() {
             // The index lags the migration ID by 1, so the current migration
             // ID is also the next index
@@ -149,7 +219,11 @@ impl<'m> MigrationRunner<'m> {
                     DB_MIGRATION_FAILED
                         .with_label_values(&[migration_id.to_string().as_str()])
                         .inc();
-                    return Err(e);
+                    return Err(MigrationFailure {
+                        index: current_migration,
+                        in_migration: true,
+                        error: e,
+                    });
                 }
             }
 
