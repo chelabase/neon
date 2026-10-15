@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, cast
 
 import pytest
-from fixtures.compute_migrations import NUM_COMPUTE_MIGRATIONS
+from fixtures.compute_migrations import COMPUTE_MIGRATIONS, NUM_COMPUTE_MIGRATIONS
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -44,6 +44,10 @@ def test_compute_migrations_retry(neon_simple_env: NeonEnv, compute_migrations_d
         assert cast("int", cur.fetchall()[0][0]) == NUM_COMPUTE_MIGRATIONS
 
 
+@pytest.mark.parametrize(
+    "migration",
+    (pytest.param((i, m), id=str(i)) for i, m in enumerate(COMPUTE_MIGRATIONS, start=1)),
+)
 def test_compute_migrations_e2e(
     neon_simple_env: NeonEnv,
     compute_migrations_dir: Path,
@@ -65,11 +69,16 @@ def test_compute_migrations_e2e(
     endpoint = env.endpoints.create("main")
     endpoint.respec(skip_pg_catalog_updates=False)
 
-    # Stop applying migrations after the one we want to test, so that we can
-    # test the state of the cluster at the given migration ID
-    endpoint.start(env={"FAILPOINTS": f"compute-migration=return({migration_id + 1})"})
-
-    endpoint.wait_for_migrations(wait_for=migration_id)
+    if migration_id + 1 == 2:
+        # U3: failing 0002 (fail-open) fails the start, so the state "after 0001" can't be
+        # held; run them all (0001's check, neon_superuser's BYPASSRLS, still holds after).
+        endpoint.start()
+        endpoint.wait_for_migrations(wait_for=NUM_COMPUTE_MIGRATIONS)
+    else:
+        # Stop applying migrations after the one we want to test, so that we can
+        # test the state of the cluster at the given migration ID
+        endpoint.start(env={"FAILPOINTS": f"compute-migration=return({migration_id + 1})"})
+        endpoint.wait_for_migrations(wait_for=migration_id)
 
     check_query = (compute_migrations_test_dir / migration_filename).read_text(encoding="utf-8")
     endpoint.safe_psql(check_query)
