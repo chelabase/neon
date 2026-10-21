@@ -26,15 +26,19 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 import requests
 from fixtures.auth_tokens import TokenScope
 from fixtures.common_types import Lsn, TenantId, TimelineId
-from fixtures.neon_fixtures import NeonEnv, NeonEnvBuilder
 from fixtures.paths import BASE_DIR
 from fixtures.safekeeper.http import MembershipConfiguration, TimelineCreateRequest
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from fixtures.neon_fixtures import NeonEnv, NeonEnvBuilder
 
 # routerify's `RouterBuilder` methods that register routes, and the HTTP method each
 # registers (`None`: a form the parser refuses, so a new route can't hide behind it).
@@ -394,7 +398,7 @@ def test_route_tables_are_complete():
 @pytest.mark.parametrize(
     "src, error",
     [
-        ('pub fn make_router() -> X { r.get(PATH, |r| h(r)) }', "not a string literal"),
+        ("pub fn make_router() -> X { r.get(PATH, |r| h(r)) }", "not a string literal"),
         ('pub fn make_router() -> X { r.add("/a", vec![], h) }', "can't read"),
         ('pub fn make_router() -> X { r.scope("/a", other) }', "can't read"),
         ('pub fn make_router() -> X { r.any_method("/a", h) }', "can't read"),
