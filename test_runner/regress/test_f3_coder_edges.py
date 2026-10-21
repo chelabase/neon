@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 import psycopg2
 import pytest
+from fixtures.pg_version import PgVersion
 from fixtures.token_files import (
     PAGESERVER_AUTH_ERRORS,
     TABLE_ROWS,
@@ -31,7 +32,6 @@ from fixtures.token_files import (
     replace_file,
     start_with_storage_auth,
 )
-from fixtures.pg_version import PgVersion
 from fixtures.utils import USE_LFC, run_only_on_postgres
 from psycopg2.errors import InsufficientPrivilege, UndefinedObject
 from werkzeug.wrappers.response import Response
@@ -62,9 +62,7 @@ def test_a_restart_after_a_clean_shutdown_records_no_discarded_slot(
     endpoint = neon_simple_env.endpoints.create_start("main")
     slot = "left_tmp"
     with endpoint.cursor() as cur:
-        cur.execute(
-            "SELECT pg_create_logical_replication_slot(%s, 'test_decoding', true)", (slot,)
-        )
+        cur.execute("SELECT pg_create_logical_replication_slot(%s, 'test_decoding', true)", (slot,))
         cur.execute("SELECT pg_read_binary_file(%s)", (f"pg_replslot/{slot}/state",))
         row = cur.fetchone()
         assert row is not None
