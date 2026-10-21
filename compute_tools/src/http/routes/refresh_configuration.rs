@@ -11,6 +11,7 @@ use http::StatusCode;
 use crate::compute::ComputeNode;
 use crate::hadron_metrics::POSTGRES_PAGESTREAM_REQUEST_ERRORS;
 use crate::http::JsonResponse;
+use crate::http::middleware::internal_auth::InternalAuth;
 
 /// The /refresh_configuration POST method is used to nudge compute_ctl to pull a new spec
 /// from the HCC and attempt to reconfigure Postgres with the new spec. The method does not wait
@@ -19,6 +20,7 @@ use crate::http::JsonResponse;
 /// guarantee that a reconfiguration will occur. The caller should consider keep sending this
 /// request while it believes that the compute configuration is out of date.
 pub(in crate::http) async fn refresh_configuration(
+    _auth: InternalAuth,
     State(compute): State<Arc<ComputeNode>>,
 ) -> Response {
     POSTGRES_PAGESTREAM_REQUEST_ERRORS.inc();

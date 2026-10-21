@@ -7,7 +7,8 @@ use std::net::IpAddr;
 
 use anyhow::{Context, Result, anyhow, bail};
 use compute_api::responses::{
-    ComputeConfig, ControlPlaneComputeStatus, ControlPlaneConfigResponse,
+    COMPUTE_CAPABILITIES, COMPUTE_CAPABILITIES_HEADER, ComputeConfig, ControlPlaneComputeStatus,
+    ControlPlaneConfigResponse,
 };
 use compute_api::spec::MemberLogins;
 use reqwest::StatusCode;
@@ -29,6 +30,9 @@ fn do_control_plane_request(
     let resp = reqwest::blocking::Client::new()
         .get(uri)
         .header("Authorization", format!("Bearer {jwt}"))
+        // RT4-2: what this compute_ctl can do, so the control plane gives it
+        // expiring storage tokens only when it can refresh them.
+        .header(COMPUTE_CAPABILITIES_HEADER, COMPUTE_CAPABILITIES.join(","))
         .send()
         .map_err(|e| {
             (

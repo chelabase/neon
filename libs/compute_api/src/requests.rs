@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::privilege::Privilege;
 use crate::responses::ComputeCtlConfig;
-use crate::spec::{ComputeSpec, ExtVersion, PgIdent};
+use crate::spec::{ComputeSpec, ExtVersion, PgIdent, StorageAuthToken};
 
 /// The value to place in the [`ComputeClaims::audience`] claim.
 pub static COMPUTE_AUDIENCE: &str = "compute";
@@ -65,6 +65,13 @@ pub struct ComputeClaims {
 pub struct ConfigurationRequest {
     pub spec: ComputeSpec,
     pub compute_ctl_config: ComputeCtlConfig,
+}
+
+/// Request of the `POST /storage_token` API: a new tenant storage token for
+/// the compute's token file (its `Debug` is redacted).
+#[derive(Debug, Deserialize, Serialize)]
+pub struct StorageTokenRequest {
+    pub token: StorageAuthToken,
 }
 
 #[derive(Deserialize, Debug)]

@@ -7,7 +7,7 @@ use compute_api::responses::{
 };
 use compute_api::spec::{
     ComputeAudit, ComputeFeature, ComputeMode, ComputeSpec, ExtVersion, GenericOption,
-    PageserverConnectionInfo, PageserverProtocol, PgIdent, Role,
+    PageserverConnectionInfo, PageserverProtocol, PgIdent, Role, StorageAuthToken,
 };
 use futures::StreamExt;
 use futures::future::join_all;
@@ -24,7 +24,7 @@ use remote_storage::{DownloadError, RemotePath};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::os::unix::fs::{PermissionsExt, symlink};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -63,7 +63,7 @@ use crate::spec::*;
 use crate::swap::resize_swap;
 use crate::sync_sk::{check_if_synced, ping_safekeeper};
 use crate::tls::{CertPoll, CertWatch, read_tls_digest, reload_tls_files, wait_for_tls};
-use crate::{config, extension_server, local_proxy};
+use crate::{config, extension_server, local_proxy, token_file};
 
 pub static SYNC_SAFEKEEPERS_PID: AtomicU32 = AtomicU32::new(0);
 pub static PG_PID: AtomicU32 = AtomicU32::new(0);
@@ -172,6 +172,13 @@ pub struct ComputeNodeParams {
     pub build_tag: String,
     pub control_plane_uri: Option<String>,
     pub config_path_test_only: Option<OsString>,
+
+    /// The file the internal API secret is written to at start (outside
+    /// pgdata; `--internal-api-token-file`), read by every internal caller.
+    pub internal_api_token_file: PathBuf,
+    /// The file the tenant storage token is written to (outside pgdata;
+    /// `--storage-auth-token-file`), read by the neon extension.
+    pub storage_auth_token_file: PathBuf,
 }
 
 type TaskHandle = Mutex<Option<JoinHandle<()>>>;
@@ -200,6 +207,11 @@ pub struct ComputeNode {
     /// Handle to the extension stats collection task
     extension_stats_task: TaskHandle,
     lfc_offload_task: TaskHandle,
+
+    /// The internal API's per-start secret (D2): every internal route needs it
+    /// as a bearer. Written to `params.internal_api_token_file` at start; never
+    /// logged (`ComputeNode` has no `Debug`).
+    internal_api_secret: String,
 }
 
 // store some metrics about download size that might impact startup time
@@ -298,10 +310,73 @@ pub struct ParsedSpec {
     pub timeline_id: TimelineId,
     pub pageserver_conninfo: PageserverConnectionInfo,
     pub safekeeper_connstrings: Vec<String>,
-    pub storage_auth_token: Option<String>,
+    /// The tenant storage token (`None` when the spec has none or an empty
+    /// one: storage auth is off). Replaced in place by `POST /storage_token`.
+    pub storage_auth_token: Option<StorageAuthToken>,
     /// k8s dns name and port
     pub endpoint_storage_addr: Option<String>,
     pub endpoint_storage_token: Option<String>,
+}
+
+/// Why `POST /storage_token` changed nothing.
+#[derive(Debug)]
+pub enum StorageTokenRefusal {
+    /// The token is outside the token alphabet or size (400).
+    InvalidToken,
+    /// Not `running` or `configuration_pending` (412).
+    InvalidStatus(ComputeStatus),
+    /// The compute started without a storage token (400: a restart is needed).
+    StartedWithoutStorageAuth,
+    /// The file couldn't be written; the old file and token are kept (500).
+    WriteFailed(anyhow::Error),
+}
+
+/// An internal request (`/grants`, `/extensions`) refused by its rules before
+/// anything ran (RT4-6): answered `403`.
+#[derive(Debug)]
+pub struct RequestRefused(pub String);
+
+impl std::fmt::Display for RequestRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RequestRefused {}
+
+/// RT4-6, the name rules of `/grants` (no catalog needed): only `USAGE` and
+/// `CREATE`; never a system schema (`pg_*`, `information_schema`); never to
+/// `PUBLIC`, `cloud_admin`, the privileged role, a `pg_*` role, a member role
+/// (`cb_m_*`, any case) or `chelabase_realtime`.
+pub fn grant_refusal(
+    schema: &str,
+    role: &str,
+    privileges: &[Privilege],
+    privileged_role_name: &str,
+) -> Option<String> {
+    if let Some(p) = privileges
+        .iter()
+        .find(|p| !matches!(p, Privilege::Usage | Privilege::Create))
+    {
+        return Some(format!(
+            "only USAGE and CREATE can be granted, not {}",
+            p.as_str()
+        ));
+    }
+    if schema.starts_with("pg_") || schema == "information_schema" {
+        return Some("grants on a system schema are not allowed".to_string());
+    }
+    let lower = role.to_ascii_lowercase();
+    if lower == "public"
+        || role == "cloud_admin"
+        || role == privileged_role_name
+        || role.starts_with("pg_")
+        || lower.starts_with("cb_m_")
+        || role == "chelabase_realtime"
+    {
+        return Some("grants to this role are not allowed".to_string());
+    }
+    None
 }
 
 impl ParsedSpec {
@@ -345,7 +420,16 @@ impl ParsedSpec {
 
 impl TryFrom<ComputeSpec> for ParsedSpec {
     type Error = anyhow::Error;
-    fn try_from(spec: ComputeSpec) -> Result<Self, anyhow::Error> {
+    fn try_from(mut spec: ComputeSpec) -> Result<Self, anyhow::Error> {
+        // An empty storage token is no token: storage auth is off.
+        if spec
+            .storage_auth_token
+            .as_ref()
+            .is_some_and(|t| t.as_str().is_empty())
+        {
+            spec.storage_auth_token = None;
+        }
+
         // Extract the options from the spec file that are needed to connect to
         // the storage system.
         //
@@ -633,7 +717,97 @@ impl ComputeNode {
             compute_ctl_config: config.compute_ctl_config,
             extension_stats_task: Mutex::new(None),
             lfc_offload_task: Mutex::new(None),
+            internal_api_secret: token_file::generate_internal_api_secret(),
         })
+    }
+
+    /// The internal API's per-start secret (the bearer every internal route
+    /// needs).
+    pub fn internal_api_secret(&self) -> &str {
+        &self.internal_api_secret
+    }
+
+    /// Writes the internal API secret to its token file.
+    fn write_internal_api_token_file(&self) -> Result<()> {
+        token_file::write_token_file(
+            &self.params.internal_api_token_file,
+            &self.internal_api_secret,
+        )
+        .context("write the internal API token file")
+    }
+
+    /// Writes the storage token `pspec` holds to the storage token file, or,
+    /// with storage auth off, removes a file an earlier start left (Postgres is
+    /// then given an empty path and reads none).
+    fn write_storage_token_file(&self, pspec: &ParsedSpec) -> Result<()> {
+        let path = &self.params.storage_auth_token_file;
+        match &pspec.storage_auth_token {
+            Some(token) => token_file::write_token_file(path, token.as_str())
+                .context("write the storage token file"),
+            None => token_file::remove_token_file(path),
+        }
+    }
+
+    /// RT4-7 and SP6: whether a new spec may replace the one a started compute
+    /// holds. Storage auth can't be turned off (a refresh never downgrades a
+    /// compute to "no auth") nor on (the token file's path is a postmaster
+    /// setting, fixed at start) without a restart. The reason never contains a
+    /// token.
+    pub fn storage_auth_change_refusal(
+        held: Option<&ParsedSpec>,
+        new: &ParsedSpec,
+    ) -> Option<&'static str> {
+        let held = held.is_some_and(|p| p.storage_auth_token.is_some());
+        match (held, new.storage_auth_token.is_some()) {
+            (true, false) => Some(
+                "the spec has no storage_auth_token, but this compute authenticates to storage; restart the compute to turn storage auth off",
+            ),
+            (false, true) => Some(
+                "compute started without storage auth; restart to enable it",
+            ),
+            _ => None,
+        }
+    }
+
+    /// A refusal of a new spec's storage token, before anything changes: one
+    /// outside the token alphabet or size could never be written to the file.
+    pub fn storage_token_refusal(new: &ParsedSpec) -> Option<&'static str> {
+        match &new.storage_auth_token {
+            Some(token) if !token_file::is_valid_token(token.as_str()) => Some(
+                "storage_auth_token is not a valid token (one line of [A-Za-z0-9._~+/=-], 1-8191 bytes)",
+            ),
+            _ => None,
+        }
+    }
+
+    /// `POST /storage_token` (RT4-3, SP5, SP6, SP7): writes `token` to the
+    /// storage token file and replaces the token compute_ctl holds (its own
+    /// basebackup, sync and LSN-lease calls read it), under the state lock, in
+    /// `running` or `configuration_pending` only. Nothing else changes: no
+    /// status change, no reload (the neon extension `stat`s the file).
+    pub fn refresh_storage_token(&self, token: StorageAuthToken) -> Result<(), StorageTokenRefusal> {
+        if !token_file::is_valid_token(token.as_str()) {
+            return Err(StorageTokenRefusal::InvalidToken);
+        }
+        let mut state = self.state.lock().unwrap();
+        let status = state.status;
+        if !matches!(
+            status,
+            ComputeStatus::Running | ComputeStatus::ConfigurationPending
+        ) {
+            return Err(StorageTokenRefusal::InvalidStatus(status));
+        }
+        let Some(pspec) = state.pspec.as_mut() else {
+            return Err(StorageTokenRefusal::InvalidStatus(status));
+        };
+        if pspec.storage_auth_token.is_none() {
+            return Err(StorageTokenRefusal::StartedWithoutStorageAuth);
+        }
+        token_file::write_token_file(&self.params.storage_auth_token_file, token.as_str())
+            .map_err(StorageTokenRefusal::WriteFailed)?;
+        pspec.spec.storage_auth_token = Some(token.clone());
+        pspec.storage_auth_token = Some(token);
+        Ok(())
     }
 
     /// Top-level control flow of compute_ctl. Returns a process exit code we should
@@ -658,6 +832,10 @@ impl ComputeNode {
         COMPUTE_CTL_UP
             .with_label_values(&[&BUILD_TAG, ComputeStatus::Empty.to_string().as_str()])
             .set(1);
+
+        // The internal API's secret goes to its file before anything can call
+        // the internal server or Postgres starts (D2): every caller reads it there.
+        this.write_internal_api_token_file()?;
 
         // Launch the external HTTP server first, so that we can serve control plane
         // requests while configuration is still in progress.
@@ -990,7 +1168,7 @@ impl ComputeNode {
 
         ////// START POSTGRES
         let start_time = Utc::now();
-        let pg_process = self.start_postgres(pspec.storage_auth_token.clone())?;
+        let pg_process = self.start_postgres()?;
         let postmaster_pid = pg_process.pid();
         *pg_handle = Some(pg_process);
 
@@ -1083,8 +1261,8 @@ impl ComputeNode {
         let pspec = compute_state.pspec.as_ref().expect("spec must be set");
         let lsn = if matches!(pspec.spec.mode, compute_api::spec::ComputeMode::Primary) {
             info!("syncing safekeepers on shutdown");
-            let storage_auth_token = pspec.storage_auth_token.clone();
-            let lsn = self.sync_safekeepers(storage_auth_token)?;
+            // The token comes from the storage token file, as for Postgres.
+            let lsn = self.sync_safekeepers()?;
             info!(%lsn, "synced safekeepers");
             Some(lsn)
         } else {
@@ -1230,7 +1408,9 @@ impl ComputeNode {
                 spec.tenant_id,
                 spec.timeline_id,
                 shard0_index,
-                spec.storage_auth_token.clone(),
+                spec.storage_auth_token
+                    .as_ref()
+                    .map(|t| t.as_str().to_owned()),
                 None, // NB: base backups use payload compression
             )
             .await?;
@@ -1270,7 +1450,7 @@ impl ComputeNode {
         // Note: this overrides any password set in the connection string.
         if let Some(storage_auth_token) = &spec.storage_auth_token {
             info!("Got storage auth token from spec file");
-            config.password(storage_auth_token);
+            config.password(storage_auth_token.as_str());
         } else {
             info!("Storage auth token not set");
         }
@@ -1385,8 +1565,8 @@ impl ComputeNode {
             // Construct client
             let mut config = tokio_postgres::Config::from_str(&connstr).unwrap();
             config.options(&options);
-            if let Some(storage_auth_token) = pspec.storage_auth_token.clone() {
-                config.password(storage_auth_token);
+            if let Some(storage_auth_token) = &pspec.storage_auth_token {
+                config.password(storage_auth_token.as_str());
             }
 
             (id, config)
@@ -1456,17 +1636,16 @@ impl ComputeNode {
     // Run `postgres` in a special mode with `--sync-safekeepers` argument
     // and return the reported LSN back to the caller.
     #[instrument(skip_all)]
-    pub fn sync_safekeepers(&self, storage_auth_token: Option<String>) -> Result<Lsn> {
+    ///
+    /// The walproposer authenticates with the storage token file named in
+    /// `postgresql.conf` (RT4-11): both are written before any sync, so no
+    /// token goes through the environment.
+    pub fn sync_safekeepers(&self) -> Result<Lsn> {
         let start_time = Utc::now();
 
         let mut sync_handle = Command::new(&self.params.pgbin)
             .args(["--sync-safekeepers"])
             .env("PGDATA", &self.params.pgdata) // we cannot use -D in this mode
-            .envs(if let Some(storage_auth_token) = &storage_auth_token {
-                vec![("NEON_AUTH_TOKEN", storage_auth_token)]
-            } else {
-                vec![]
-            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -1512,11 +1691,11 @@ impl ComputeNode {
         Ok(lsn)
     }
 
-    fn sync_safekeepers_with_retries(&self, storage_auth_token: Option<String>) -> Result<Lsn> {
+    fn sync_safekeepers_with_retries(&self) -> Result<Lsn> {
         let max_retries = 5;
         let mut attempts = 0;
         loop {
-            let result = self.sync_safekeepers(storage_auth_token.clone());
+            let result = self.sync_safekeepers();
             match &result {
                 Ok(_) => {
                     if attempts > 0 {
@@ -1572,6 +1751,10 @@ impl ComputeNode {
             databricks_settings,
             self.params.lakebase_mode,
         )?;
+        // RT4-11: `postgresql.conf` names the storage token file and the file
+        // holds the token before anything (the safekeeper sync check, the
+        // `--sync-safekeepers` walproposer, Postgres) authenticates to storage.
+        self.write_storage_token_file(pspec)?;
 
         // Syncing safekeepers is only safe with primary nodes: if a primary
         // is already connected it will be kicked out, so a secondary (standby)
@@ -1583,7 +1766,7 @@ impl ComputeNode {
                     lsn
                 } else {
                     info!("starting safekeepers syncing");
-                    self.sync_safekeepers_with_retries(pspec.storage_auth_token.clone())
+                    self.sync_safekeepers_with_retries()
                         .with_context(|| "failed to sync safekeepers")?
                 };
                 info!("safekeepers synced at LSN {}", lsn);
@@ -1749,7 +1932,9 @@ impl ComputeNode {
     ///
     /// Returns a handle to the child process and a handle to the logs thread.
     #[instrument(skip_all)]
-    fn start_postgres(&self, storage_auth_token: Option<String>) -> Result<PostgresHandle> {
+    /// Starts the postmaster. The storage token reaches it only through the
+    /// token file named in `postgresql.conf`, never through its environment.
+    fn start_postgres(&self) -> Result<PostgresHandle> {
         let pgdata_path = Path::new(&self.params.pgdata);
 
         let env_vars: Vec<(String, String)> = if self.params.lakebase_mode {
@@ -1769,11 +1954,7 @@ impl ComputeNode {
                 &databricks_env_vars.endpoint_id
             );
 
-            let mut env_vars = databricks_env_vars.to_env_var_list();
-            env_vars.extend(storage_auth_token.map(|t| ("NEON_AUTH_TOKEN".to_string(), t)));
-            env_vars
-        } else if let Some(storage_auth_token) = &storage_auth_token {
-            vec![("NEON_AUTH_TOKEN".to_owned(), storage_auth_token.to_owned())]
+            databricks_env_vars.to_env_var_list()
         } else {
             vec![]
         };
@@ -2047,7 +2228,18 @@ impl ComputeNode {
     /// as it's used to reconfigure a previously started and configured Postgres node.
     #[instrument(skip_all)]
     pub fn reconfigure(&self) -> Result<()> {
-        let spec = self.state.lock().unwrap().pspec.clone().unwrap().spec;
+        // RT4-3: the spec's storage token goes to its file before anything
+        // else, so it is in place even if a later step fails. Written under the
+        // state lock, as `POST /storage_token` writes, so the file always holds
+        // the token compute_ctl holds.
+        let spec = {
+            let state = self.state.lock().unwrap();
+            let pspec = state.pspec.as_ref().expect("spec must be set");
+            if pspec.storage_auth_token.is_some() {
+                self.write_storage_token_file(pspec)?;
+            }
+            pspec.spec.clone()
+        };
 
         let tls_config = self.tls_config(&spec);
 
@@ -2504,11 +2696,73 @@ LIMIT 100",
         let mut conf = self.get_tokio_conn_conf(Some("compute_ctl:set_role_grants"));
         conf.dbname(db_name);
 
-        let (db_client, conn) = conf
+        let (mut db_client, conn) = conf
             .connect(NoTls)
             .await
             .context("Failed to connect to the database")?;
         tokio::spawn(conn);
+
+        // RT4-6, the catalog rules, checked in the transaction that grants: a
+        // schema a non-superuser owns, for an existing grantee that is no
+        // superuser and carries no `chelabase.managed_role` marker (a role-wide
+        // `pg_db_role_setting` entry, SP22). The name rules were checked by the
+        // route (`grant_refusal`).
+        let db_client = db_client
+            .transaction()
+            .await
+            .context("Failed to begin a transaction")?;
+        let schema_owner_is_superuser: Option<bool> = db_client
+            .query_opt(
+                "SELECT r.rolsuper
+                FROM pg_catalog.pg_namespace n
+                    JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) n.nspowner
+                WHERE n.nspname OPERATOR(pg_catalog.=) $1::pg_catalog.name",
+                &[schema_name],
+            )
+            .await
+            .context("Failed to look up the schema's owner")?
+            .map(|row| row.get(0));
+        match schema_owner_is_superuser {
+            None => return Err(RequestRefused("the schema does not exist".into()).into()),
+            Some(true) => {
+                return Err(RequestRefused(
+                    "grants on a schema a superuser owns are not allowed".into(),
+                )
+                .into());
+            }
+            Some(false) => {}
+        }
+        let grantee: Option<(bool, bool)> = db_client
+            .query_opt(
+                "SELECT r.rolsuper,
+                    EXISTS (
+                        SELECT 1
+                        FROM pg_catalog.pg_db_role_setting s,
+                            pg_catalog.unnest(s.setconfig) AS c(entry)
+                        WHERE s.setdatabase OPERATOR(pg_catalog.=) 0::pg_catalog.oid
+                            AND s.setrole OPERATOR(pg_catalog.=) r.oid
+                            AND pg_catalog.starts_with(c.entry, 'chelabase.managed_role=')
+                    )
+                FROM pg_catalog.pg_roles r
+                WHERE r.rolname OPERATOR(pg_catalog.=) $1::pg_catalog.name",
+                &[role_name],
+            )
+            .await
+            .context("Failed to look up the grantee")?
+            .map(|row| (row.get(0), row.get(1)));
+        match grantee {
+            None => return Err(RequestRefused("the grantee does not exist".into()).into()),
+            Some((true, _)) => {
+                return Err(RequestRefused("grants to a superuser are not allowed".into()).into());
+            }
+            Some((_, true)) => {
+                return Err(RequestRefused(
+                    "grants to a role managed by Chelabase are not allowed".into(),
+                )
+                .into());
+            }
+            Some((false, false)) => {}
+        }
 
         // TODO: support other types of grants apart from schemas?
 
@@ -2545,6 +2799,10 @@ LIMIT 100",
                 .await
                 .with_context(|| format!("Failed to execute query: {query}"))?;
         }
+        db_client
+            .commit()
+            .await
+            .context("Failed to commit the grant")?;
 
         Ok(())
     }
@@ -2565,6 +2823,35 @@ LIMIT 100",
             .await
             .context("Failed to connect to the database")?;
         tokio::spawn(conn);
+
+        // RT4-6: only a version whose control file is trusted, i.e. what the
+        // database owner could install itself; an unknown name or version (a
+        // quoting trick included) has no row and is refused too.
+        let trusted: Option<bool> = db_client
+            .query_opt(
+                "SELECT trusted FROM pg_catalog.pg_available_extension_versions
+                WHERE name OPERATOR(pg_catalog.=) $1::pg_catalog.name
+                    AND version OPERATOR(pg_catalog.=) $2::pg_catalog.text",
+                &[ext_name, &ext_version],
+            )
+            .await
+            .context("Failed to look up the extension")?
+            .map(|row| row.get(0));
+        match trusted {
+            None => {
+                return Err(RequestRefused(
+                    "no such extension version is available".into(),
+                )
+                .into());
+            }
+            Some(false) => {
+                return Err(RequestRefused(
+                    "only trusted extensions can be installed".into(),
+                )
+                .into());
+            }
+            Some(true) => {}
+        }
 
         let version_query = "SELECT extversion FROM pg_extension WHERE extname = $1";
         let version: Option<ExtVersion> = db_client

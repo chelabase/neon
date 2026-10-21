@@ -1,4 +1,4 @@
-use compute_api::responses::ComputeStatusResponse;
+use compute_api::responses::{COMPUTE_CAPABILITIES, ComputeStatusResponse};
 
 use crate::compute::ComputeState;
 
@@ -18,6 +18,7 @@ pub(in crate::http) mod metrics_json;
 pub(in crate::http) mod promote;
 pub(in crate::http) mod refresh_configuration;
 pub(in crate::http) mod status;
+pub(in crate::http) mod storage_token;
 pub(in crate::http) mod terminate;
 
 impl From<&ComputeState> for ComputeStatusResponse {
@@ -35,6 +36,7 @@ impl From<&ComputeState> for ComputeStatusResponse {
             status: state.status,
             last_active: state.last_active,
             error: state.error.clone(),
+            capabilities: COMPUTE_CAPABILITIES.iter().map(|c| c.to_string()).collect(),
         }
     }
 }

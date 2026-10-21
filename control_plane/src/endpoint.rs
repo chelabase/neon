@@ -58,8 +58,12 @@ use compute_api::responses::{
 };
 use compute_api::spec::{
     Cluster, ComputeAudit, ComputeFeature, ComputeMode, ComputeSpec, Database, PageserverProtocol,
-    PageserverShardInfo, PgIdent, RemoteExtSpec, Role,
+    PageserverShardInfo, PgIdent, RemoteExtSpec, Role, StorageAuthToken,
 };
+
+/// The file compute_ctl writes the internal API's per-start secret to, in the
+/// endpoint directory (pgdata's parent): `compute_ctl`'s default.
+const INTERNAL_API_TOKEN_FILE: &str = "compute_ctl_internal.token";
 
 // re-export these, because they're used in the reconfigure() function
 pub use compute_api::spec::{PageserverConnectionInfo, PageserverShardConnectionInfo};
@@ -592,7 +596,9 @@ impl Endpoint {
         }
     }
 
-    fn pg_ctl(&self, args: &[&str], auth_token: &Option<String>) -> Result<()> {
+    /// Runs `pg_ctl` on the endpoint's pgdata. No storage token goes through
+    /// its environment: the compute reads it from compute_ctl's token file.
+    fn pg_ctl(&self, args: &[&str]) -> Result<()> {
         let pg_ctl_path = self.env.pg_bin_dir(self.pg_version)?.join("pg_ctl");
         let mut cmd = Command::new(&pg_ctl_path);
         cmd.args(
@@ -615,11 +621,6 @@ impl Endpoint {
             "DYLD_LIBRARY_PATH",
             self.env.pg_lib_dir(self.pg_version)?.to_str().unwrap(),
         );
-
-        // Pass authentication token used for the connections to pageserver and safekeepers
-        if let Some(token) = auth_token {
-            cmd.env("NEON_AUTH_TOKEN", token);
-        }
 
         let pg_ctl = cmd
             .output()
@@ -807,7 +808,7 @@ impl Endpoint {
                 pageserver_connstring,
                 safekeepers_generation: args.safekeepers_generation.map(|g| g.into_inner()),
                 safekeeper_connstrings,
-                storage_auth_token: args.auth_token.clone(),
+                storage_auth_token: args.auth_token.clone().map(StorageAuthToken::from),
                 remote_extensions,
                 pgbouncer_settings: None,
                 shard_stripe_size: args.pageserver_conninfo.stripe_size, // redundant with pageserver_connection_info.stripe_size
@@ -1150,7 +1151,7 @@ impl Endpoint {
             let text = response.text().await.context("/terminate result")?;
             serde_json::from_str(&text).with_context(|| format!("deserializing {text}"))?
         } else {
-            if let Err(e) = self.pg_ctl(&["-m", &mode.to_string(), "stop"], &None) {
+            if let Err(e) = self.pg_ctl(&["-m", &mode.to_string(), "stop"]) {
                 // A compute whose start failed has already stopped Postgres, but
                 // compute_ctl is still up (it keeps serving the error for a
                 // while): stopping the endpoint must still stop compute_ctl.
@@ -1182,7 +1183,16 @@ impl Endpoint {
         Ok(response)
     }
 
+    /// The path of the internal API secret compute_ctl writes at every start.
+    pub fn internal_api_token_file(&self) -> PathBuf {
+        self.endpoint_path().join(INTERNAL_API_TOKEN_FILE)
+    }
+
     pub async fn refresh_configuration(&self) -> Result<()> {
+        // The internal server needs the endpoint's per-start secret (D2).
+        let token_file = self.internal_api_token_file();
+        let secret = std::fs::read_to_string(&token_file)
+            .with_context(|| format!("read {}", token_file.display()))?;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -1193,6 +1203,7 @@ impl Endpoint {
                 self.internal_http_address.ip(),
                 self.internal_http_address.port()
             ))
+            .bearer_auth(secret.trim_end_matches('\n'))
             .send()
             .await?;
 

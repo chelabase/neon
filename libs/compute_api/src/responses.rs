@@ -148,7 +148,23 @@ pub struct ComputeStatusResponse {
     #[serde(serialize_with = "rfc3339_serialize")]
     pub last_active: Option<DateTime<Utc>>,
     pub error: Option<String>,
+    /// What this compute_ctl can do beyond the base API, e.g.
+    /// [`STORAGE_TOKEN_REFRESH`]. An older compute_ctl sends none.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
+
+/// The capability of a compute_ctl that takes `POST /storage_token`: it may be
+/// given expiring tenant storage tokens and refreshed while it runs.
+pub const STORAGE_TOKEN_REFRESH: &str = "storage_token_refresh";
+
+/// Every capability this compute_ctl advertises, in `/status` and in the
+/// [`COMPUTE_CAPABILITIES_HEADER`] of its spec fetch.
+pub const COMPUTE_CAPABILITIES: &[&str] = &[STORAGE_TOKEN_REFRESH];
+
+/// The request header of compute_ctl's spec fetch that lists its capabilities
+/// (comma-separated).
+pub const COMPUTE_CAPABILITIES_HEADER: &str = "Compute-Capabilities";
 
 #[derive(Serialize, Clone, Copy, Debug, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]

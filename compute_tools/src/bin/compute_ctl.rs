@@ -30,6 +30,7 @@
 //! ```
 use std::ffi::OsString;
 use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -47,7 +48,7 @@ use compute_tools::extension_server::get_pg_version_string;
 use compute_tools::params::*;
 use compute_tools::pg_isready::get_pg_isready_bin;
 use compute_tools::spec::*;
-use compute_tools::{hadron_metrics, installed_extensions, logger::*};
+use compute_tools::{hadron_metrics, installed_extensions, logger::*, token_file};
 use rlimit::{Resource, setrlimit};
 use signal_hook::consts::{SIGINT, SIGQUIT, SIGTERM};
 use signal_hook::iterator::Signals;
@@ -134,6 +135,29 @@ struct Cli {
 
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pub lakebase_mode: bool,
+
+    /// Where to write the internal API's per-start secret (0600, outside
+    /// pgdata). Every caller of the internal server reads it there. Default:
+    /// `compute_ctl_internal.token` in pgdata's parent directory.
+    #[arg(long, value_name = "PATH")]
+    pub internal_api_token_file: Option<PathBuf>,
+
+    /// Where to write the tenant storage token (0600, outside pgdata), which
+    /// the neon extension reads for every pageserver and safekeeper
+    /// connection. Default: `storage_auth.token` in pgdata's parent directory.
+    #[arg(long, value_name = "PATH")]
+    pub storage_auth_token_file: Option<PathBuf>,
+}
+
+/// A token file's path: the flag's, or `file_name` in pgdata's parent; made
+/// absolute, since Postgres resolves a relative path in `postgresql.conf`
+/// against its data directory.
+fn token_file_path(flag: &Option<PathBuf>, pgdata: &str, file_name: &str) -> Result<PathBuf> {
+    let path = match flag {
+        Some(path) => path.clone(),
+        None => token_file::default_token_path(Path::new(pgdata), file_name),
+    };
+    std::path::absolute(&path).with_context(|| format!("make {} absolute", path.display()))
 }
 
 impl Cli {
@@ -228,6 +252,16 @@ fn main() -> Result<()> {
 
     let external_http_port = get_external_http_port(&cli);
     let internal_http_port = get_internal_http_port(&cli);
+    let internal_api_token_file = token_file_path(
+        &cli.internal_api_token_file,
+        &cli.pgdata,
+        token_file::INTERNAL_API_TOKEN_FILE,
+    )?;
+    let storage_auth_token_file = token_file_path(
+        &cli.storage_auth_token_file,
+        &cli.pgdata,
+        token_file::STORAGE_AUTH_TOKEN_FILE,
+    )?;
 
     let compute_node = ComputeNode::new(
         ComputeNodeParams {
@@ -252,6 +286,8 @@ fn main() -> Result<()> {
             build_tag: BUILD_TAG.to_string(),
             control_plane_uri: cli.control_plane_uri,
             config_path_test_only: cli.config,
+            internal_api_token_file,
+            storage_auth_token_file,
         },
         config,
     )?;
@@ -436,5 +472,42 @@ mod test {
             "",
         ])
         .expect_err("empty name is not allowed");
+    }
+
+    /// The token files default to pgdata's parent and are always absolute (a
+    /// relative path in `postgresql.conf` would be read from inside pgdata).
+    #[test]
+    fn token_file_paths_are_absolute_and_outside_pgdata() {
+        use std::path::{Path, PathBuf};
+
+        use super::token_file_path;
+
+        let p = token_file_path(&None, "/var/db/postgres/compute", "storage_auth.token").unwrap();
+        assert_eq!(p, Path::new("/var/db/postgres/storage_auth.token"));
+
+        let cwd = std::env::current_dir().unwrap();
+        let p = token_file_path(&None, "endpoints/ep-1/pgdata", "x.token").unwrap();
+        assert!(p.is_absolute(), "{}", p.display());
+        assert_eq!(p, cwd.join("endpoints/ep-1/x.token"));
+
+        let p = token_file_path(&Some(PathBuf::from("rel.token")), "/pgdata", "x.token").unwrap();
+        assert_eq!(p, cwd.join("rel.token"));
+
+        let cli = Cli::parse_from([
+            "compute_ctl",
+            "--pgdata=test",
+            "--connstr=test",
+            "--compute-id=test",
+            "--internal-api-token-file=/run/a.token",
+            "--storage-auth-token-file=/run/b.token",
+        ]);
+        assert_eq!(
+            cli.internal_api_token_file.as_deref(),
+            Some(Path::new("/run/a.token"))
+        );
+        assert_eq!(
+            cli.storage_auth_token_file.as_deref(),
+            Some(Path::new("/run/b.token"))
+        );
     }
 }

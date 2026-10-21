@@ -224,6 +224,23 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SetRoleGrantsResponse"
+        401:
+          description: |
+            Internal route: no `Authorization: Bearer <secret>` with the secret
+            from compute_ctl's internal API token file.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericError"
+        403:
+          description: |
+            Refused, nothing run: only USAGE and CREATE, on a schema a
+            non-superuser owns, for an existing grantee that is no superuser,
+            privileged, `pg_*`, `cloud_admin` or Chelabase-managed role.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericError"
         412:
           description: |
             Compute is not in the right state for processing the request.
@@ -276,6 +293,22 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ExtensionInstallResult"
+        401:
+          description: |
+            Internal route: no `Authorization: Bearer <secret>` with the secret
+            from compute_ctl's internal API token file.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericError"
+        403:
+          description: |
+            Refused, nothing run: the extension version isn't available or its
+            control file isn't `trusted`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericError"
         412:
           description: |
             Compute is in the wrong state for processing the request.
@@ -285,6 +318,53 @@ paths:
                 $ref: "#/components/schemas/GenericError"
         500:
           description: Error during extension installation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericError"
+
+  /storage_token:
+    post:
+      tags:
+      - Configure
+      summary: Replace the compute's tenant storage token.
+      description: |
+        Writes the token to the storage token file (read by the neon extension
+        for every new pageserver and safekeeper connection) and to the spec
+        compute_ctl holds. Nothing else changes: no status change, no reload.
+        Needs this compute's token or an admin token.
+      operationId: refreshStorageToken
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - token
+              properties:
+                token:
+                  type: string
+                  description: One line of [A-Za-z0-9._~+/=-], 1-8191 bytes.
+      responses:
+        204:
+          description: The token is in place.
+        400:
+          description: |
+            A malformed body or token, or a compute that started without storage
+            auth (a restart is needed).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericError"
+        412:
+          description: The compute is neither running nor configuration_pending.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericError"
+        500:
+          description: The file couldn't be written; the old token is kept.
           content:
             application/json:
               schema:
@@ -537,6 +617,15 @@ components:
           type: string
           description: Identifier of the current timeline served by compute node, if any.
           example: ece7de74d4b8cbe5433a68ce4d1b97b4
+        capabilities:
+          type: array
+          items:
+            type: string
+          description: |
+            What this compute_ctl can do beyond the base API (also sent in the
+            `Compute-Capabilities` header of its spec fetch). An older
+            compute_ctl sends none.
+          example: ["storage_token_refresh"]
 
     ComputeInsights:
       type: object

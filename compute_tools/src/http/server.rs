@@ -1,9 +1,8 @@
 use std::fmt::Display;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
 use axum::Router;
 use axum::middleware::{self};
 use axum::response::IntoResponse;
@@ -15,7 +14,7 @@ use tower::ServiceBuilder;
 use tower_http::{
     auth::AsyncRequireAuthorizationLayer, request_id::PropagateRequestIdLayer, trace::TraceLayer,
 };
-use tracing::{Span, error, info};
+use tracing::{Span, error, info, warn};
 
 use super::middleware::request_id::maybe_add_request_id_header;
 use super::{
@@ -24,17 +23,19 @@ use super::{
     routes::{
         check_writability, configure, database_schema, dbs_and_roles, extension_server, extensions,
         grants, hadron_liveness_probe, insights, lfc, metrics, metrics_json, promote,
-        refresh_configuration, status, terminate,
+        refresh_configuration, status, storage_token, terminate,
     },
 };
 use crate::compute::ComputeNode;
 
 /// `compute_ctl` has two servers: internal and external. The internal server
-/// binds to the loopback interface and handles communication from clients on
-/// the compute. The external server is what receives communication from the
-/// control plane, the metrics scraper, etc. We make the distinction because
-/// certain routes in `compute_ctl` only need to be exposed to local processes
-/// like Postgres via the neon extension and local_proxy.
+/// binds to the loopback interface (127.0.0.1, and ::1 where the host has it)
+/// and handles communication from clients on the compute; every one of its
+/// routes needs the per-start secret as a bearer (D2: each handler takes
+/// `InternalAuth` first). The external server is what receives communication
+/// from the control plane, the metrics scraper, etc. We make the distinction
+/// because certain routes in `compute_ctl` only need to be exposed to local
+/// processes like Postgres via the neon extension and local_proxy.
 #[derive(Clone, Debug)]
 pub enum Server {
     Internal {
@@ -114,6 +115,10 @@ impl From<&Server> for Router<Arc<ComputeNode>> {
                     .route("/insights", get(insights::get_insights))
                     .route("/metrics.json", get(metrics_json::get_metrics))
                     .route("/status", get(status::get_status))
+                    .route(
+                        "/storage_token",
+                        post(storage_token::refresh_storage_token),
+                    )
                     .route("/terminate", post(terminate::terminate))
                     .route(
                         "/hadron_liveness_probe",
@@ -182,59 +187,61 @@ impl Server {
         StatusCode::METHOD_NOT_ALLOWED
     }
 
-    async fn listener(&self) -> Result<TcpListener> {
-        let addr = SocketAddr::new(self.ip(), self.port());
-        let listener = TcpListener::bind(&addr).await?;
-
-        Ok(listener)
-    }
-
-    fn ip(&self) -> IpAddr {
+    /// The addresses the server listens on: the internal server on loopback
+    /// only, `127.0.0.1` and `::1` (D2, P5; the `::1` one best effort, for hosts
+    /// and pods without IPv6), the external server on every address.
+    pub fn listen_addrs(&self) -> Vec<SocketAddr> {
         match self {
-            // TODO: Change this to Ipv6Addr::LOCALHOST when the GitHub runners
-            // allow binding to localhost
-            Server::Internal { .. } => IpAddr::from(Ipv6Addr::UNSPECIFIED),
-            Server::External { .. } => IpAddr::from(Ipv6Addr::UNSPECIFIED),
+            Server::Internal { port } => vec![
+                SocketAddr::new(IpAddr::from(Ipv4Addr::LOCALHOST), *port),
+                SocketAddr::new(IpAddr::from(Ipv6Addr::LOCALHOST), *port),
+            ],
+            Server::External { port, .. } => {
+                vec![SocketAddr::new(IpAddr::from(Ipv6Addr::UNSPECIFIED), *port)]
+            }
         }
     }
 
-    fn port(&self) -> u16 {
-        match self {
-            Server::Internal { port, .. } => *port,
-            Server::External { port, .. } => *port,
+    /// Binds every listen address. The first one is required: if it can't be
+    /// bound, the compute cannot operate correctly. The internal server's
+    /// `::1` is best effort: a failure is logged once and skipped.
+    async fn listeners(&self) -> Vec<TcpListener> {
+        let mut listeners = Vec::new();
+        for (i, addr) in self.listen_addrs().into_iter().enumerate() {
+            match TcpListener::bind(&addr).await {
+                Ok(listener) => listeners.push(listener),
+                Err(e) if i == 0 => panic!(
+                    "failed to bind the compute_ctl {self} HTTP server to {addr}: {e}"
+                ),
+                Err(e) => warn!(
+                    "compute_ctl {self} HTTP server not listening at {addr} (no IPv6 loopback?): {e}"
+                ),
+            }
         }
+        listeners
     }
 
     async fn serve(self, compute: Arc<ComputeNode>) {
-        let listener = self.listener().await.unwrap_or_else(|e| {
-            // If we can't bind, the compute cannot operate correctly
-            panic!(
-                "failed to bind the compute_ctl {} HTTP server to {}: {}",
-                self,
-                SocketAddr::new(self.ip(), self.port()),
-                e
-            );
-        });
-
-        if tracing::enabled!(tracing::Level::INFO) {
-            let local_addr = match listener.local_addr() {
-                Ok(local_addr) => local_addr,
-                Err(_) => SocketAddr::new(self.ip(), self.port()),
-            };
-
-            info!(
-                "compute_ctl {} HTTP server listening at {}",
-                self, local_addr
-            );
-        }
-
         let router = Router::from(&self)
             .with_state(compute)
             .into_make_service_with_connect_info::<SocketAddr>();
 
-        if let Err(e) = axum::serve(listener, router).await {
-            error!("compute_ctl {} HTTP server error: {}", self, e);
+        let mut servers = tokio::task::JoinSet::new();
+        for listener in self.listeners().await {
+            if let Ok(local_addr) = listener.local_addr() {
+                info!(
+                    "compute_ctl {} HTTP server listening at {}",
+                    self, local_addr
+                );
+            }
+            let (router, name) = (router.clone(), self.to_string());
+            servers.spawn(async move {
+                if let Err(e) = axum::serve(listener, router).await {
+                    error!("compute_ctl {} HTTP server error: {}", name, e);
+                }
+            });
         }
+        while servers.join_next().await.is_some() {}
     }
 
     pub fn launch(self, compute: &Arc<ComputeNode>) {

@@ -8,6 +8,7 @@ use serde::Deserialize;
 use crate::compute::{BUILD_TAG, ComputeNode};
 use crate::http::JsonResponse;
 use crate::http::extract::{Path, Query};
+use crate::http::middleware::internal_auth::InternalAuth;
 
 #[derive(Debug, Clone, Deserialize)]
 pub(in crate::http) struct ExtensionServerParams {
@@ -17,6 +18,7 @@ pub(in crate::http) struct ExtensionServerParams {
 
 /// Download a remote extension.
 pub(in crate::http) async fn download_extension(
+    _auth: InternalAuth,
     Path(filename): Path<String>,
     ext_server_params: Query<ExtensionServerParams>,
     State(compute): State<Arc<ComputeNode>>,

@@ -82,7 +82,10 @@ fn acquire_lsn_lease_with_retry(
             let spec = state.pspec.as_ref().expect("spec must be set");
             (
                 spec.pageserver_conninfo.clone(),
-                spec.storage_auth_token.clone(),
+                // The held token, which `POST /storage_token` keeps current (SP5).
+                spec.storage_auth_token
+                    .as_ref()
+                    .map(|t| t.as_str().to_owned()),
             )
         };
 

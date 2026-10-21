@@ -143,6 +143,13 @@ pub fn rewrite_config_files(
     Ok(())
 }
 
+/// Whether `spec` carries a storage token (an empty one is none).
+fn spec_has_storage_token(spec: &ComputeSpec) -> bool {
+    spec.storage_auth_token
+        .as_ref()
+        .is_some_and(|t| !t.as_str().is_empty())
+}
+
 /// The content of `postgresql.conf`.
 #[allow(clippy::too_many_arguments)]
 fn render_postgres_conf(
@@ -471,6 +478,35 @@ fn render_postgres_conf(
         "neon.branch_protected={}",
         if spec.branch_protected { "on" } else { "off" }
     )?;
+
+    // §4.1: where the neon extension reads the internal API secret and the
+    // storage token (the paths, never the tokens; `PGC_POSTMASTER`). Written
+    // after the spec's settings, so none of them can redirect a reader. A
+    // compute without a storage token gets an empty path (P4: no file, no
+    // warning); storage auth can't change without a restart (SP6), so every
+    // rewrite writes the same two lines.
+    writeln!(
+        file,
+        "neon.compute_ctl_token_file={}",
+        escape_conf_value(&params.internal_api_token_file.to_string_lossy())
+    )?;
+    let storage_token_file = if spec_has_storage_token(spec) {
+        params.storage_auth_token_file.to_string_lossy().into_owned()
+    } else {
+        String::new()
+    };
+    writeln!(
+        file,
+        "neon.storage_auth_token_file={}",
+        escape_conf_value(&storage_token_file)
+    )?;
+
+    // RT4-1, S22: DuckDB (pg_duckdb, `extensions-all`) never reads local files
+    // or installs and loads its own extensions, whatever the spec says
+    // (`PGC_SUSET`: no owner can change them in a session).
+    writeln!(file, "duckdb.disabled_filesystems='LocalFileSystem'")?;
+    writeln!(file, "duckdb.autoinstall_known_extensions=off")?;
+    writeln!(file, "duckdb.autoload_known_extensions=off")?;
 
     // This is essential to keep this line at the end of the file,
     // because it is intended to override any settings above.
