@@ -105,11 +105,14 @@ pub(crate) const ACTIVE_TENANT_TIMEOUT: Duration = Duration::from_millis(5000);
 #[cfg(feature = "testing")]
 pub(crate) const ACTIVE_TENANT_TIMEOUT: Duration = Duration::from_millis(30000);
 
+/// The routes the auth middleware lets through without a token. `/metrics` and the
+/// profiles need one (`crate::auth::check_metrics_permission`, `check_profile_permission`).
+pub const PUBLIC_ROUTES: &[&str] = &["/v1/status", "/v1/doc", "/swagger.yml"];
+
 pub struct State {
     conf: &'static PageServerConf,
     tenant_manager: Arc<TenantManager>,
     auth: Option<Arc<SwappableJwtAuth>>,
-    allowlist_routes: &'static [&'static str],
     remote_storage: GenericRemoteStorage,
     broker_client: storage_broker::BrokerClientChannel,
     disk_usage_eviction_state: Arc<disk_usage_eviction_task::State>,
@@ -132,19 +135,10 @@ impl State {
         secondary_controller: SecondaryController,
         feature_resolver: FeatureResolver,
     ) -> anyhow::Result<Self> {
-        let allowlist_routes = &[
-            "/v1/status",
-            "/v1/doc",
-            "/swagger.yml",
-            "/metrics",
-            "/profile/cpu",
-            "/profile/heap",
-        ];
         Ok(Self {
             conf,
             tenant_manager,
             auth,
-            allowlist_routes,
             remote_storage,
             broker_client,
             disk_usage_eviction_state,
@@ -3998,11 +3992,10 @@ pub fn make_router(
     let mut router = attach_openapi_ui(endpoint::make_router(), spec, "/swagger.yml", "/v1/doc");
     if auth.is_some() {
         router = router.middleware(auth_middleware(|request| {
-            let state = get_state(request);
-            if state.allowlist_routes.contains(&request.uri().path()) {
+            if PUBLIC_ROUTES.contains(&request.uri().path()) {
                 None
             } else {
-                state.auth.as_deref()
+                get_state(request).auth.as_deref()
             }
         }))
     }
@@ -4017,14 +4010,26 @@ pub fn make_router(
 
     let force_metric_collection_on_scrape = state.conf.force_metric_collection_on_scrape;
 
-    let prometheus_metrics_handler_wrapper =
-        move |req| prometheus_metrics_handler(req, force_metric_collection_on_scrape);
+    let prometheus_metrics_handler_wrapper = move |req: Request<Body>| async move {
+        check_permission_with(&req, crate::auth::check_metrics_permission)?;
+        prometheus_metrics_handler(req, force_metric_collection_on_scrape).await
+    };
 
     Ok(router
         .data(state)
         .get("/metrics", move |r| request_span(r, prometheus_metrics_handler_wrapper))
-        .get("/profile/cpu", |r| request_span(r, profile_cpu_handler))
-        .get("/profile/heap", |r| request_span(r, profile_heap_handler))
+        .get("/profile/cpu", |r| {
+            request_span(r, |r: Request<Body>| async move {
+                check_permission_with(&r, crate::auth::check_profile_permission)?;
+                profile_cpu_handler(r).await
+            })
+        })
+        .get("/profile/heap", |r| {
+            request_span(r, |r: Request<Body>| async move {
+                check_permission_with(&r, crate::auth::check_profile_permission)?;
+                profile_heap_handler(r).await
+            })
+        })
         .get("/v1/status", |r| api_handler(r, status_handler))
         .put("/v1/failpoints", |r| {
             testing_api_handler("manage failpoints", r, failpoints_handler)

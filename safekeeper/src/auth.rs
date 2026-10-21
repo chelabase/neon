@@ -9,12 +9,13 @@ pub fn check_permission(claims: &Claims, tenant_id: Option<TenantId>) -> Result<
         (Scope::Tenant, None) => Err(AuthError(
             "Attempt to access management api with tenant scope. Permission denied".into(),
         )),
-        (Scope::Tenant, Some(tenant_id)) => {
-            if claims.tenant_id.unwrap() != tenant_id {
-                return Err(AuthError("Tenant id mismatch. Permission denied".into()));
+        (Scope::Tenant, Some(tenant_id)) => match claims.tenant_id {
+            None => Err(AuthError("tenant scope without a tenant id".into())),
+            Some(own) if own != tenant_id => {
+                Err(AuthError("Tenant id mismatch. Permission denied".into()))
             }
-            Ok(())
-        }
+            Some(_) => Ok(()),
+        },
         (
             Scope::Admin
             | Scope::PageServerApi
@@ -22,17 +23,45 @@ pub fn check_permission(claims: &Claims, tenant_id: Option<TenantId>) -> Result<
             | Scope::Infra
             | Scope::Scrubber
             | Scope::ControllerPeer
-            | Scope::TenantEndpoint,
+            | Scope::TenantEndpoint
+            | Scope::Metrics,
             _,
-        ) => Err(AuthError(
-            format!(
-                "JWT scope '{:?}' is ineligible for Safekeeper auth",
-                claims.scope
-            )
-            .into(),
-        )),
+        ) => Err(ineligible(claims.scope)),
         (Scope::SafekeeperData, _) => Ok(()),
     }
+}
+
+/// `/metrics` takes `Metrics`, `Admin` and the safekeeper's own `SafekeeperData`.
+pub fn check_metrics_permission(claims: &Claims) -> Result<(), AuthError> {
+    match claims.scope {
+        Scope::Metrics | Scope::Admin | Scope::SafekeeperData => Ok(()),
+        Scope::Tenant
+        | Scope::TenantEndpoint
+        | Scope::PageServerApi
+        | Scope::GenerationsApi
+        | Scope::Infra
+        | Scope::Scrubber
+        | Scope::ControllerPeer => Err(ineligible(claims.scope)),
+    }
+}
+
+/// `/profile/cpu` and `/profile/heap` take `Admin` and `SafekeeperData`.
+pub fn check_profile_permission(claims: &Claims) -> Result<(), AuthError> {
+    match claims.scope {
+        Scope::Admin | Scope::SafekeeperData => Ok(()),
+        Scope::Tenant
+        | Scope::TenantEndpoint
+        | Scope::PageServerApi
+        | Scope::GenerationsApi
+        | Scope::Infra
+        | Scope::Scrubber
+        | Scope::ControllerPeer
+        | Scope::Metrics => Err(ineligible(claims.scope)),
+    }
+}
+
+fn ineligible(scope: Scope) -> AuthError {
+    AuthError(format!("JWT scope '{scope:?}' is ineligible for Safekeeper auth").into())
 }
 
 #[cfg(test)]

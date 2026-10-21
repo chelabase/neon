@@ -2030,7 +2030,7 @@ class NeonStorageController(MetricsGetter, LogUtils):
         return headers
 
     def get_metrics(self) -> Metrics:
-        res = self.request("GET", f"{self.api}/metrics")
+        res = self.request("GET", f"{self.api}/metrics", headers=self.headers(TokenScope.ADMIN))
         return parse_metrics(res.text)
 
     def ready(self) -> bool:
@@ -3158,8 +3158,15 @@ class NeonPageserver(PgProtocol, LogUtils):
             "pageserver_tenant_manager_unexpected_errors_total",
             "pageserver_deletion_queue_unexpected_errors_total",
         ]:
-            value = self.http_client().get_metric_value(metric)
+            value = self.metrics_http_client().get_metric_value(metric)
             assert value == 0, f"Nonzero {metric} == {value}"
+
+    def metrics_http_client(self) -> PageserverHttpClient:
+        """
+        A client whose token `/metrics` accepts when auth is on (the pageserver's own
+        `pageserverapi` scope); a pageserver without auth ignores it.
+        """
+        return self.http_client(auth_token=self.env.auth_keys.generate_pageserver_token())
 
     def snapshot_final_metrics(self):
         """
@@ -3169,7 +3176,7 @@ class NeonPageserver(PgProtocol, LogUtils):
             log.info(f"Skipping metrics snapshot on pageserver {self.id}, it is not running")
             return
 
-        metrics = self.http_client().get_metrics_str()
+        metrics = self.metrics_http_client().get_metrics_str()
         metrics_snapshot_path = self.workdir / "final_metrics.txt"
 
         with open(metrics_snapshot_path, "w") as f:

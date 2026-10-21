@@ -59,8 +59,11 @@ pub struct HttpState {
     auth: Option<Arc<SwappableJwtAuth>>,
     rate_limiter: governor::DefaultKeyedRateLimiter<TenantId>,
     neon_metrics: NeonMetrics,
-    allowlist_routes: &'static [&'static str],
 }
+
+/// The routes the auth middleware lets through without a token. `/metrics` and the
+/// profiles need one (`crate::auth::check_metrics_permission`, `check_profile_permission`).
+pub const PUBLIC_ROUTES: &[&str] = &["/status", "/live", "/ready"];
 
 impl HttpState {
     pub fn new(
@@ -74,14 +77,6 @@ impl HttpState {
             auth,
             rate_limiter: governor::RateLimiter::keyed(quota),
             neon_metrics: NeonMetrics::new(build_info),
-            allowlist_routes: &[
-                "/status",
-                "/live",
-                "/ready",
-                "/metrics",
-                "/profile/cpu",
-                "/profile/heap",
-            ],
         }
     }
 }
@@ -1920,6 +1915,8 @@ fn epilogue_metrics_middleware<B: hyper::body::HttpBody + Send + Sync + 'static>
 pub async fn measured_metrics_handler(req: Request<Body>) -> Result<Response<Body>, ApiError> {
     pub const TEXT_FORMAT: &str = "text/plain; version=0.0.4";
 
+    check_permission_with(&req, crate::auth::check_metrics_permission)?;
+
     let req = match maybe_forward(req).await {
         ForwardOutcome::Forwarded(res) => {
             return res;
@@ -2193,11 +2190,10 @@ pub fn make_router(
         .middleware(epilogue_metrics_middleware());
     if auth.is_some() {
         router = router.middleware(auth_middleware(|request| {
-            let state = get_state(request);
-            if state.allowlist_routes.contains(&request.uri().path()) {
+            if PUBLIC_ROUTES.contains(&request.uri().path()) {
                 None
             } else {
-                state.auth.as_deref()
+                get_state(request).auth.as_deref()
             }
         }));
     }
@@ -2218,10 +2214,24 @@ pub fn make_router(
             named_request_span(r, handle_ready, RequestName("ready"))
         })
         .get("/profile/cpu", |r| {
-            named_request_span(r, profile_cpu_handler, RequestName("profile_cpu"))
+            named_request_span(
+                r,
+                |r: Request<Body>| async move {
+                    check_permission_with(&r, crate::auth::check_profile_permission)?;
+                    profile_cpu_handler(r).await
+                },
+                RequestName("profile_cpu"),
+            )
         })
         .get("/profile/heap", |r| {
-            named_request_span(r, profile_heap_handler, RequestName("profile_heap"))
+            named_request_span(
+                r,
+                |r: Request<Body>| async move {
+                    check_permission_with(&r, crate::auth::check_profile_permission)?;
+                    profile_heap_handler(r).await
+                },
+                RequestName("profile_heap"),
+            )
         })
         // Upcalls for the pageserver: point the pageserver's `control_plane_api` config to this prefix
         .post("/upcall/v1/re-attach", |r| {

@@ -698,6 +698,10 @@ async fn dump_debug_handler(mut request: Request<Body>) -> Result<Response<Body>
     Ok(response)
 }
 
+/// The routes the auth middleware lets through without a token. `/metrics` and the
+/// profiles need one (`crate::auth::check_metrics_permission`, `check_profile_permission`).
+pub const PUBLIC_ROUTES: &[&str] = &["/v1/status"];
+
 /// Safekeeper http router.
 pub fn make_router(
     conf: Arc<SafeKeeperConf>,
@@ -706,9 +710,7 @@ pub fn make_router(
     let mut router = endpoint::make_router();
     if conf.http_auth.is_some() {
         router = router.middleware(auth_middleware(|request| {
-            const ALLOWLIST_ROUTES: &[&str] =
-                &["/v1/status", "/metrics", "/profile/cpu", "/profile/heap"];
-            if ALLOWLIST_ROUTES.contains(&request.uri().path()) {
+            if PUBLIC_ROUTES.contains(&request.uri().path()) {
                 None
             } else {
                 // Option<Arc<SwappableJwtAuth>> is always provided as data below, hence unwrap().
@@ -722,8 +724,10 @@ pub fn make_router(
 
     let force_metric_collection_on_scrape = conf.force_metric_collection_on_scrape;
 
-    let prometheus_metrics_handler_wrapper =
-        move |req| prometheus_metrics_handler(req, force_metric_collection_on_scrape);
+    let prometheus_metrics_handler_wrapper = move |req: Request<Body>| async move {
+        check_permission_with(&req, crate::auth::check_metrics_permission)?;
+        prometheus_metrics_handler(req, force_metric_collection_on_scrape).await
+    };
 
     // NB: on any changes do not forget to update the OpenAPI spec
     // located nearby (/safekeeper/src/http/openapi_spec.yaml).
@@ -735,8 +739,18 @@ pub fn make_router(
         .get("/metrics", move |r| {
             request_span(r, prometheus_metrics_handler_wrapper)
         })
-        .get("/profile/cpu", |r| request_span(r, profile_cpu_handler))
-        .get("/profile/heap", |r| request_span(r, profile_heap_handler))
+        .get("/profile/cpu", |r| {
+            request_span(r, |r: Request<Body>| async move {
+                check_permission_with(&r, crate::auth::check_profile_permission)?;
+                profile_cpu_handler(r).await
+            })
+        })
+        .get("/profile/heap", |r| {
+            request_span(r, |r: Request<Body>| async move {
+                check_permission_with(&r, crate::auth::check_profile_permission)?;
+                profile_heap_handler(r).await
+            })
+        })
         .get("/v1/status", |r| request_span(r, status_handler))
         .put("/v1/failpoints", |r| {
             request_span(r, move |r| async {

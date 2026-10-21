@@ -55,6 +55,11 @@ pub enum Scope {
     /// At the time of writing, this is only used for the step down request.
     #[serde(rename = "controller_peer")]
     ControllerPeer,
+
+    /// Read-only access to `/metrics` on the pageserver, the safekeeper and the storage
+    /// controller (and compute_ctl's metrics routes). It opens no other route, libpq
+    /// included. A metrics token carries `scope` and `iat`, and no `tenant_id`.
+    Metrics,
 }
 
 fn deserialize_empty_string_as_none_uuid<'de, D>(deserializer: D) -> Result<Option<Uuid>, D::Error>
@@ -141,6 +146,8 @@ impl JwtAuth {
         // The default 'required_spec_claims' is 'exp'. But we don't want to require
         // expiration.
         validation.required_spec_claims = [].into();
+        // An `exp` a token carries is still checked (with the default 60 s leeway).
+        validation.validate_exp = true;
         Self {
             decoding_keys,
             validation,
@@ -184,22 +191,40 @@ impl JwtAuth {
     /// The function tries the stored decoding keys in succession,
     /// and returns the first yielding a successful result.
     /// If there is no working decoding key, it returns the last error.
+    ///
+    /// A token whose `exp` or `nbf` is present but not an integer NumericDate is
+    /// refused: the validation would skip such a claim, and the token would never expire.
     pub fn decode<D: DeserializeOwned>(
         &self,
         token: &str,
     ) -> std::result::Result<TokenData<D>, AuthError> {
         let mut res = None;
         for decoding_key in &self.decoding_keys {
-            res = Some(decode(token, decoding_key, &self.validation));
-            if let Some(Ok(res)) = res {
-                return Ok(res);
+            let attempt = decode::<serde_json::Value>(token, decoding_key, &self.validation);
+            let verified = attempt.is_ok();
+            res = Some(attempt);
+            if verified {
+                break;
             }
         }
-        if let Some(res) = res {
-            res.map_err(|e| AuthError(Cow::Owned(e.to_string())))
-        } else {
-            Err(AuthError(Cow::Borrowed("no JWT decoding keys configured")))
+        let data = match res {
+            Some(Ok(data)) => data,
+            Some(Err(e)) => return Err(AuthError(Cow::Owned(e.to_string()))),
+            None => return Err(AuthError(Cow::Borrowed("no JWT decoding keys configured"))),
+        };
+        for name in ["exp", "nbf"] {
+            if data.claims.get(name).is_some_and(|value| !value.is_u64()) {
+                return Err(AuthError(Cow::Owned(format!(
+                    "JWT claim `{name}` is not a NumericDate"
+                ))));
+            }
         }
+        let claims = serde_json::from_value::<D>(data.claims)
+            .map_err(|e| AuthError(Cow::Owned(format!("JSON error: {e}"))))?;
+        Ok(TokenData {
+            header: data.header,
+            claims,
+        })
     }
 }
 

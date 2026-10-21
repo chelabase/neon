@@ -1,17 +1,22 @@
 use utils::auth::{AuthError, Claims, Scope};
 use utils::id::TenantId;
 
+/// Checks a token for a tenant route (`tenant_id` is the route's tenant) or a
+/// management route (`None`). Every HTTP route but `/metrics` and the profiles, the
+/// page service and the gRPC API go through it. Total: it never panics, whatever the
+/// claims hold.
 pub fn check_permission(claims: &Claims, tenant_id: Option<TenantId>) -> Result<(), AuthError> {
     match (&claims.scope, tenant_id) {
         (Scope::Tenant, None) => Err(AuthError(
             "Attempt to access management api with tenant scope. Permission denied".into(),
         )),
-        (Scope::Tenant, Some(tenant_id)) => {
-            if claims.tenant_id.unwrap() != tenant_id {
-                return Err(AuthError("Tenant id mismatch. Permission denied".into()));
+        (Scope::Tenant, Some(tenant_id)) => match claims.tenant_id {
+            None => Err(AuthError("tenant scope without a tenant id".into())),
+            Some(own) if own != tenant_id => {
+                Err(AuthError("Tenant id mismatch. Permission denied".into()))
             }
-            Ok(())
-        }
+            Some(_) => Ok(()),
+        },
         (Scope::PageServerApi, None) => Ok(()), // access to management api for PageServerApi scope
         (Scope::PageServerApi, Some(_)) => Ok(()), // access to tenant api using PageServerApi scope
         (
@@ -21,16 +26,44 @@ pub fn check_permission(claims: &Claims, tenant_id: Option<TenantId>) -> Result<
             | Scope::Infra
             | Scope::Scrubber
             | Scope::ControllerPeer
-            | Scope::TenantEndpoint,
+            | Scope::TenantEndpoint
+            | Scope::Metrics,
             _,
-        ) => Err(AuthError(
-            format!(
-                "JWT scope '{:?}' is ineligible for Pageserver auth",
-                claims.scope
-            )
-            .into(),
-        )),
+        ) => Err(ineligible(claims.scope)),
     }
+}
+
+/// `/metrics` takes `Metrics`, `Admin` and the pageserver's own `PageServerApi`.
+pub fn check_metrics_permission(claims: &Claims) -> Result<(), AuthError> {
+    match claims.scope {
+        Scope::Metrics | Scope::Admin | Scope::PageServerApi => Ok(()),
+        Scope::Tenant
+        | Scope::TenantEndpoint
+        | Scope::SafekeeperData
+        | Scope::GenerationsApi
+        | Scope::Infra
+        | Scope::Scrubber
+        | Scope::ControllerPeer => Err(ineligible(claims.scope)),
+    }
+}
+
+/// `/profile/cpu` and `/profile/heap` take `Admin` and `PageServerApi`.
+pub fn check_profile_permission(claims: &Claims) -> Result<(), AuthError> {
+    match claims.scope {
+        Scope::Admin | Scope::PageServerApi => Ok(()),
+        Scope::Tenant
+        | Scope::TenantEndpoint
+        | Scope::SafekeeperData
+        | Scope::GenerationsApi
+        | Scope::Infra
+        | Scope::Scrubber
+        | Scope::ControllerPeer
+        | Scope::Metrics => Err(ineligible(claims.scope)),
+    }
+}
+
+fn ineligible(scope: Scope) -> AuthError {
+    AuthError(format!("JWT scope '{scope:?}' is ineligible for Pageserver auth").into())
 }
 
 #[cfg(test)]

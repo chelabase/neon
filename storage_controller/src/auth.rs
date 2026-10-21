@@ -9,6 +9,26 @@ pub fn check_permission(claims: &Claims, required_scope: Scope) -> Result<(), Au
     Ok(())
 }
 
+/// `/metrics` takes `Metrics` and `Admin` (the storage controller's own global scope).
+pub fn check_metrics_permission(claims: &Claims) -> Result<(), AuthError> {
+    match claims.scope {
+        Scope::Metrics | Scope::Admin => Ok(()),
+        Scope::Tenant
+        | Scope::TenantEndpoint
+        | Scope::PageServerApi
+        | Scope::SafekeeperData
+        | Scope::GenerationsApi
+        | Scope::Infra
+        | Scope::Scrubber
+        | Scope::ControllerPeer => Err(AuthError("Scope mismatch. Permission denied".into())),
+    }
+}
+
+/// `/profile/cpu` and `/profile/heap` take `Admin` only.
+pub fn check_profile_permission(claims: &Claims) -> Result<(), AuthError> {
+    check_permission(claims, Scope::Admin)
+}
+
 #[allow(dead_code)]
 pub fn check_endpoint_permission(claims: &Claims, endpoint_id: Uuid) -> Result<(), AuthError> {
     if claims.scope != Scope::TenantEndpoint {
