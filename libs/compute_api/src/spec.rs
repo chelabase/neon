@@ -218,6 +218,12 @@ pub struct ComputeSpec {
     #[serde(default)]
     pub member_logins: Option<MemberLogins>,
 
+    /// `chelabase_realtime` logs in only over TLS, from these source addresses,
+    /// with a client certificate whose CN is in `client_cns` (W31). Absent:
+    /// the role's logins are refused.
+    #[serde(default)]
+    pub realtime_logins: Option<MemberLogins>,
+
     /// The branch is protected (U14): compute_ctl writes it into
     /// `postgresql.conf` as `neon.branch_protected`, and while it's on every
     /// non-superuser `CREATE DATABASE` is born closed and `ALTER DATABASE ...

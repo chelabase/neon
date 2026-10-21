@@ -149,8 +149,17 @@ const MEMBER_ROLE_RE: &str = "/^cb_m_[0-9a-f]{32}$";
 const MEMBER_PREFIX_RE: &str = "/^[Cc][Bb]_[Mm]_";
 const MEMBER_IDENT_MAP: &str = "chelabase_member";
 
-/// `<ipv4|ipv6>/<prefix>`, nothing else (no keyword, no host name, no spaces).
-fn check_member_cidr(cidr: &str) -> Result<()> {
+const REALTIME_HBA_HEAD: &str = "# chelabase: realtime logins";
+const REALTIME_HBA_TAIL: &str = "# chelabase: end of realtime logins";
+/// The realtime decoder's role (W31); its ident map has the same name.
+const REALTIME_ROLE: &str = "chelabase_realtime";
+const REALTIME_IDENT_MAP: &str = "chelabase_realtime";
+const REALTIME_IDENT_HEAD: &str = "# chelabase: realtime certificate map (chelabase_realtime)";
+const REALTIME_IDENT_TAIL: &str = "# chelabase: end of realtime certificate map";
+
+/// `<ipv4|ipv6>/<prefix>`, nothing else (no keyword, no host name, no spaces);
+/// an error names `field` (`member_logins`, `realtime_logins`).
+fn check_cidr(field: &str, cidr: &str) -> Result<()> {
     let parsed = cidr.split_once('/').and_then(|(addr, prefix)| {
         let addr: IpAddr = addr.parse().ok()?;
         if prefix.is_empty() || prefix.len() > 3 || !prefix.bytes().all(|b| b.is_ascii_digit()) {
@@ -160,14 +169,12 @@ fn check_member_cidr(cidr: &str) -> Result<()> {
         let max = if addr.is_ipv4() { 32 } else { 128 };
         (prefix <= max).then_some(())
     });
-    parsed.ok_or_else(|| {
-        anyhow!("member_logins: allowed_cidrs entry {cidr:?} isn't an address/prefix")
-    })
+    parsed.ok_or_else(|| anyhow!("{field}: allowed_cidrs entry {cidr:?} isn't an address/prefix"))
 }
 
 /// `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`: no whitespace, quotes, `/` or `#` can
-/// reach pg_ident.conf.
-fn check_member_cn(cn: &str) -> Result<()> {
+/// reach pg_ident.conf; an error names `field`.
+fn check_cn(field: &str, cn: &str) -> Result<()> {
     let mut bytes = cn.bytes();
     let ok = cn.len() <= 64
         && bytes.next().is_some_and(|b| b.is_ascii_alphanumeric())
@@ -175,9 +182,80 @@ fn check_member_cn(cn: &str) -> Result<()> {
     if ok {
         Ok(())
     } else {
-        bail!("member_logins: client_cns entry {cn:?} isn't a valid certificate CN")
+        bail!("{field}: client_cns entry {cn:?} isn't a valid certificate CN")
     }
 }
+
+/// One login rule set of `pg_hba.conf`, between its `head` and `tail` markers:
+/// with `logins` and `tls`, one `hostssl` line per allowed CIDR (`all` for an
+/// empty list) for `allow_role`, requiring SCRAM and a client certificate
+/// whose CN the `map` ident map accepts; then `reject` for every other login of
+/// `reject_role` (TCP, replication, Unix socket). The CIDRs are checked
+/// whatever `tls` is; an error names `field`.
+struct HbaRules<'a> {
+    head: &'a str,
+    tail: &'a str,
+    allow_role: &'a str,
+    reject_role: &'a str,
+    map: &'a str,
+    field: &'a str,
+}
+
+impl HbaRules<'_> {
+    fn block(&self, logins: Option<&MemberLogins>, tls: bool) -> Result<String> {
+        let Self {
+            head,
+            tail,
+            allow_role,
+            reject_role,
+            map,
+            field,
+        } = self;
+        let mut block = format!("{head}\n");
+        if let Some(logins) = logins {
+            for cidr in &logins.allowed_cidrs {
+                check_cidr(field, cidr)?;
+            }
+            if tls {
+                let all = ["all".to_string()];
+                let cidrs = if logins.allowed_cidrs.is_empty() {
+                    &all[..]
+                } else {
+                    &logins.allowed_cidrs[..]
+                };
+                for cidr in cidrs {
+                    block.push_str(&format!(
+                        "hostssl\tall\t{allow_role}\t{cidr}\tscram-sha-256\tclientcert=verify-full\tmap={map}\n"
+                    ));
+                }
+            }
+        }
+        block.push_str(&format!("host\tall\t{reject_role}\tall\treject\n"));
+        block.push_str(&format!("host\treplication\t{reject_role}\tall\treject\n"));
+        block.push_str(&format!("local\tall\t{reject_role}\treject\n"));
+        block.push_str(&format!("local\treplication\t{reject_role}\treject\n"));
+        block.push_str(&format!("{tail}\n"));
+        Ok(block)
+    }
+}
+
+const MEMBER_HBA: HbaRules<'static> = HbaRules {
+    head: MEMBER_HBA_HEAD,
+    tail: MEMBER_HBA_TAIL,
+    allow_role: MEMBER_ROLE_RE,
+    reject_role: MEMBER_PREFIX_RE,
+    map: MEMBER_IDENT_MAP,
+    field: "member_logins",
+};
+
+const REALTIME_HBA: HbaRules<'static> = HbaRules {
+    head: REALTIME_HBA_HEAD,
+    tail: REALTIME_HBA_TAIL,
+    allow_role: REALTIME_ROLE,
+    reject_role: REALTIME_ROLE,
+    map: REALTIME_IDENT_MAP,
+    field: "realtime_logins",
+};
 
 /// The member-login block that goes at the top of `pg_hba.conf`: one `hostssl`
 /// line per allowed CIDR (`all` for an empty list) requiring SCRAM and a client
@@ -185,91 +263,128 @@ fn check_member_cn(cn: &str) -> Result<()> {
 /// for every other member login (TCP, replication, Unix socket). With no
 /// `member_logins` or no TLS, only the `reject` lines: member logins are refused.
 pub fn member_hba_block(member_logins: Option<&MemberLogins>, tls: bool) -> Result<String> {
-    let mut block = format!("{MEMBER_HBA_HEAD}\n");
-    if let Some(ml) = member_logins {
-        for cidr in &ml.allowed_cidrs {
-            check_member_cidr(cidr)?;
-        }
-        if tls {
-            let all = ["all".to_string()];
-            let cidrs = if ml.allowed_cidrs.is_empty() {
-                &all[..]
-            } else {
-                &ml.allowed_cidrs[..]
-            };
-            for cidr in cidrs {
-                block.push_str(&format!(
-                    "hostssl\tall\t{MEMBER_ROLE_RE}\t{cidr}\tscram-sha-256\tclientcert=verify-full\tmap={MEMBER_IDENT_MAP}\n"
-                ));
-            }
-        }
+    MEMBER_HBA.block(member_logins, tls)
+}
+
+/// The realtime-login block that goes right after the member block (W31): one
+/// `hostssl` line per allowed CIDR (`all` for an empty list) for
+/// `chelabase_realtime`, requiring SCRAM and a client certificate whose CN the
+/// `chelabase_realtime` ident map accepts, then `reject` for every other login
+/// of the role (TCP, replication, Unix socket). With no `realtime_logins` or no
+/// TLS, only the `reject` lines: the role can't log in.
+pub fn realtime_hba_block(realtime_logins: Option<&MemberLogins>, tls: bool) -> Result<String> {
+    REALTIME_HBA.block(realtime_logins, tls)
+}
+
+/// The `pg_ident.conf` lines of `map`, one per CN of `logins`, to `role`.
+/// `client_cns` must not be empty and each CN must be valid (RT3-12); an error
+/// names `field`.
+fn ident_lines(
+    logins: Option<&MemberLogins>,
+    map: &str,
+    role: &str,
+    field: &str,
+) -> Result<String> {
+    let Some(logins) = logins else {
+        return Ok(String::new());
+    };
+    if logins.client_cns.is_empty() {
+        bail!("{field}: client_cns is empty");
     }
-    block.push_str(&format!("host\tall\t{MEMBER_PREFIX_RE}\tall\treject\n"));
-    block.push_str(&format!(
-        "host\treplication\t{MEMBER_PREFIX_RE}\tall\treject\n"
-    ));
-    block.push_str(&format!("local\tall\t{MEMBER_PREFIX_RE}\treject\n"));
-    block.push_str(&format!("local\treplication\t{MEMBER_PREFIX_RE}\treject\n"));
-    block.push_str(&format!("{MEMBER_HBA_TAIL}\n"));
-    Ok(block)
+    let mut lines = String::new();
+    for cn in &logins.client_cns {
+        check_cn(field, cn)?;
+        lines.push_str(&format!("{map}\t{cn}\t{role}\n"));
+    }
+    Ok(lines)
 }
 
 /// The `pg_ident.conf` lines mapping each client certificate CN to the member
 /// roles. `client_cns` must not be empty and each CN must be valid (RT3-12).
 pub fn member_ident_lines(member_logins: Option<&MemberLogins>) -> Result<String> {
-    let Some(ml) = member_logins else {
-        return Ok(String::new());
-    };
-    if ml.client_cns.is_empty() {
-        bail!("member_logins: client_cns is empty");
-    }
-    let mut lines = String::new();
-    for cn in &ml.client_cns {
-        check_member_cn(cn)?;
-        lines.push_str(&format!("{MEMBER_IDENT_MAP}\t{cn}\t{MEMBER_ROLE_RE}\n"));
-    }
-    Ok(lines)
+    ident_lines(
+        member_logins,
+        MEMBER_IDENT_MAP,
+        MEMBER_ROLE_RE,
+        "member_logins",
+    )
+}
+
+/// The `pg_ident.conf` lines mapping each client certificate CN to
+/// `chelabase_realtime` (W31). `client_cns` must not be empty and each CN must
+/// be valid.
+pub fn realtime_ident_lines(realtime_logins: Option<&MemberLogins>) -> Result<String> {
+    ident_lines(
+        realtime_logins,
+        REALTIME_IDENT_MAP,
+        REALTIME_ROLE,
+        "realtime_logins",
+    )
 }
 
 const MEMBER_IDENT_HEAD: &str = "# chelabase: member certificate map (chelabase_member)";
 const MEMBER_IDENT_TAIL: &str = "# chelabase: end of member certificate map";
 
+/// Where the `head` and `tail` marker lines of `text` are: each `head` line's
+/// start offset and each `tail` line's end offset (after its line end). A line
+/// matches without its `\n` or `\r\n`.
+fn marker_offsets(text: &str, head: &str, tail: &str) -> (Vec<usize>, Vec<usize>) {
+    let mut heads = Vec::new();
+    let mut tails = Vec::new();
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let bare = line.strip_suffix('\n').unwrap_or(line);
+        let bare = bare.strip_suffix('\r').unwrap_or(bare);
+        if bare == head {
+            heads.push(offset);
+        } else if bare == tail {
+            tails.push(offset + line.len());
+        }
+        offset += line.len();
+    }
+    (heads, tails)
+}
+
 /// `current` with the text from the `head` line through the `tail` line (both
-/// included) replaced by `block`; without either marker, `block` goes first. A
-/// block cut short (one marker without the other, a marker twice, the end
-/// before the start) is an error naming `file`: nothing is guessed.
+/// included) replaced by `block`; without either marker, `block` goes in at
+/// byte offset `absent_at` (a line start). A block cut short (one marker
+/// without the other, a marker twice, the end before the start) is an error
+/// naming `file`: nothing is guessed.
 fn replace_marked_block(
     current: &str,
     head: &str,
     tail: &str,
     block: &str,
     file: &str,
+    absent_at: usize,
 ) -> Result<String> {
-    let mut heads = Vec::new();
-    let mut tails = Vec::new();
-    let mut offset = 0;
-    for line in current.split_inclusive('\n') {
-        let text = line.strip_suffix('\n').unwrap_or(line);
-        let text = text.strip_suffix('\r').unwrap_or(text);
-        if text == head {
-            heads.push(offset);
-        } else if text == tail {
-            tails.push(offset + line.len());
-        }
-        offset += line.len();
-    }
+    let (heads, tails) = marker_offsets(current, head, tail);
     match (heads.as_slice(), tails.as_slice()) {
-        ([], []) => Ok(format!("{block}{current}")),
+        ([], []) => Ok(format!(
+            "{}{block}{}",
+            &current[..absent_at],
+            &current[absent_at..]
+        )),
         ([start], [end]) if start < end => {
             Ok(format!("{}{block}{}", &current[..*start], &current[*end..]))
         }
         _ => bail!(
-            "{file}: the chelabase block is cut short or repeated ({} start and {} end markers, \
-             expected one of each, in order); fix the file by hand",
+            "{file}: the chelabase block {head:?} is cut short or repeated ({} start and {} end \
+             markers, expected one of each, in order); fix the file by hand",
             heads.len(),
             tails.len()
         ),
     }
+}
+
+/// The end of the (one) `tail` marker line of `text`, where a block that
+/// follows that block goes; `0` without it.
+fn after_marked_block(text: &str, head: &str, tail: &str) -> usize {
+    marker_offsets(text, head, tail)
+        .1
+        .first()
+        .copied()
+        .unwrap_or(0)
 }
 
 /// Writes `text` to `path` through a temporary file and a rename, so Postgres
@@ -305,34 +420,50 @@ fn pgdata_major_version(pgdata_path: &Path) -> Option<u32> {
         .ok()
 }
 
-/// Check `pg_hba.conf` and update if needed: the member-login block first
-/// (replaced between its markers when it's there, the rest of the file kept byte
-/// for byte), then the databricks include, then the catch-all `md5` line last.
+/// Check `pg_hba.conf` and update if needed: the member-login block first, the
+/// realtime-login block right after it (each replaced between its own markers
+/// when it's there, the rest of the file kept byte for byte), then the
+/// databricks include, then the catch-all `md5` line last.
 ///
-/// The block's `hostssl … clientcert=verify-full map=…` lines need v17 (older
+/// The blocks' `hostssl … clientcert=verify-full map=…` lines need v17 (older
 /// majors refuse `map=` with a client certificate check); below v17, or when
-/// `PG_VERSION` can't be read, the block holds only the `reject` lines: member
-/// logins are refused (fails closed).
+/// `PG_VERSION` can't be read, or without TLS, each block holds only its
+/// `reject` lines: those logins are refused (fails closed).
 pub fn update_pg_hba(
     pgdata_path: &Path,
     databricks_pg_hba: Option<&String>,
     member_logins: Option<&MemberLogins>,
+    realtime_logins: Option<&MemberLogins>,
     tls: bool,
 ) -> Result<()> {
-    plan_pg_hba(pgdata_path, databricks_pg_hba, member_logins, tls)?.write()?;
+    plan_pg_hba(
+        pgdata_path,
+        databricks_pg_hba,
+        member_logins,
+        realtime_logins,
+        tls,
+    )?
+    .write()?;
     Ok(())
 }
 
-/// Check `pg_ident.conf` and update if needed: the member-login map lines
-/// (between their markers, replaced as a whole so a CN dropped from
-/// `client_cns` stops mapping; the rest of the file kept), and the databricks
-/// include.
+/// Check `pg_ident.conf` and update if needed: the member-login map lines and,
+/// right after them, the realtime map lines (each between their own markers,
+/// replaced as a whole so a CN dropped from `client_cns` stops mapping; the
+/// rest of the file kept), and the databricks include.
 pub fn update_pg_ident(
     pgdata_path: &Path,
     databricks_pg_ident: Option<&String>,
     member_logins: Option<&MemberLogins>,
+    realtime_logins: Option<&MemberLogins>,
 ) -> Result<()> {
-    plan_pg_ident(pgdata_path, databricks_pg_ident, member_logins)?.write()?;
+    plan_pg_ident(
+        pgdata_path,
+        databricks_pg_ident,
+        member_logins,
+        realtime_logins,
+    )?
+    .write()?;
     Ok(())
 }
 
@@ -372,31 +503,43 @@ pub(crate) fn plan_pg_hba(
     pgdata_path: &Path,
     databricks_pg_hba: Option<&String>,
     member_logins: Option<&MemberLogins>,
+    realtime_logins: Option<&MemberLogins>,
     tls: bool,
 ) -> Result<ConfRewrite> {
     // XXX: consider making it a part of config.json
     let pghba_path = pgdata_path.join("pg_hba.conf");
 
     let major = pgdata_major_version(pgdata_path);
-    let member_tls = tls && major.is_some_and(|v| v >= 17);
-    if tls && !member_tls && member_logins.is_some() {
+    let cert_tls = tls && major.is_some_and(|v| v >= 17);
+    if tls && !cert_tls && (member_logins.is_some() || realtime_logins.is_some()) {
         tracing::warn!(
             ?major,
-            "member logins need PostgreSQL 17 or later: pg_hba.conf only rejects them"
+            "member and realtime logins need PostgreSQL 17 or later: pg_hba.conf only rejects them"
         );
     }
 
-    // Postgres uses the first matching line, so the member block goes before the
-    // basebackup's `trust` lines: loopback and the Unix socket don't admit member
-    // roles either.
-    let block = member_hba_block(member_logins, member_tls)?;
+    // Postgres uses the first matching line, so the member block goes first and
+    // the realtime block right after it, both before the basebackup's `trust`
+    // lines: loopback and the Unix socket don't admit those roles either.
+    let member_block = member_hba_block(member_logins, cert_tls)?;
+    let realtime_block = realtime_hba_block(realtime_logins, cert_tls)?;
     let current = read_conf_file(&pghba_path)?;
     let updated = replace_marked_block(
         &current,
         MEMBER_HBA_HEAD,
         MEMBER_HBA_TAIL,
-        &block,
+        &member_block,
         "pg_hba.conf",
+        0,
+    )?;
+    let after_member = after_marked_block(&updated, MEMBER_HBA_HEAD, MEMBER_HBA_TAIL);
+    let updated = replace_marked_block(
+        &updated,
+        REALTIME_HBA_HEAD,
+        REALTIME_HBA_TAIL,
+        &realtime_block,
+        "pg_hba.conf",
+        after_member,
     )?;
 
     // Update pg_hba to contains databricks specfic settings before adding neon settings
@@ -419,38 +562,66 @@ pub(crate) fn plan_pg_hba(
     })
 }
 
+/// `text` without its lines of the ident map `map` when it has neither the
+/// `head` nor the `tail` marker (a file from before that block existed);
+/// unchanged otherwise.
+fn without_unmarked_map(text: String, head: &str, tail: &str, map: &str) -> String {
+    if text.lines().any(|l| l == head || l == tail) {
+        return text;
+    }
+    text.split_inclusive('\n')
+        .filter(|l| l.split_whitespace().next() != Some(map))
+        .collect()
+}
+
 /// The new `pg_ident.conf` (see [`update_pg_ident`]), not written.
 pub(crate) fn plan_pg_ident(
     pgdata_path: &Path,
     databricks_pg_ident: Option<&String>,
     member_logins: Option<&MemberLogins>,
+    realtime_logins: Option<&MemberLogins>,
 ) -> Result<ConfRewrite> {
     let pgident_path = pgdata_path.join("pg_ident.conf");
 
-    let block = format!(
+    let member_block = format!(
         "{MEMBER_IDENT_HEAD}\n{}{MEMBER_IDENT_TAIL}\n",
         member_ident_lines(member_logins)?
     );
+    let realtime_block = format!(
+        "{REALTIME_IDENT_HEAD}\n{}{REALTIME_IDENT_TAIL}\n",
+        realtime_ident_lines(realtime_logins)?
+    );
     let current = read_conf_file(&pgident_path)?;
-    let has_markers = current
-        .lines()
-        .any(|l| l == MEMBER_IDENT_HEAD || l == MEMBER_IDENT_TAIL);
-    // A file written before the markers existed: its unmarked member map lines
-    // go, the block replaces them.
-    let base = if has_markers {
-        current.clone()
-    } else {
-        current
-            .split_inclusive('\n')
-            .filter(|l| l.split_whitespace().next() != Some(MEMBER_IDENT_MAP))
-            .collect()
-    };
+    // A file written before a block's markers existed: its unmarked lines of
+    // that map go, the block replaces them (so no CN stays mapped outside it).
+    let base = without_unmarked_map(
+        current.clone(),
+        MEMBER_IDENT_HEAD,
+        MEMBER_IDENT_TAIL,
+        MEMBER_IDENT_MAP,
+    );
+    let base = without_unmarked_map(
+        base,
+        REALTIME_IDENT_HEAD,
+        REALTIME_IDENT_TAIL,
+        REALTIME_IDENT_MAP,
+    );
     let updated = replace_marked_block(
         &base,
         MEMBER_IDENT_HEAD,
         MEMBER_IDENT_TAIL,
-        &block,
+        &member_block,
         "pg_ident.conf",
+        0,
+    )?;
+    let after_member = after_marked_block(&updated, MEMBER_IDENT_HEAD, MEMBER_IDENT_TAIL);
+    let updated = replace_marked_block(
+        &updated,
+        REALTIME_IDENT_HEAD,
+        REALTIME_IDENT_TAIL,
+        &realtime_block,
+        "pg_ident.conf",
+        after_member,
     )?;
 
     // Update pg_ident to contains databricks specfic settings

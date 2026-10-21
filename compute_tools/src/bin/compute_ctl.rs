@@ -281,6 +281,7 @@ fn main() -> Result<()> {
             )),
             pg_init_timeout: cli.pg_init_timeout.map(Duration::from_secs),
             pg_isready_bin: get_pg_isready_bin(&cli.pgbin),
+            // Log and endpoint ids only: it never turns authentication off (S6).
             instance_id: std::env::var("INSTANCE_ID").ok(),
             lakebase_mode: cli.lakebase_mode,
             build_tag: BUILD_TAG.to_string(),

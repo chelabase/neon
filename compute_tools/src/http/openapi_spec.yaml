@@ -42,7 +42,10 @@ paths:
       tags:
       - Info
       summary: Get compute node metrics in text format.
-      description: ""
+      description: |
+        Needs a token, as every route: a `metrics`-scoped one (which opens only
+        this route and /autoscaling_metrics), a `compute_ctl:admin` one, or one
+        for this compute's `compute_id`.
       operationId: getComputeMetrics
       responses:
         200:
