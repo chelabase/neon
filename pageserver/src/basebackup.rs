@@ -901,7 +901,7 @@ enum MalformedSlotState {
 }
 
 /// `ReplicationSlotOnDisk`'s layout (`slot.c`, the same on v14 to v17).
-const SLOT_MAGIC: u32 = 0x1051_CA1;
+const SLOT_MAGIC: u32 = 0x0105_1CA1;
 /// `ReplicationSlotOnDiskConstantSize`: `magic`, `checksum`, `version`, `length`.
 const SLOT_STATE_HEADER: usize = 16;
 /// `ReplicationSlotOnDiskNotChecksummedSize`: the checksum covers everything after these.
@@ -1134,7 +1134,7 @@ mod slot_state_check_tests {
 
     use super::{MalformedSlotState, check_slot_state};
 
-    const SLOT_MAGIC: u32 = 0x1051_CA1;
+    const SLOT_MAGIC: u32 = 0x0105_1CA1;
     const HEADER: usize = 16;
     const SLOTDATA: u32 = 184;
     const FULL: usize = 200;
@@ -1390,7 +1390,7 @@ mod slot_state_check_edges {
 
     fn valid_state(pg_version: PgMajorVersion) -> Vec<u8> {
         let mut buf = vec![0x5Au8; 200];
-        put(&mut buf, 0, 0x1051_CA1);
+        put(&mut buf, 0, 0x0105_1CA1);
         put(&mut buf, 8, slot_state_version(pg_version));
         put(&mut buf, 12, 184);
         reseal(&mut buf);
