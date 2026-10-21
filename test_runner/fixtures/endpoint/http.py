@@ -28,6 +28,8 @@ The value to place in the `aud` claim.
 @final
 class ComputeClaimsScope(StrEnum):
     ADMIN = "compute_ctl:admin"
+    # Read-only: opens only GET /metrics and GET /autoscaling_metrics.
+    METRICS = "metrics"
 
 
 @final
@@ -97,7 +99,8 @@ class EndpointHttpClient(requests.Session):
         return res.json()
 
     def autoscaling_metrics(self):
-        res = self.get(f"http://localhost:{self.external_port}/autoscaling_metrics")
+        url = f"http://localhost:{self.external_port}/autoscaling_metrics"
+        res = self.get(url, auth=self.auth)
         res.raise_for_status()
         log.debug("raw compute metrics: %s", res.text)
         return res.text
@@ -217,7 +220,7 @@ class EndpointHttpClient(requests.Session):
         res.raise_for_status()
 
     def metrics(self) -> str:
-        res = self.get(f"http://localhost:{self.external_port}/metrics")
+        res = self.get(f"http://localhost:{self.external_port}/metrics", auth=self.auth)
         res.raise_for_status()
         log.debug("raw compute metrics: %s", res.text)
         return res.text

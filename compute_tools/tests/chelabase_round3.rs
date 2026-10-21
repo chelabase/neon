@@ -9,7 +9,8 @@ use compute_tools::migration::{
     MIGRATION_CONN_OPTIONS, MigrationFailure, MigrationKind, fatal_failure,
 };
 use compute_tools::spec::{
-    member_hba_block, member_ident_lines, migration_kinds, update_pg_hba, update_pg_ident,
+    member_hba_block, member_ident_lines, migration_kinds, realtime_hba_block, update_pg_hba,
+    update_pg_ident,
 };
 use compute_tools::tls::{reload_tls_files, verify_key_cert};
 
@@ -116,8 +117,8 @@ host    all             all             127.0.0.1/32            trust\n";
     std::fs::write(dir.join("pg_hba.conf"), sample).unwrap();
     std::fs::write(dir.join("PG_VERSION"), "17\n").unwrap();
     let ml = logins(&["10.213.4.10/32"], &["chelabase-orchestrator"]);
-    update_pg_hba(dir, None, Some(&ml), true).unwrap();
-    update_pg_hba(dir, None, Some(&ml), true).unwrap();
+    update_pg_hba(dir, None, Some(&ml), None, true).unwrap();
+    update_pg_hba(dir, None, Some(&ml), None, true).unwrap();
     let text = std::fs::read_to_string(dir.join("pg_hba.conf")).unwrap();
     let block = member_hba_block(Some(&ml), true).unwrap();
     assert!(text.starts_with(&block), "{text}");
@@ -332,35 +333,38 @@ fn update_pg_hba_replaces_the_block_between_the_markers() {
         ),
     )
     .unwrap();
+    // K4 (W31): the realtime block (reject lines only without realtime_logins)
+    // goes right after the member block.
     let expect = |ml: Option<&MemberLogins>| {
         format!(
-            "{before}{}{after}{MD5}",
-            member_hba_block(ml, true).unwrap()
+            "{before}{}{}{after}{MD5}",
+            member_hba_block(ml, true).unwrap(),
+            realtime_hba_block(None, true).unwrap()
         )
     };
 
     let new = logins(&["10.213.4.12/32", "fd00::12/128"], &[ORCH]);
-    update_pg_hba(&dir, None, Some(&new), true).unwrap();
+    update_pg_hba(&dir, None, Some(&new), None, true).unwrap();
     assert_eq!(
         read(&hba),
         expect(Some(&new)),
         "the new list replaces the old"
     );
-    update_pg_hba(&dir, None, Some(&new), true).unwrap();
+    update_pg_hba(&dir, None, Some(&new), None, true).unwrap();
     assert_eq!(read(&hba), expect(Some(&new)), "idempotent");
 
     let none = logins(&[], &[ORCH]);
-    update_pg_hba(&dir, None, Some(&none), true).unwrap();
+    update_pg_hba(&dir, None, Some(&none), None, true).unwrap();
     assert_eq!(
         read(&hba),
         expect(Some(&none)),
         "0 entries: the address rule is off"
     );
     assert!(read(&hba).contains(&allow("all")));
-    update_pg_hba(&dir, None, Some(&new), true).unwrap();
+    update_pg_hba(&dir, None, Some(&new), None, true).unwrap();
     assert_eq!(read(&hba), expect(Some(&new)), "and back");
 
-    update_pg_hba(&dir, None, None, true).unwrap();
+    update_pg_hba(&dir, None, None, None, true).unwrap();
     assert_eq!(read(&hba), expect(None), "no member_logins: reject only");
     assert!(!read(&hba).contains("hostssl"));
     std::fs::remove_dir_all(&dir).unwrap();
@@ -393,8 +397,8 @@ fn update_pg_hba_refuses_a_truncated_block() {
         let dir = pgdata(&format!("f3_hba_truncated_{i}"), Some("17"));
         let hba = dir.join("pg_hba.conf");
         std::fs::write(&hba, text).unwrap();
-        let err =
-            update_pg_hba(&dir, None, Some(&ml), true).expect_err(&format!("{what}: must fail"));
+        let err = update_pg_hba(&dir, None, Some(&ml), None, true)
+            .expect_err(&format!("{what}: must fail"));
         assert!(
             format!("{err:#}").contains("pg_hba.conf"),
             "{what}: the error names the file: {err:#}"
@@ -415,7 +419,7 @@ fn below_v17_the_block_only_rejects() {
         .enumerate()
     {
         let dir = pgdata(&format!("f3_hba_version_{i}"), *version);
-        update_pg_hba(&dir, None, Some(&ml), true).unwrap();
+        update_pg_hba(&dir, None, Some(&ml), None, true).unwrap();
         let text = read(&dir.join("pg_hba.conf"));
         assert!(
             text.starts_with(&format!("{HEAD}{REJECT}{TAIL}")),
@@ -425,7 +429,7 @@ fn below_v17_the_block_only_rejects() {
         std::fs::remove_dir_all(&dir).unwrap();
     }
     let dir = pgdata("f3_hba_version_17", Some("17"));
-    update_pg_hba(&dir, None, Some(&ml), true).unwrap();
+    update_pg_hba(&dir, None, Some(&ml), None, true).unwrap();
     assert!(
         read(&dir.join("pg_hba.conf")).starts_with(&member_hba_block(Some(&ml), true).unwrap())
     );
@@ -448,8 +452,8 @@ fn update_pg_ident_replaces_the_member_lines() {
     std::fs::write(&ident, mine).unwrap();
     let line = |cn: &str| format!("chelabase_member\t{cn}\t/^cb_m_[0-9a-f]{{32}}$");
 
-    update_pg_ident(&dir, None, Some(&logins(&[], &["cn-a", "cn-b"]))).unwrap();
-    update_pg_ident(&dir, None, Some(&logins(&[], &["cn-b", "cn-c"]))).unwrap();
+    update_pg_ident(&dir, None, Some(&logins(&[], &["cn-a", "cn-b"])), None).unwrap();
+    update_pg_ident(&dir, None, Some(&logins(&[], &["cn-b", "cn-c"])), None).unwrap();
     let text = read(&ident);
     assert_eq!(
         ident_map_lines(&text),
@@ -457,10 +461,10 @@ fn update_pg_ident_replaces_the_member_lines() {
         "cn-a is gone:\n{text}"
     );
     assert!(text.contains(mine), "other lines kept:\n{text}");
-    update_pg_ident(&dir, None, Some(&logins(&[], &["cn-b", "cn-c"]))).unwrap();
+    update_pg_ident(&dir, None, Some(&logins(&[], &["cn-b", "cn-c"])), None).unwrap();
     assert_eq!(read(&ident), text, "idempotent");
 
-    update_pg_ident(&dir, None, None).unwrap();
+    update_pg_ident(&dir, None, None, None).unwrap();
     let text = read(&ident);
     assert!(
         ident_map_lines(&text).is_empty(),

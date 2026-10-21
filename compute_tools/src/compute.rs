@@ -1738,6 +1738,7 @@ impl ComputeNode {
         let tls_config = self.tls_config(&pspec.spec);
         let databricks_settings = spec.databricks_settings.as_ref();
         let member_logins = spec.member_logins.as_ref();
+        let realtime_logins = spec.realtime_logins.as_ref();
         let postgres_port = self.params.connstr.port();
 
         // Remove/create an empty pgdata directory and put configuration there.
@@ -1798,17 +1799,25 @@ impl ComputeNode {
                 pgdata_path,
                 Some(&settings.databricks_pg_hba),
                 member_logins,
+                realtime_logins,
                 tls_config.is_some(),
             )?;
             update_pg_ident(
                 pgdata_path,
                 Some(&settings.databricks_pg_ident),
                 member_logins,
+                realtime_logins,
             )?;
         } else {
             // Update pg_hba.conf received with basebackup.
-            update_pg_hba(pgdata_path, None, member_logins, tls_config.is_some())?;
-            update_pg_ident(pgdata_path, None, member_logins)?;
+            update_pg_hba(
+                pgdata_path,
+                None,
+                member_logins,
+                realtime_logins,
+                tls_config.is_some(),
+            )?;
+            update_pg_ident(pgdata_path, None, member_logins, realtime_logins)?;
         }
 
         if let Some(databricks_settings) = spec.databricks_settings.as_ref() {

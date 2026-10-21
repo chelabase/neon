@@ -47,6 +47,7 @@ pub enum Server {
         port: u16,
         config: ComputeCtlConfig,
         compute_id: String,
+        /// The Hadron instance id; no part of authentication (S6).
         instance_id: Option<String>,
     },
 }
@@ -89,19 +90,17 @@ impl From<&Server> for Router<Arc<ComputeNode>> {
                 router
             }
             Server::External {
-                config,
-                compute_id,
-                instance_id,
-                ..
+                config, compute_id, ..
             } => {
-                let unauthenticated_router = Router::<Arc<ComputeNode>>::new()
+                // Every external route needs a token (U4): the metrics routes
+                // too, which also take a `metrics` token (that opens nothing
+                // else). `instance_id` plays no part in authentication.
+                let authenticated_router = Router::<Arc<ComputeNode>>::new()
                     .route("/metrics", get(metrics::get_metrics))
                     .route(
                         "/autoscaling_metrics",
                         get(metrics::get_autoscaling_metrics),
-                    );
-
-                let authenticated_router = Router::<Arc<ComputeNode>>::new()
+                    )
                     .route(
                         "/lfc/prewarm",
                         get(lfc::prewarm_state)
@@ -125,13 +124,10 @@ impl From<&Server> for Router<Arc<ComputeNode>> {
                     )
                     .layer(AsyncRequireAuthorizationLayer::new(Authorize::new(
                         compute_id.clone(),
-                        instance_id.clone(),
                         config.jwks.clone(),
                     )));
 
-                router
-                    .merge(unauthenticated_router)
-                    .merge(authenticated_router)
+                router.merge(authenticated_router)
             }
         };
 

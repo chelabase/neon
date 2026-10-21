@@ -18,6 +18,12 @@ pub enum ComputeClaimsScope {
     /// facilities.
     #[serde(rename = "compute_ctl:admin")]
     Admin,
+
+    /// A metrics-scoped token opens only `GET /metrics` and
+    /// `GET /autoscaling_metrics`, whatever `compute_id` it carries (or none),
+    /// without an audience; every other route refuses it.
+    #[serde(rename = "metrics")]
+    Metrics,
 }
 
 impl FromStr for ComputeClaimsScope {
@@ -26,6 +32,7 @@ impl FromStr for ComputeClaimsScope {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "compute_ctl:admin" => Ok(ComputeClaimsScope::Admin),
+            "metrics" => Ok(ComputeClaimsScope::Metrics),
             _ => Err(anyhow::anyhow!("invalid compute claims scope \"{s}\"")),
         }
     }
@@ -37,9 +44,9 @@ impl FromStr for ComputeClaimsScope {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename = "snake_case")]
 pub struct ComputeClaims {
-    /// The compute ID that will validate the token. The only case in which this
-    /// can be [`None`] is if [`Self::scope`] is
-    /// [`ComputeClaimsScope::Admin`].
+    /// The compute ID that will validate the token. It can be [`None`] only
+    /// when [`Self::scope`] is [`ComputeClaimsScope::Admin`] or
+    /// [`ComputeClaimsScope::Metrics`] (which ignores it).
     pub compute_id: Option<String>,
 
     /// The scope of what the token authorizes.
