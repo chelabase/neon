@@ -864,3 +864,83 @@ fn new_tar_header_dir(path: &str) -> anyhow::Result<Header> {
     header.set_cksum();
     Ok(header)
 }
+
+#[cfg(test)]
+mod slot_state_tests {
+    //! U16: only a persistent, long-enough `pg_replslot/*/state` counts towards `restart.lsn`.
+    //! Offsets written out by hand (not through `pg_constants`), from `ReplicationSlotOnDisk`:
+    //! a 16-byte header (magic, checksum, version, length), then `slotdata`: `name` (64),
+    //! `database` (4), `persistency` (4) at 84, `xmin`, `catalog_xmin`, `restart_lsn` (8) at 96.
+
+    use utils::lsn::Lsn;
+
+    use super::persistent_slot_restart_lsn;
+
+    const PERSISTENCY_AT: usize = 84;
+    const RESTART_LSN_AT: usize = 96;
+    /// `sizeof(ReplicationSlotOnDisk)` on v17.
+    const FULL: usize = 200;
+
+    const RS_PERSISTENT: u32 = 0;
+    const RS_EPHEMERAL: u32 = 1;
+    const RS_TEMPORARY: u32 = 2;
+
+    const LSN: u64 = 0x0000_0001_0203_0408;
+
+    /// A state of `len` bytes (at least 104) with the given persistency and `LSN`.
+    fn state(persistency: u32, len: usize) -> Vec<u8> {
+        let mut buf = vec![0xA5u8; len];
+        buf[PERSISTENCY_AT..PERSISTENCY_AT + 4].copy_from_slice(&persistency.to_le_bytes());
+        buf[RESTART_LSN_AT..RESTART_LSN_AT + 8].copy_from_slice(&LSN.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn a_persistent_state_gives_its_restart_lsn() {
+        assert_eq!(
+            persistent_slot_restart_lsn(&state(RS_PERSISTENT, FULL)),
+            Some(Lsn(LSN))
+        );
+    }
+
+    #[test]
+    fn a_persistent_state_of_exactly_104_bytes_is_long_enough() {
+        assert_eq!(
+            persistent_slot_restart_lsn(&state(RS_PERSISTENT, 104)),
+            Some(Lsn(LSN))
+        );
+    }
+
+    #[test]
+    fn temporary_and_ephemeral_states_do_not_count() {
+        assert_eq!(
+            persistent_slot_restart_lsn(&state(RS_TEMPORARY, FULL)),
+            None
+        );
+        assert_eq!(
+            persistent_slot_restart_lsn(&state(RS_EPHEMERAL, FULL)),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unknown_persistency_does_not_count() {
+        assert_eq!(persistent_slot_restart_lsn(&state(3, FULL)), None);
+        assert_eq!(persistent_slot_restart_lsn(&state(u32::MAX, FULL)), None);
+    }
+
+    #[test]
+    fn a_short_state_is_skipped_without_a_panic() {
+        // Persistency is RS_PERSISTENT (zero) wherever it is present, so only the length
+        // decides; every length up to 103 bytes (0, 83, 95, 103 among them) is too short to
+        // hold restart_lsn.
+        let full = state(RS_PERSISTENT, FULL);
+        for len in 0..104 {
+            assert_eq!(
+                persistent_slot_restart_lsn(&full[..len]),
+                None,
+                "a {len}-byte state"
+            );
+        }
+    }
+}
