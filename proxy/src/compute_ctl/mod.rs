@@ -8,6 +8,9 @@ use crate::http;
 use crate::types::{DbName, RoleName};
 use crate::url::ApiUrl;
 
+#[cfg(test)]
+mod tests;
+
 pub struct ComputeCtlApi {
     pub(crate) api: http::Endpoint,
 }

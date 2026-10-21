@@ -40,6 +40,9 @@ use crate::url::ApiUrl;
 project_git_version!(GIT_VERSION);
 project_build_tag!(BUILD_TAG);
 
+#[cfg(test)]
+mod token_tests;
+
 /// Neon proxy/router
 #[derive(Parser)]
 #[command(version = GIT_VERSION, about)]

@@ -978,6 +978,9 @@ async fn configure_redis(
 }
 
 #[cfg(test)]
+mod secret_tests;
+
+#[cfg(test)]
 mod tests {
     use std::time::Duration;
 
