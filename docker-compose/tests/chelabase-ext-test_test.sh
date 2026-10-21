@@ -754,6 +754,15 @@ case_harness_compute_config() {
 
 # ---------------------------------------------------------------------------------------------
 
+case_harness_compose_has_no_minio() {
+    local f="$ROOT/docker-compose/docker-compose.yml"
+    ! grep -qiE '^[[:space:]]*image:.*minio' "$f" || die_case "docker-compose.yml still uses a minio image (not pullable)"
+    grep -qE '^[[:space:]]*image:[[:space:]]*chrislusf/seaweedfs:4\.47@sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882$' "$f" ||
+        die_case "docker-compose.yml does not use the pinned SeaweedFS image"
+    ! grep -rq 'minio:9000' "$ROOT/docker-compose" --include=*.yml --include=*.toml --include=*.json ||
+        die_case "a config still points at the minio endpoint"
+}
+
 run_case() {
     local name="$1" out
     n=$((n + 1))
@@ -780,7 +789,7 @@ for c in \
     case_extensions_minimal_build_failure case_extensions_usage_errors case_help_mentions_extensions \
     case_extension_tests_minimal_stage case_extension_tests_full_stage_unchanged \
     case_ext_src_version_scripts_exist case_ext_src_timescaledb_version case_ext_src_pg_partman_version \
-    case_ext_src_pg_cron_version case_harness_compute_config; do
+    case_ext_src_pg_cron_version case_harness_compute_config case_harness_compose_has_no_minio; do
     run_case "$c"
 done
 

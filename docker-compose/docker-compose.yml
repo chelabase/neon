@@ -1,31 +1,42 @@
 services:
-  minio:
+  # S3 for pageserver layers and safekeeper WAL: all-in-one SeaweedFS in S3 mode, with the
+  # credentials the harness always used.
+  seaweedfs:
     restart: always
-    image: quay.io/minio/minio:RELEASE.2022-10-20T00-55-09Z
-    ports:
-      - 9000:9000
-      - 9001:9001
-    environment:
-      - MINIO_ROOT_USER=minio
-      - MINIO_ROOT_PASSWORD=password
-    command: server /data --address :9000 --console-address ":9001"
-
-  minio_create_buckets:
-    image: minio/mc
-    environment:
-      - MINIO_ROOT_USER=minio
-      - MINIO_ROOT_PASSWORD=password
-    entrypoint:
-      - "/bin/sh"
-      - "-c"
+    image: chrislusf/seaweedfs:4.47@sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882
+    entrypoint: ["/bin/sh", "-c"]
     command:
-      - "until (/usr/bin/mc alias set minio http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD) do
-             echo 'Waiting to start minio...' && sleep 1;
-         done;
-         /usr/bin/mc mb minio/neon --region=eu-north-1;
-         exit 0;"
+      - |
+        cat > /tmp/s3.json <<EOT
+        {"identities": [{"name": "neon",
+          "credentials": [{"accessKey": "minio", "secretKey": "password"}],
+          "actions": ["Admin", "Read", "Write", "List", "Tagging"]}]}
+        EOT
+        exec weed server -s3 -s3.port=9000 -s3.config=/tmp/s3.json -dir=/data -volume.max=64 -master.volumeSizeLimitMB=1024
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "9000"]
+      interval: 2s
+      retries: 60
+
+  create_bucket:
+    image: ${REPOSITORY:-ghcr.io/neondatabase}/neon:${TAG:-latest}
+    restart: "no"
+    environment:
+      - AWS_ACCESS_KEY_ID=minio
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_DEFAULT_REGION=eu-north-1
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        for i in $$(seq 60); do
+          aws --endpoint-url http://seaweedfs:9000 s3 mb s3://neon 2>/dev/null ||
+            aws --endpoint-url http://seaweedfs:9000 s3 ls s3://neon >/dev/null && exit 0
+          sleep 2
+        done
+        exit 1
     depends_on:
-      - minio
+      seaweedfs:
+        condition: service_healthy
 
   pageserver:
     restart: always
@@ -40,8 +51,10 @@ services:
     volumes:
       - ./pageserver_config:/data/.neon/
     depends_on:
-      - storage_broker
-      - minio_create_buckets
+      storage_broker:
+        condition: service_started
+      create_bucket:
+        condition: service_completed_successfully
 
   safekeeper1:
     restart: always
@@ -65,13 +78,15 @@ services:
                     --id=$$SAFEKEEPER_ID
                     --broker-endpoint=$$BROKER_ENDPOINT
                     -D /data
-                    --remote-storage=\"{endpoint='http://minio:9000',
+                    --remote-storage=\"{endpoint='http://seaweedfs:9000',
                                         bucket_name='neon',
                                         bucket_region='eu-north-1',
                                         prefix_in_bucket='/safekeeper/'}\""
     depends_on:
-      - storage_broker
-      - minio_create_buckets
+      storage_broker:
+        condition: service_started
+      create_bucket:
+        condition: service_completed_successfully
 
   safekeeper2:
     restart: always
@@ -95,13 +110,15 @@ services:
                     --id=$$SAFEKEEPER_ID
                     --broker-endpoint=$$BROKER_ENDPOINT
                     -D /data
-                    --remote-storage=\"{endpoint='http://minio:9000',
+                    --remote-storage=\"{endpoint='http://seaweedfs:9000',
                                         bucket_name='neon',
                                         bucket_region='eu-north-1',
                                         prefix_in_bucket='/safekeeper/'}\""
     depends_on:
-      - storage_broker
-      - minio_create_buckets
+      storage_broker:
+        condition: service_started
+      create_bucket:
+        condition: service_completed_successfully
 
   safekeeper3:
     restart: always
@@ -125,13 +142,15 @@ services:
                     --id=$$SAFEKEEPER_ID
                     --broker-endpoint=$$BROKER_ENDPOINT
                     -D /data
-                    --remote-storage=\"{endpoint='http://minio:9000',
+                    --remote-storage=\"{endpoint='http://seaweedfs:9000',
                                         bucket_name='neon',
                                         bucket_region='eu-north-1',
                                         prefix_in_bucket='/safekeeper/'}\""
     depends_on:
-      - storage_broker
-      - minio_create_buckets
+      storage_broker:
+        condition: service_started
+      create_bucket:
+        condition: service_completed_successfully
 
   storage_broker:
     restart: always
