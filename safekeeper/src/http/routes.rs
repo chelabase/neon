@@ -28,7 +28,7 @@ use tokio::task;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info_span};
-use utils::auth::SwappableJwtAuth;
+use utils::auth::{AuthError, Claims, SwappableJwtAuth};
 use utils::id::{TenantId, TenantTimelineId, TimelineId};
 use utils::lsn::Lsn;
 
@@ -67,6 +67,82 @@ fn check_permission(request: &Request<Body>, tenant_id: Option<TenantId>) -> Res
     check_permission_with(request, |claims| {
         crate::auth::check_permission(claims, tenant_id)
     })
+}
+
+/// How `api_handler` authorizes a request before its handler runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RouteAuth {
+    /// The route's path names its tenant (`:tenant_id`): that tenant's token or
+    /// `SafekeeperData`. A path naming no tenant (or one that doesn't parse) is a
+    /// management route: `SafekeeperData` only.
+    Path,
+    /// The route names its tenant only in the request body, so the handler checks that
+    /// tenant once it has read the body. Before that, a token that can't pass for any
+    /// tenant (its own one, for a tenant token) is refused.
+    TenantInBody,
+}
+
+/// Authorizes `request` for its route, before its handler reads the body or the query
+/// (see [`RouteAuth`]). Every route registered through `api_handler` gets this check,
+/// so a handler can't forget it; a handler may still check more (a tenant route that
+/// takes `SafekeeperData` only checks `None`).
+fn authorize_route(request: &Request<Body>, auth: RouteAuth) -> Result<(), ApiError> {
+    let tenant = request
+        .param("tenant_id")
+        .and_then(|id| TenantId::from_str(id).ok());
+    check_permission_with(request, |claims| route_permission(claims, auth, tenant))
+}
+
+/// Whether `claims` may use a route authorized by `auth` whose path names
+/// `route_tenant` (see [`RouteAuth`]).
+fn route_permission(
+    claims: &Claims,
+    auth: RouteAuth,
+    route_tenant: Option<TenantId>,
+) -> Result<(), AuthError> {
+    match auth {
+        RouteAuth::Path => crate::auth::check_permission(claims, route_tenant),
+        RouteAuth::TenantInBody => crate::auth::check_permission(claims, claims.tenant_id),
+    }
+}
+
+/// `request_span` for an API route, authorized for its path first
+/// ([`RouteAuth::Path`]).
+async fn api_handler<R, H>(request: Request<Body>, handler: H) -> Result<Response<Body>, ApiError>
+where
+    R: std::future::Future<Output = Result<Response<Body>, ApiError>> + Send + 'static,
+    H: FnOnce(Request<Body>) -> R + Send + Sync + 'static,
+{
+    api_handler_with(RouteAuth::Path, request, handler).await
+}
+
+/// `api_handler` for a route that names its tenant only in the request body
+/// ([`RouteAuth::TenantInBody`]): its handler must check the body's tenant.
+async fn api_handler_tenant_in_body<R, H>(
+    request: Request<Body>,
+    handler: H,
+) -> Result<Response<Body>, ApiError>
+where
+    R: std::future::Future<Output = Result<Response<Body>, ApiError>> + Send + 'static,
+    H: FnOnce(Request<Body>) -> R + Send + Sync + 'static,
+{
+    api_handler_with(RouteAuth::TenantInBody, request, handler).await
+}
+
+async fn api_handler_with<R, H>(
+    auth: RouteAuth,
+    request: Request<Body>,
+    handler: H,
+) -> Result<Response<Body>, ApiError>
+where
+    R: std::future::Future<Output = Result<Response<Body>, ApiError>> + Send + 'static,
+    H: FnOnce(Request<Body>) -> R + Send + Sync + 'static,
+{
+    request_span(request, move |r| async move {
+        authorize_route(&r, auth)?;
+        handler(r).await
+    })
+    .await
 }
 
 /// Deactivates all timelines for the tenant and removes its data directory.
@@ -698,6 +774,10 @@ async fn dump_debug_handler(mut request: Request<Body>) -> Result<Response<Body>
     Ok(response)
 }
 
+/// The routes the auth middleware lets through without a token. `/metrics` and the
+/// profiles need one (`crate::auth::check_metrics_permission`, `check_profile_permission`).
+pub const PUBLIC_ROUTES: &[&str] = &["/v1/status"];
+
 /// Safekeeper http router.
 pub fn make_router(
     conf: Arc<SafeKeeperConf>,
@@ -706,9 +786,7 @@ pub fn make_router(
     let mut router = endpoint::make_router();
     if conf.http_auth.is_some() {
         router = router.middleware(auth_middleware(|request| {
-            const ALLOWLIST_ROUTES: &[&str] =
-                &["/v1/status", "/metrics", "/profile/cpu", "/profile/heap"];
-            if ALLOWLIST_ROUTES.contains(&request.uri().path()) {
+            if PUBLIC_ROUTES.contains(&request.uri().path()) {
                 None
             } else {
                 // Option<Arc<SwappableJwtAuth>> is always provided as data below, hence unwrap().
@@ -722,8 +800,10 @@ pub fn make_router(
 
     let force_metric_collection_on_scrape = conf.force_metric_collection_on_scrape;
 
-    let prometheus_metrics_handler_wrapper =
-        move |req| prometheus_metrics_handler(req, force_metric_collection_on_scrape);
+    let prometheus_metrics_handler_wrapper = move |req: Request<Body>| async move {
+        check_permission_with(&req, crate::auth::check_metrics_permission)?;
+        prometheus_metrics_handler(req, force_metric_collection_on_scrape).await
+    };
 
     // NB: on any changes do not forget to update the OpenAPI spec
     // located nearby (/safekeeper/src/http/openapi_spec.yaml).
@@ -735,79 +815,88 @@ pub fn make_router(
         .get("/metrics", move |r| {
             request_span(r, prometheus_metrics_handler_wrapper)
         })
-        .get("/profile/cpu", |r| request_span(r, profile_cpu_handler))
-        .get("/profile/heap", |r| request_span(r, profile_heap_handler))
-        .get("/v1/status", |r| request_span(r, status_handler))
+        .get("/profile/cpu", |r| {
+            request_span(r, |r: Request<Body>| async move {
+                check_permission_with(&r, crate::auth::check_profile_permission)?;
+                profile_cpu_handler(r).await
+            })
+        })
+        .get("/profile/heap", |r| {
+            request_span(r, |r: Request<Body>| async move {
+                check_permission_with(&r, crate::auth::check_profile_permission)?;
+                profile_heap_handler(r).await
+            })
+        })
+        .get("/v1/status", |r| api_handler(r, status_handler))
         .put("/v1/failpoints", |r| {
-            request_span(r, move |r| async {
-                check_permission(&r, None)?;
+            api_handler(r, move |r| async {
                 let cancel = CancellationToken::new();
                 failpoints_handler(r, cancel).await
             })
         })
-        .get("/v1/utilization", |r| request_span(r, utilization_handler))
+        .get("/v1/utilization", |r| api_handler(r, utilization_handler))
         /* BEGIN_HADRON */
         .get("/v1/debug/filesystem_usage", |r| {
-            request_span(r, filesystem_usage_handler)
+            api_handler(r, filesystem_usage_handler)
         })
         /* END_HADRON */
         .delete("/v1/tenant/:tenant_id", |r| {
-            request_span(r, tenant_delete_handler)
+            api_handler(r, tenant_delete_handler)
         })
         // Will be used in the future instead of implicit timeline creation
         .post("/v1/tenant/timeline", |r| {
-            request_span(r, timeline_create_handler)
+            api_handler_tenant_in_body(r, timeline_create_handler)
         })
         .get("/v1/tenant/timeline", |r| {
-            request_span(r, timeline_list_handler)
+            api_handler(r, timeline_list_handler)
         })
         .get("/v1/tenant/:tenant_id/timeline/:timeline_id", |r| {
-            request_span(r, timeline_status_handler)
+            api_handler(r, timeline_status_handler)
         })
         .delete("/v1/tenant/:tenant_id/timeline/:timeline_id", |r| {
-            request_span(r, timeline_delete_handler)
+            api_handler(r, timeline_delete_handler)
         })
         .post("/v1/pull_timeline", |r| {
-            request_span(r, timeline_pull_handler)
+            api_handler(r, timeline_pull_handler)
         })
         .put("/v1/tenant/:tenant_id/timeline/:timeline_id/exclude", |r| {
-            request_span(r, timeline_exclude_handler)
+            api_handler(r, timeline_exclude_handler)
         })
         .get(
             "/v1/tenant/:tenant_id/timeline/:timeline_id/snapshot/:destination_id",
-            |r| request_span(r, timeline_snapshot_handler),
+            |r| api_handler(r, timeline_snapshot_handler),
         )
         .put(
             "/v1/tenant/:tenant_id/timeline/:timeline_id/membership",
-            |r| request_span(r, timeline_membership_handler),
+            |r| api_handler(r, timeline_membership_handler),
         )
         .post(
             "/v1/tenant/:tenant_id/timeline/:source_timeline_id/copy",
-            |r| request_span(r, timeline_copy_handler),
+            |r| api_handler(r, timeline_copy_handler),
         )
         .patch(
             "/v1/tenant/:tenant_id/timeline/:timeline_id/control_file",
-            |r| request_span(r, patch_control_file_handler),
+            |r| api_handler(r, patch_control_file_handler),
         )
         .post(
             "/v1/tenant/:tenant_id/timeline/:timeline_id/checkpoint",
-            |r| request_span(r, timeline_checkpoint_handler),
+            |r| api_handler(r, timeline_checkpoint_handler),
         )
         .get("/v1/tenant/:tenant_id/timeline/:timeline_id/digest", |r| {
-            request_span(r, timeline_digest_handler)
+            api_handler(r, timeline_digest_handler)
         })
         .post(
             "/v1/tenant/:tenant_id/timeline/:timeline_id/backup_partial_reset",
-            |r| request_span(r, timeline_backup_partial_reset),
+            |r| api_handler(r, timeline_backup_partial_reset),
         )
         .post(
             "/v1/tenant/:tenant_id/timeline/:timeline_id/term_bump",
-            |r| request_span(r, timeline_term_bump_handler),
+            |r| api_handler(r, timeline_term_bump_handler),
         )
         .post("/v1/record_safekeeper_info/:tenant_id/:timeline_id", |r| {
-            request_span(r, record_safekeeper_info)
+            api_handler(r, record_safekeeper_info)
         })
-        .get("/v1/debug_dump", |r| request_span(r, dump_debug_handler))
+        .get("/v1/debug_dump", |r| api_handler(r, dump_debug_handler))
 }
 
 #[cfg(test)]
@@ -829,5 +918,73 @@ mod tests {
             json,
             "{\"term\":1,\"epoch\":1,\"term_history\":[{\"term\":1,\"lsn\":\"0/16FFDDDD\"}]}"
         );
+    }
+
+    fn all_scopes() -> Vec<utils::auth::Scope> {
+        use utils::auth::Scope;
+        let all = vec![
+            Scope::Tenant,
+            Scope::TenantEndpoint,
+            Scope::PageServerApi,
+            Scope::SafekeeperData,
+            Scope::GenerationsApi,
+            Scope::Admin,
+            Scope::Infra,
+            Scope::Scrubber,
+            Scope::ControllerPeer,
+            Scope::Metrics,
+        ];
+        // Stops compiling when a scope is added, so the table below stays exhaustive.
+        for scope in &all {
+            match scope {
+                Scope::Tenant
+                | Scope::TenantEndpoint
+                | Scope::PageServerApi
+                | Scope::SafekeeperData
+                | Scope::GenerationsApi
+                | Scope::Admin
+                | Scope::Infra
+                | Scope::Scrubber
+                | Scope::ControllerPeer
+                | Scope::Metrics => {}
+            }
+        }
+        all
+    }
+
+    /// Invariant: the check every `api_handler` route runs first is total and allows
+    /// exactly `SafekeeperData` everywhere and a tenant token on its own tenant's routes
+    /// (or, for a tenant-in-body route, until its handler checks the body's tenant).
+    #[test]
+    fn route_permission_is_total_over_every_scope_route_and_tenant() {
+        use std::panic::catch_unwind;
+
+        use utils::auth::Scope;
+
+        let own = TenantId::generate();
+        let foreign = TenantId::generate();
+        for scope in all_scopes() {
+            for token_tenant in [None, Some(own)] {
+                for auth in [RouteAuth::Path, RouteAuth::TenantInBody] {
+                    for route in [None, Some(own), Some(foreign)] {
+                        let claims = Claims::new(token_tenant, scope);
+                        let case = format!(
+                            "scope {scope:?}, token tenant {token_tenant:?}, {auth:?}, route tenant {route:?}"
+                        );
+                        let result = catch_unwind(|| route_permission(&claims, auth, route))
+                            .unwrap_or_else(|_| panic!("route_permission panicked: {case}"));
+                        let allowed = match scope {
+                            Scope::SafekeeperData => true,
+                            Scope::Tenant => match auth {
+                                RouteAuth::Path => token_tenant.is_some() && route == token_tenant,
+                                RouteAuth::TenantInBody => token_tenant.is_some(),
+                            },
+                            _ => false,
+                        };
+                        assert_eq!(result.is_ok(), allowed, "{case}: {result:?}");
+                    }
+                }
+            }
+        }
     }
 }

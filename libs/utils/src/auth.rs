@@ -55,6 +55,11 @@ pub enum Scope {
     /// At the time of writing, this is only used for the step down request.
     #[serde(rename = "controller_peer")]
     ControllerPeer,
+
+    /// Read-only access to `/metrics` on the pageserver, the safekeeper and the storage
+    /// controller (and compute_ctl's metrics routes). It opens no other route, libpq
+    /// included. A metrics token carries `scope` and `iat`, and no `tenant_id`.
+    Metrics,
 }
 
 fn deserialize_empty_string_as_none_uuid<'de, D>(deserializer: D) -> Result<Option<Uuid>, D::Error>
@@ -141,6 +146,10 @@ impl JwtAuth {
         // The default 'required_spec_claims' is 'exp'. But we don't want to require
         // expiration.
         validation.required_spec_claims = [].into();
+        // An `exp` or `nbf` a token carries is still checked (with the default 60 s
+        // leeway): a token isn't valid after `exp` nor before `nbf`.
+        validation.validate_exp = true;
+        validation.validate_nbf = true;
         Self {
             decoding_keys,
             validation,
@@ -184,22 +193,40 @@ impl JwtAuth {
     /// The function tries the stored decoding keys in succession,
     /// and returns the first yielding a successful result.
     /// If there is no working decoding key, it returns the last error.
+    ///
+    /// A token whose `exp` or `nbf` is present but not an integer NumericDate is
+    /// refused: the validation would skip such a claim, and the token would never expire.
     pub fn decode<D: DeserializeOwned>(
         &self,
         token: &str,
     ) -> std::result::Result<TokenData<D>, AuthError> {
         let mut res = None;
         for decoding_key in &self.decoding_keys {
-            res = Some(decode(token, decoding_key, &self.validation));
-            if let Some(Ok(res)) = res {
-                return Ok(res);
+            let attempt = decode::<serde_json::Value>(token, decoding_key, &self.validation);
+            let verified = attempt.is_ok();
+            res = Some(attempt);
+            if verified {
+                break;
             }
         }
-        if let Some(res) = res {
-            res.map_err(|e| AuthError(Cow::Owned(e.to_string())))
-        } else {
-            Err(AuthError(Cow::Borrowed("no JWT decoding keys configured")))
+        let data = match res {
+            Some(Ok(data)) => data,
+            Some(Err(e)) => return Err(AuthError(Cow::Owned(e.to_string()))),
+            None => return Err(AuthError(Cow::Borrowed("no JWT decoding keys configured"))),
+        };
+        for name in ["exp", "nbf"] {
+            if data.claims.get(name).is_some_and(|value| !value.is_u64()) {
+                return Err(AuthError(Cow::Owned(format!(
+                    "JWT claim `{name}` is not a NumericDate"
+                ))));
+            }
         }
+        let claims = serde_json::from_value::<D>(data.claims)
+            .map_err(|e| AuthError(Cow::Owned(format!("JSON error: {e}"))))?;
+        Ok(TokenData {
+            header: data.header,
+            claims,
+        })
     }
 }
 
@@ -286,5 +313,56 @@ MC4CAQAwBQYDK2VwBCIEID/Drmc1AA6U/znNRWpF3zEGegOATQxfkdWxitcOMsIH
         let decoded: TokenData<Claims> = auth.decode(&encoded).unwrap();
 
         assert_eq!(decoded.claims, claims);
+    }
+
+    /// The wire names of every scope; `metrics` is the read-only scope of `/metrics`.
+    const SCOPE_NAMES: [&str; 10] = [
+        "tenant",
+        "tenantendpoint",
+        "pageserverapi",
+        "safekeeperdata",
+        "generations_api",
+        "admin",
+        "infra",
+        "scrubber",
+        "controller_peer",
+        "metrics",
+    ];
+
+    // The scope is spelled by its wire name here: the name is the interface Chelabase
+    // and the fixtures mint against.
+    #[test]
+    fn metrics_scope_round_trips_as_metrics() {
+        let metrics: Scope = serde_json::from_str("\"metrics\"")
+            .expect("`metrics` deserializes as a storage auth scope");
+        assert_eq!(serde_json::to_string(&metrics).unwrap(), "\"metrics\"");
+        for name in SCOPE_NAMES {
+            let scope: Scope = serde_json::from_str(&format!("\"{name}\""))
+                .unwrap_or_else(|e| panic!("scope `{name}` doesn't deserialize: {e}"));
+            assert_eq!(
+                serde_json::to_string(&scope).unwrap(),
+                format!("\"{name}\"")
+            );
+            assert_eq!(scope == metrics, name == "metrics", "scope `{name}`");
+        }
+    }
+
+    /// A metrics token carries `scope` and `iat` and no `tenant_id` or `exp` (U2); it
+    /// decodes, with no tenant.
+    #[test]
+    fn metrics_token_decodes_without_tenant_or_exp() {
+        let pem = pem::parse(TEST_PRIV_KEY_ED25519).unwrap();
+        let token = encode_from_key_file(
+            &serde_json::json!({"scope": "metrics", "iat": 1_760_000_000u64}),
+            &pem,
+        )
+        .unwrap();
+        let auth = JwtAuth::new(vec![
+            DecodingKey::from_ed_pem(TEST_PUB_KEY_ED25519.as_bytes()).unwrap(),
+        ]);
+        let claims: Claims = auth.decode(&token).expect("a metrics token decodes").claims;
+        assert_eq!(claims.tenant_id, None);
+        assert_eq!(claims.endpoint_id, None);
+        assert_eq!(serde_json::to_string(&claims.scope).unwrap(), "\"metrics\"");
     }
 }

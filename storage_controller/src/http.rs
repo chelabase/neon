@@ -38,7 +38,7 @@ use pageserver_client::{BlockUnblock, mgmt_api};
 use routerify::Middleware;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
-use utils::auth::{Scope, SwappableJwtAuth};
+use utils::auth::{Claims, Scope, SwappableJwtAuth};
 use utils::id::{NodeId, TenantId, TimelineId};
 
 use crate::http;
@@ -59,8 +59,11 @@ pub struct HttpState {
     auth: Option<Arc<SwappableJwtAuth>>,
     rate_limiter: governor::DefaultKeyedRateLimiter<TenantId>,
     neon_metrics: NeonMetrics,
-    allowlist_routes: &'static [&'static str],
 }
+
+/// The routes the auth middleware lets through without a token. `/metrics` and the
+/// profiles need one (`crate::auth::check_metrics_permission`, `check_profile_permission`).
+pub const PUBLIC_ROUTES: &[&str] = &["/status", "/live", "/ready"];
 
 impl HttpState {
     pub fn new(
@@ -74,14 +77,6 @@ impl HttpState {
             auth,
             rate_limiter: governor::RateLimiter::keyed(quota),
             neon_metrics: NeonMetrics::new(build_info),
-            allowlist_routes: &[
-                "/status",
-                "/live",
-                "/ready",
-                "/metrics",
-                "/profile/cpu",
-                "/profile/heap",
-            ],
         }
     }
 }
@@ -402,6 +397,8 @@ async fn handle_tenant_secondary_download(
     service: Arc<Service>,
     req: Request<Body>,
 ) -> Result<Response<Body>, ApiError> {
+    check_permissions(&req, Scope::PageServerApi)?;
+
     let tenant_id: TenantId = parse_request_param(&req, "tenant_id")?;
     let wait = parse_query_param(&req, "wait_ms")?.map(Duration::from_millis);
     maybe_rate_limit(&req, tenant_id).await;
@@ -1820,6 +1817,21 @@ fn check_permissions(request: &Request<Body>, required_scope: Scope) -> Result<(
     })
 }
 
+/// Refuses, before routing, a token whose scope no route takes
+/// (`crate::auth::check_route_scope`), so a handler that forgets its own check still
+/// can't be reached with a tenant or compute token. Runs after `auth_middleware`, which
+/// puts the token's claims in the request.
+fn route_scope_middleware<B: hyper::body::HttpBody + Send + Sync + 'static>()
+-> Middleware<B, ApiError> {
+    Middleware::pre(|req| async move {
+        if let Some(claims) = req.context::<Claims>() {
+            crate::auth::check_route_scope(&claims)
+                .map_err(|e| ApiError::Forbidden(format!("JWT authentication error: {e}")))?;
+        }
+        Ok(req)
+    })
+}
+
 #[derive(Clone, Debug)]
 struct RequestMeta {
     method: hyper::http::Method,
@@ -1920,6 +1932,8 @@ fn epilogue_metrics_middleware<B: hyper::body::HttpBody + Send + Sync + 'static>
 pub async fn measured_metrics_handler(req: Request<Body>) -> Result<Response<Body>, ApiError> {
     pub const TEXT_FORMAT: &str = "text/plain; version=0.0.4";
 
+    check_permission_with(&req, crate::auth::check_metrics_permission)?;
+
     let req = match maybe_forward(req).await {
         ForwardOutcome::Forwarded(res) => {
             return res;
@@ -1962,7 +1976,7 @@ enum ForwardOutcome {
 /// Potentially forward the request to the current storage controler leader.
 /// More specifically we forward when:
 /// 1. Request is not one of:
-///    ["/control/v1/step_down", "/status", "/ready", "/metrics", "/profile/cpu", "/profile/heap"]
+///    ["/control/v1/step_down", "/status", "/live", "/ready", "/metrics", "/profile/cpu", "/profile/heap"]
 /// 2. Current instance is in [`LeadershipStatus::SteppedDown`] state
 /// 3. There is a leader in the database to forward to
 /// 4. Leader from step (3) is not the current instance
@@ -2192,14 +2206,15 @@ pub fn make_router(
         .middleware(prologue_metrics_middleware())
         .middleware(epilogue_metrics_middleware());
     if auth.is_some() {
-        router = router.middleware(auth_middleware(|request| {
-            let state = get_state(request);
-            if state.allowlist_routes.contains(&request.uri().path()) {
-                None
-            } else {
-                state.auth.as_deref()
-            }
-        }));
+        router = router
+            .middleware(auth_middleware(|request| {
+                if PUBLIC_ROUTES.contains(&request.uri().path()) {
+                    None
+                } else {
+                    get_state(request).auth.as_deref()
+                }
+            }))
+            .middleware(route_scope_middleware());
     }
 
     router
@@ -2218,10 +2233,24 @@ pub fn make_router(
             named_request_span(r, handle_ready, RequestName("ready"))
         })
         .get("/profile/cpu", |r| {
-            named_request_span(r, profile_cpu_handler, RequestName("profile_cpu"))
+            named_request_span(
+                r,
+                |r: Request<Body>| async move {
+                    check_permission_with(&r, crate::auth::check_profile_permission)?;
+                    profile_cpu_handler(r).await
+                },
+                RequestName("profile_cpu"),
+            )
         })
         .get("/profile/heap", |r| {
-            named_request_span(r, profile_heap_handler, RequestName("profile_heap"))
+            named_request_span(
+                r,
+                |r: Request<Body>| async move {
+                    check_permission_with(&r, crate::auth::check_profile_permission)?;
+                    profile_heap_handler(r).await
+                },
+                RequestName("profile_heap"),
+            )
         })
         // Upcalls for the pageserver: point the pageserver's `control_plane_api` config to this prefix
         .post("/upcall/v1/re-attach", |r| {
@@ -2322,7 +2351,10 @@ pub fn make_router(
             request_span(r, handle_reconcile_all)
         })
         .put("/debug/v1/failpoints", |r| {
-            request_span(r, |r| failpoints_handler(r, CancellationToken::new()))
+            request_span(r, |r: Request<Body>| async move {
+                check_permissions(&r, Scope::Admin)?;
+                failpoints_handler(r, CancellationToken::new()).await
+            })
         })
         // Node operations
         .post("/control/v1/node", |r| {

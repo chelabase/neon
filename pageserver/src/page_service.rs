@@ -2803,13 +2803,13 @@ impl PageServerHandler {
             // auth is set to Trust, nothing to check so just return ok
             return Ok(());
         }
-        // auth is some, just checked above, when auth is some
-        // then claims are always present because of checks during connection init
-        // so this expect won't trigger
-        let claims = self
-            .claims
-            .as_ref()
-            .expect("claims presence already checked");
+        // With auth on, connection init only lets an authenticated connection through, so
+        // claims are present; a connection without them is refused, never a panic.
+        let Some(claims) = self.claims.as_ref() else {
+            return Err(QueryError::Unauthorized(
+                "connection is not authenticated".into(),
+            ));
+        };
         check_permission(claims, tenant_id).map_err(|e| QueryError::Unauthorized(e.0))
     }
 }
@@ -4450,6 +4450,10 @@ pub(crate) fn effective_request_lsn_for_test(
     )
     .map_err(|e| e.to_string())
 }
+
+#[cfg(test)]
+#[path = "page_service_auth_tests.rs"]
+mod auth_tests;
 
 #[cfg(test)]
 mod tests {

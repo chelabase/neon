@@ -19,7 +19,7 @@ use tokio::sync::{Mutex, Notify, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::ReaderStream;
 use tracing::{Instrument, debug, info, info_span, warn};
-use utils::auth::{AuthError, Claims, SwappableJwtAuth};
+use utils::auth::{AuthError, Claims, Scope, SwappableJwtAuth};
 use utils::metrics_collector::{METRICS_COLLECTOR, METRICS_STALE_MILLIS};
 
 use crate::error::{ApiError, api_error_handler, route_error_handler};
@@ -638,6 +638,25 @@ fn parse_token(header_value: &str) -> Result<&str, ApiError> {
     Ok(token)
 }
 
+/// The one path a `metrics` token opens.
+pub const METRICS_PATH: &str = "/metrics";
+
+/// A `metrics` token reads `/metrics` and nothing else: it is refused on every other
+/// path (unknown ones included) before routing, so no handler is ever reached with it,
+/// whether or not the handler checks its own permission.
+fn check_metrics_scope_path(claims: &Claims, path: &str) -> Result<(), ApiError> {
+    if claims.scope == Scope::Metrics && path != METRICS_PATH {
+        // Logged with the request by the error handler, as every refusal.
+        return Err(ApiError::Forbidden(
+            "a metrics token only reads /metrics".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Decodes the request's token into its `Claims` (the request context) when
+/// `provide_auth` gives a key set for the request, and refuses the request when the token
+/// is missing, malformed or invalid, or is a `metrics` token off `/metrics`.
 pub fn auth_middleware<B: hyper::body::HttpBody + Send + Sync + 'static>(
     provide_auth: fn(&Request<Body>) -> Option<&SwappableJwtAuth>,
 ) -> Middleware<B, ApiError> {
@@ -655,6 +674,7 @@ pub fn auth_middleware<B: hyper::body::HttpBody + Send + Sync + 'static>(
                         // Rely on From<AuthError> for ApiError impl
                         err
                     })?;
+                    check_metrics_scope_path(&data.claims, req.uri().path())?;
                     req.set_context(data.claims);
                 }
                 None => {
