@@ -43,7 +43,7 @@ storage_image=""
 only=""
 keep_tag=""
 
-# value_of <flag> <value...>: the next argument as the flag's value (not empty, not flag-looking).
+# need_value <flag> <args...>: dies unless the first of <args> exists, is not empty and does not look like a flag.
 need_value() {
     local flag="$1"
     shift
