@@ -19,9 +19,11 @@ pub struct FailpointConfig {
 
 use crate::http::JsonResponse;
 use crate::http::extract::Json;
+use crate::http::middleware::internal_auth::InternalAuth;
 
 /// Configure failpoints for testing purposes.
 pub(in crate::http) async fn configure_failpoints(
+    _auth: InternalAuth,
     failpoints: Json<ConfigureFailpointsRequest>,
 ) -> Response {
     if !fail::has_failpoints() {

@@ -14,6 +14,8 @@ from fixtures.log_helper import log
 from fixtures.utils import wait_until
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from requests import PreparedRequest
 
 
@@ -45,17 +47,45 @@ class BearerAuth(AuthBase):
 
 
 @final
+class InternalTokenAuth(AuthBase):
+    """
+    The bearer of compute_ctl's internal server: the per-start secret, read
+    from the endpoint's internal API token file at every request (it changes at
+    every compute start). No file, no header (the call is refused).
+    """
+
+    def __init__(self, token_file: Path | None):
+        self.__token_file = token_file
+
+    @override
+    def __call__(self, request: PreparedRequest) -> PreparedRequest:
+        request.headers.pop("Authorization", None)
+        if self.__token_file is not None:
+            try:
+                secret = self.__token_file.read_text().strip()
+            except FileNotFoundError:
+                return request
+            request.headers["Authorization"] = "Bearer " + secret
+        return request
+
+
+@final
 class EndpointHttpClient(requests.Session):
     def __init__(
         self,
         external_port: int,
         internal_port: int,
         jwt: str,
+        internal_token_file: Path | None = None,
     ):
         super().__init__()
         self.external_port: int = external_port
         self.internal_port: int = internal_port
         self.auth = BearerAuth(jwt)
+        # The internal server listens on loopback only and needs the secret
+        # (never the external JWT).
+        self.internal_auth = InternalTokenAuth(internal_token_file)
+        self.internal_url = f"http://127.0.0.1:{internal_port}"
 
         self.mount("http://", HTTPAdapter())
         self.prewarm_url = f"http://localhost:{external_port}/lfc/prewarm"
@@ -164,17 +194,27 @@ class EndpointHttpClient(requests.Session):
             "version": version,
             "database": database,
         }
-        res = self.post(f"http://localhost:{self.internal_port}/extensions", json=body)
+        res = self.post(f"{self.internal_url}/extensions", json=body, auth=self.internal_auth)
         res.raise_for_status()
         return res.json()
 
     def set_role_grants(self, database: str, role: str, schema: str, privileges: list[str]):
         res = self.post(
-            f"http://localhost:{self.internal_port}/grants",
+            f"{self.internal_url}/grants",
             json={"database": database, "schema": schema, "role": role, "privileges": privileges},
+            auth=self.internal_auth,
         )
         res.raise_for_status()
         return res.json()
+
+    def storage_token(self, token: str) -> None:
+        """Hands the compute a new storage token (`POST /storage_token`)."""
+        res = self.post(
+            f"http://localhost:{self.external_port}/storage_token",
+            json={"token": token},
+            auth=self.auth,
+        )
+        res.raise_for_status()
 
     def metrics(self) -> str:
         res = self.get(f"http://localhost:{self.external_port}/metrics")
@@ -201,9 +241,9 @@ class EndpointHttpClient(requests.Session):
             body.append(
                 {
                     "name": fp[0],
-                    "action": fp[1],
+                    "actions": fp[1],
                 }
             )
 
-        res = self.post(f"http://localhost:{self.internal_port}/failpoints", json=body)
+        res = self.post(f"{self.internal_url}/failpoints", json=body, auth=self.internal_auth)
         res.raise_for_status()

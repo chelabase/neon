@@ -4742,7 +4742,18 @@ class Endpoint(PgProtocol, LogUtils):
             external_port=self.external_http_port,
             internal_port=self.internal_http_port,
             jwt=self.__jwt,
+            internal_token_file=self.internal_api_token_file,
         )
+
+    @property
+    def internal_api_token_file(self) -> Path:
+        """compute_ctl's internal API secret, rewritten at every start (pgdata's parent)."""
+        return self.endpoint_path() / "compute_ctl_internal.token"
+
+    @property
+    def storage_auth_token_file(self) -> Path:
+        """The compute's storage token file (absent when storage auth is off)."""
+        return self.endpoint_path() / "storage_auth.token"
 
     def create(
         self,

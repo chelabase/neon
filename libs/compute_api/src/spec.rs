@@ -149,8 +149,9 @@ pub struct ComputeSpec {
     pub mode: ComputeMode,
 
     /// If set, 'storage_auth_token' is used as the password to authenticate to
-    /// the pageserver and safekeepers.
-    pub storage_auth_token: Option<String>,
+    /// the pageserver and safekeepers. compute_ctl hands it to Postgres only
+    /// through its token file, never through the environment or a setting.
+    pub storage_auth_token: Option<StorageAuthToken>,
 
     // information about available remote extensions
     pub remote_extensions: Option<RemoteExtSpec>,
@@ -223,6 +224,36 @@ pub struct ComputeSpec {
     /// ALLOW_CONNECTIONS/IS_TEMPLATE` is refused. Absent: false.
     #[serde(default)]
     pub branch_protected: bool,
+}
+
+/// The tenant storage token of a compute (the password of its pageserver and
+/// safekeeper connections). Its `Debug` never prints the value, so a spec, a
+/// request or a state that carries one can be logged safely; there is no
+/// `Display` or `Deref`, so the value is only reached through [`Self::as_str`].
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct StorageAuthToken(String);
+
+impl StorageAuthToken {
+    pub fn new(token: String) -> Self {
+        Self(token)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for StorageAuthToken {
+    fn from(token: String) -> Self {
+        Self(token)
+    }
+}
+
+impl std::fmt::Debug for StorageAuthToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StorageAuthToken(<redacted>)")
+    }
 }
 
 /// Who may log in as a member role (`cb_m_*`): `allowed_cidrs` are the source

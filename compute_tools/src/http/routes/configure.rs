@@ -26,6 +26,9 @@ pub(in crate::http) async fn configure(
         Ok(p) => p,
         Err(e) => return JsonResponse::error(StatusCode::BAD_REQUEST, e),
     };
+    if let Some(reason) = ComputeNode::storage_token_refusal(&pspec) {
+        return JsonResponse::error(StatusCode::BAD_REQUEST, reason);
+    }
 
     // XXX: wrap state update under lock in a code block. Otherwise, we will try
     // to `Send` `mut state` into the spawned thread bellow, which will cause
@@ -36,6 +39,15 @@ pub(in crate::http) async fn configure(
         let mut state = compute.state.lock().unwrap();
         if !matches!(state.status, ComputeStatus::Empty | ComputeStatus::Running) {
             return JsonResponse::invalid_status(state.status);
+        }
+
+        // RT4-7, SP6: a started compute keeps its storage auth as it started;
+        // refused before anything changes.
+        if state.status == ComputeStatus::Running
+            && let Some(reason) =
+                ComputeNode::storage_auth_change_refusal(state.pspec.as_ref(), &pspec)
+        {
+            return JsonResponse::error(StatusCode::BAD_REQUEST, reason);
         }
 
         // Pass the tracing span to the main thread that performs the startup,

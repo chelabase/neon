@@ -12,6 +12,14 @@ pub(in crate::http) async fn promote(
         Ok(p) => p,
         Err(e) => return JsonResponse::error(StatusCode::BAD_REQUEST, e),
     };
+    // RT4-7, SP6: a promote can't turn storage auth off or on either.
+    let refusal = crate::compute::ComputeNode::storage_token_refusal(&pspec).or_else(|| {
+        let state = compute.state.lock().unwrap();
+        crate::compute::ComputeNode::storage_auth_change_refusal(state.pspec.as_ref(), &pspec)
+    });
+    if let Some(reason) = refusal {
+        return JsonResponse::error(StatusCode::BAD_REQUEST, reason);
+    }
 
     let cfg = PromoteConfig {
         spec: pspec.spec,

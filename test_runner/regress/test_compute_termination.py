@@ -334,9 +334,15 @@ def test_compute_empty_spec_during_refresh_configuration(
         # Switch spec fetch handler to return empty spec
         SwitchableConfigHandler.return_empty_spec = True
 
-        # Trigger a configuration refresh
+        # Trigger a configuration refresh (the internal server needs compute_ctl's
+        # per-start secret, written next to pgdata)
+        token_file = env.repo_dir / "endpoints" / endpoint_name / "compute_ctl_internal.token"
+        secret = token_file.read_text().strip()
         try:
-            requests.post(f"http://localhost:{internal_http_port}/refresh_configuration")
+            requests.post(
+                f"http://127.0.0.1:{internal_http_port}/refresh_configuration",
+                headers={"Authorization": f"Bearer {secret}"},
+            )
         except requests.RequestException as e:
             log.info(f"Call to /refresh_configuration failed: {e}")
             log.info(

@@ -64,6 +64,8 @@ fn params(pgdata: &Path) -> ComputeNodeParams {
         build_tag: "test".into(),
         control_plane_uri: None,
         config_path_test_only: None::<OsString>,
+        internal_api_token_file: pgdata.with_file_name("compute_ctl_internal.token"),
+        storage_auth_token_file: pgdata.with_file_name("storage_auth.token"),
     }
 }
 

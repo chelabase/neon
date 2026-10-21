@@ -122,6 +122,27 @@ fn configurator_main_loop(compute: &Arc<ComputeNode>) {
                         // into the type system.
                         assert_eq!(state.status, ComputeStatus::RefreshConfiguration);
 
+                        // RT4-7, SP6: a refreshed spec can't turn storage auth off
+                        // or on (or carry an unwritable token); keep the current
+                        // spec and retry later, as for a failed fetch.
+                        if let Some(reason) =
+                            ComputeNode::storage_token_refusal(&pspec).or_else(|| {
+                                ComputeNode::storage_auth_change_refusal(
+                                    state.pspec.as_ref(),
+                                    &pspec,
+                                )
+                            })
+                        {
+                            error!("Refresh configuration: refusing the new spec: {reason}");
+                            state.set_status(
+                                ComputeStatus::RefreshConfigurationPending,
+                                &compute.state_changed,
+                            );
+                            drop(state);
+                            std::thread::sleep(std::time::Duration::from_secs(5));
+                            continue;
+                        }
+
                         if state
                             .pspec
                             .as_ref()
