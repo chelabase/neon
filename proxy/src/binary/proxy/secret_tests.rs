@@ -244,9 +244,12 @@ async fn configure_redis_reads_the_file_and_logs_nothing_secret() {
 #[tokio::test]
 async fn configure_redis_fails_closed() {
     let dir = camino_tempfile::tempdir().unwrap();
-    let empty = write_pw(&dir, b"");
+    // Each case has its own file: `write_pw` always writes the same path.
+    let empty = dir.path().join("empty.password");
+    std::fs::write(&empty, b"").unwrap();
     let missing = dir.path().join("missing");
-    let good = write_pw(&dir, format!("{PW}\n").as_bytes());
+    let good = dir.path().join("good.password");
+    std::fs::write(&good, format!("{PW}\n")).unwrap();
 
     for (why, args) in [
         ("empty file", plain_args(Some(URL), Some(&empty))),
