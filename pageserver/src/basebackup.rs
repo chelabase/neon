@@ -488,8 +488,20 @@ where
                 if self.replica {
                     continue;
                 }
-                // Every entry is shipped (the compute deletes a non-persistent slot it finds
-                // and removes its stale copy at start), but only a persistent slot holds WAL.
+                // A malformed state would make the compute PANIC in RestoreSlotFromDisk at
+                // every start: it is never shipped, and never holds WAL.
+                if let Err(defect) = check_slot_state(self.timeline.pg_version, &content) {
+                    warn!(
+                        "skipping malformed replication slot state {} ({} bytes): {:?}",
+                        path,
+                        content.len(),
+                        defect
+                    );
+                    continue;
+                }
+                // Every well-formed entry is shipped (the compute deletes a non-persistent
+                // slot it finds and removes its stale copy at start), but only a persistent
+                // slot holds WAL.
                 match persistent_slot_restart_lsn(&content) {
                     Some(restart_lsn) => {
                         info!("Replication slot {} restart LSN={}", path, restart_lsn);
@@ -869,6 +881,70 @@ fn new_tar_header_dir(path: &str) -> anyhow::Result<Header> {
     );
     header.set_cksum();
     Ok(header)
+}
+
+/// Why a `pg_replslot/<slot>/state` aux entry would make the compute's `RestoreSlotFromDisk`
+/// PANIC at start (checked in its order).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MalformedSlotState {
+    /// Fewer bytes than the 16-byte constant header (`magic`, `checksum`, `version`, `length`).
+    TooShort,
+    /// `magic` is not `SLOT_MAGIC`.
+    WrongMagic,
+    /// `version` is not this major's `SLOT_VERSION`.
+    WrongVersion,
+    /// `length` is not `sizeof(ReplicationSlotPersistentData)`, or the entry is not exactly
+    /// the header plus `length` bytes.
+    WrongLength,
+    /// The CRC-32C of everything after `magic` and `checksum` is not `checksum`.
+    ChecksumMismatch,
+}
+
+/// `ReplicationSlotOnDisk`'s layout (`slot.c`, the same on v14 to v17).
+const SLOT_MAGIC: u32 = 0x1051_CA1;
+/// `ReplicationSlotOnDiskConstantSize`: `magic`, `checksum`, `version`, `length`.
+const SLOT_STATE_HEADER: usize = 16;
+/// `ReplicationSlotOnDiskNotChecksummedSize`: the checksum covers everything after these.
+const SLOT_STATE_NOT_CHECKSUMMED: usize = 8;
+/// `ReplicationSlotOnDiskV2Size`: `sizeof(ReplicationSlotPersistentData)` on every major.
+const SLOT_STATE_DATA: usize = 184;
+
+/// `SLOT_VERSION` of each major's `slot.c`.
+fn slot_state_version(pg_version: PgMajorVersion) -> u32 {
+    match pg_version {
+        PgMajorVersion::PG14 | PgMajorVersion::PG15 => 2,
+        PgMajorVersion::PG16 => 3,
+        PgMajorVersion::PG17 => 5,
+    }
+}
+
+/// Checks a `pg_replslot/<slot>/state` aux entry as `RestoreSlotFromDisk` does, so the
+/// basebackup never ships one the compute would PANIC on.
+fn check_slot_state(pg_version: PgMajorVersion, content: &[u8]) -> Result<(), MalformedSlotState> {
+    let field = |at: usize| {
+        let mut bytes = [0u8; 4];
+        bytes.copy_from_slice(&content[at..at + 4]);
+        u32::from_le_bytes(bytes)
+    };
+    if content.len() < SLOT_STATE_HEADER {
+        return Err(MalformedSlotState::TooShort);
+    }
+    let (magic, checksum, version, length) = (field(0), field(4), field(8), field(12));
+    if magic != SLOT_MAGIC {
+        return Err(MalformedSlotState::WrongMagic);
+    }
+    if version != slot_state_version(pg_version) {
+        return Err(MalformedSlotState::WrongVersion);
+    }
+    if usize::try_from(length) != Ok(SLOT_STATE_DATA)
+        || content.len() != SLOT_STATE_HEADER + SLOT_STATE_DATA
+    {
+        return Err(MalformedSlotState::WrongLength);
+    }
+    if crc32c::crc32c(&content[SLOT_STATE_NOT_CHECKSUMMED..]) != checksum {
+        return Err(MalformedSlotState::ChecksumMismatch);
+    }
+    Ok(())
 }
 
 /// The `restart_lsn` of a `pg_replslot/<slot>/state` aux file (`ReplicationSlotOnDisk`), only
@@ -1283,6 +1359,110 @@ mod slot_state_check_tests {
                     );
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod slot_state_check_edges {
+    //! F3 coder edges beyond `slot_state_check_tests`: the order of the checks
+    //! when several fields are wrong, and which majors accept which state.
+
+    use postgres_ffi::PgMajorVersion;
+
+    use super::{MalformedSlotState, check_slot_state, slot_state_version};
+
+    const ALL: [PgMajorVersion; 4] = [
+        PgMajorVersion::PG14,
+        PgMajorVersion::PG15,
+        PgMajorVersion::PG16,
+        PgMajorVersion::PG17,
+    ];
+
+    fn put(buf: &mut [u8], at: usize, value: u32) {
+        buf[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn reseal(buf: &mut [u8]) {
+        let crc = crc32c::crc32c(&buf[8..]);
+        put(buf, 4, crc);
+    }
+
+    fn valid_state(pg_version: PgMajorVersion) -> Vec<u8> {
+        let mut buf = vec![0x5Au8; 200];
+        put(&mut buf, 0, 0x1051_CA1);
+        put(&mut buf, 8, slot_state_version(pg_version));
+        put(&mut buf, 12, 184);
+        reseal(&mut buf);
+        buf
+    }
+
+    /// A state is shipped on exactly the majors whose `SLOT_VERSION` wrote it
+    /// (v14 and v15 share version 2).
+    #[test]
+    fn a_state_is_accepted_exactly_on_the_majors_of_its_version() {
+        for written in ALL {
+            let buf = valid_state(written);
+            for read in ALL {
+                let same = slot_state_version(read) == slot_state_version(written);
+                assert_eq!(
+                    check_slot_state(read, &buf).is_ok(),
+                    same,
+                    "a {written:?} state read on {read:?}"
+                );
+            }
+        }
+    }
+
+    /// With several defects, the first in `RestoreSlotFromDisk`'s order is the
+    /// one reported (the checksum comes last).
+    #[test]
+    fn the_first_defect_in_restore_order_is_reported() {
+        let v = PgMajorVersion::PG17;
+        let mut buf = valid_state(v);
+        put(&mut buf, 0, 0);
+        put(&mut buf, 8, 0);
+        put(&mut buf, 12, 0);
+        buf[100] ^= 1;
+        assert_eq!(
+            check_slot_state(v, &buf),
+            Err(MalformedSlotState::WrongMagic)
+        );
+
+        let mut buf = valid_state(v);
+        put(&mut buf, 8, 0);
+        put(&mut buf, 12, 0);
+        buf[100] ^= 1;
+        assert_eq!(
+            check_slot_state(v, &buf),
+            Err(MalformedSlotState::WrongVersion)
+        );
+
+        let mut buf = valid_state(v);
+        put(&mut buf, 12, 0);
+        buf[100] ^= 1;
+        assert_eq!(
+            check_slot_state(v, &buf),
+            Err(MalformedSlotState::WrongLength)
+        );
+
+        // A short entry with a good header is a wrong length, not a checksum error.
+        let buf = valid_state(v);
+        assert_eq!(
+            check_slot_state(v, &buf[..199]),
+            Err(MalformedSlotState::WrongLength)
+        );
+    }
+
+    /// A state whose slot data is all zero (an otherwise valid header and a
+    /// checksum over it) is well formed: content isn't the checker's business.
+    #[test]
+    fn a_zeroed_slotdata_with_a_good_checksum_is_well_formed() {
+        for v in ALL {
+            let mut buf = valid_state(v);
+            buf[16..].fill(0);
+            reseal(&mut buf);
+            assert_eq!(check_slot_state(v, &buf), Ok(()), "{v:?}");
         }
     }
 }

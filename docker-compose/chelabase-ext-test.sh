@@ -24,13 +24,15 @@ usage: chelabase-ext-test.sh [--extensions minimal|all] [--storage-image <ref>] 
 
   --extensions minimal|all  extensions of the compute and the tests image (default all); minimal builds
                          the slim extension-tests-minimal image (timescaledb, pg_partman, pg_cron)
-  --storage-image <ref>  tag <ref> as chelabase-local/neon:<tag> for the harness's storage services
+  --storage-image <ref>  tag <ref> as chelabase-local/neon:<tag> for the harness's storage services;
+                         that retag is removed afterwards (unless --keep-images); <ref> is kept
   --only <dir,...>       run only these docker-compose/ext-src directories (contrib suite skipped)
   --keep-images <tag>    use <tag> instead of ext-test and keep every image afterwards
   --help                 print this text
 
 Builds the compute (EXTENSIONS=all, or minimal) and extension-tests images from this checkout, runs
-docker_compose_test.sh for Postgres 17 on them, then removes the images (unless --keep-images).
+docker_compose_test.sh for Postgres 17 on them, then takes the harness's containers down (best
+effort, also with --keep-images) and removes the images (unless --keep-images).
 The exit status is the harness's.
 EOF
 }
@@ -104,8 +106,16 @@ if [[ -z "$storage_image" ]]; then
     echo "chelabase-ext-test.sh: warning: no --storage-image; the harness's storage services use $storage_tag, which must already exist locally" >&2
 fi
 
+harness_started=false
+
 cleanup() {
     local rc=$?
+    # The harness's own `down` doesn't run when it is interrupted or fails early: take its
+    # project down (best effort) before removing the images its containers use.
+    if $harness_started; then
+        REPOSITORY="$REPOSITORY" TAG="$TAG" docker compose \
+            -f "$ROOT/docker-compose/docker-compose.yml" --profile test-extensions down || true
+    fi
     if [[ -z "$keep_tag" ]]; then
         local images=("$compute_image" "$tests_image")
         [[ -n "$storage_image" ]] && images+=("$storage_tag")
@@ -136,6 +146,7 @@ if [[ -n "$storage_image" ]]; then
     docker tag "$storage_image" "$storage_tag" || exit 1
 fi
 
+harness_started=true
 TEST_VERSION_ONLY=17 ONLY="$only" REPOSITORY="$REPOSITORY" TAG="$TAG" \
     "$ROOT/docker-compose/docker_compose_test.sh"
 exit $?

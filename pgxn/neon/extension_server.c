@@ -39,14 +39,46 @@ neon_download_extension_file_http(const char *filename, bool is_library)
 	CURL	   *handle;
 	struct curl_slist *headers;
 	char	   *compute_ctl_url;
+	char	   *escaped;
+	int			url_len;
+
+	/*
+	 * The name is the session's (CREATE EXTENSION's name, LOAD's library):
+	 * percent-encode it so it stays one path segment, and "?", "#", "%", "&"
+	 * or "/" in it never become a query string, a fragment, an escape or
+	 * another path.  curl_easy_escape's handle argument is unused, and it
+	 * keeps only [A-Za-z0-9._~-] as they are, so an ordinary name is
+	 * unchanged.  Nothing may throw while `escaped` (malloc'd) is held.
+	 */
+	escaped = curl_easy_escape(NULL, filename, 0);
+	if (escaped == NULL)
+	{
+		elog(WARNING, "neon_download_extension_file_http failed: could not escape the file name");
+		return false;
+	}
 
 	/*
 	 * compute_ctl's internal server listens on loopback only, and wants the
 	 * internal API secret, read from its file before every call (a missing
 	 * or invalid file means no header, and compute_ctl refuses the call).
 	 */
-	compute_ctl_url = psprintf("http://127.0.0.1:%d/extension_server/%s%s",
-							   hadron_extension_server_port, filename, is_library ? "?is_library=true" : "");
+#define EXTENSION_SERVER_URL_FORMAT "http://127.0.0.1:%d/extension_server/%s%s"
+	url_len = snprintf(NULL, 0, EXTENSION_SERVER_URL_FORMAT,
+					   hadron_extension_server_port, escaped,
+					   is_library ? "?is_library=true" : "");
+	compute_ctl_url = url_len < 0 ? NULL :
+		palloc_extended(url_len + 1, MCXT_ALLOC_NO_OOM);
+	if (compute_ctl_url == NULL)
+	{
+		curl_free(escaped);
+		elog(WARNING, "neon_download_extension_file_http failed: out of memory");
+		return false;
+	}
+	snprintf(compute_ctl_url, url_len + 1, EXTENSION_SERVER_URL_FORMAT,
+			 hadron_extension_server_port, escaped,
+			 is_library ? "?is_library=true" : "");
+#undef EXTENSION_SERVER_URL_FORMAT
+	curl_free(escaped);
 
 	elog(LOG, "Sending request to compute_ctl: %s", compute_ctl_url);
 
