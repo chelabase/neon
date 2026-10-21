@@ -280,16 +280,30 @@ impl Secrets {
     const PEER_JWT_TOKEN_ENV: &'static str = "PEER_JWT_TOKEN";
     const PUBLIC_KEY_ENV: &'static str = "PUBLIC_KEY";
 
-    /// [`Self::load_with_env`] with the process environment.
+    /// [`Self::load_with_vars`] with the process environment.
     fn load(args: &Cli) -> anyhow::Result<Self> {
-        Self::load_with_env(args, &|name| std::env::var(name).ok())
+        Self::load_with_vars(args, &|name| std::env::var(name))
+    }
+
+    /// [`Self::load_with_vars`] with an environment that has only UTF-8 values (`None` is
+    /// an unset variable).
+    #[cfg(test)]
+    fn load_with_env(args: &Cli, env: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
+        Self::load_with_vars(args, &|name| {
+            env(name).ok_or(std::env::VarError::NotPresent)
+        })
     }
 
     /// Load secrets from, in order of preference:
-    /// - a token file flag (`--*-jwt-token-file`), exclusive with its flag and variable
+    /// - a token file flag (`--*-jwt-token-file`), exclusive with its flag and with its
+    ///   variable when that is present at all (empty or not UTF-8 included)
     /// - CLI args
-    /// - environment variables, read through `env`.
-    fn load_with_env(args: &Cli, env: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
+    /// - environment variables, read through `vars` (a non-UTF-8 value reads as unset).
+    fn load_with_vars(
+        args: &Cli,
+        vars: &dyn Fn(&str) -> Result<String, std::env::VarError>,
+    ) -> anyhow::Result<Self> {
+        let env = |name: &str| vars(name).ok();
         let load_secret = |cli: &Option<String>, env_name: &str| -> Option<String> {
             cli.clone().or_else(|| env(env_name))
         };
@@ -305,7 +319,7 @@ impl Secrets {
             if cli.is_some() {
                 anyhow::bail!("{file_flag} and {cli_flag} are exclusive: give only one");
             }
-            if env(env_name).is_some() {
+            if !matches!(vars(env_name), Err(std::env::VarError::NotPresent)) {
                 anyhow::bail!(
                     "{file_flag} is given and {env_name} is set in the environment: give only one"
                 );
@@ -724,6 +738,64 @@ mod secret_file_edges {
         assert_eq!(s.pageserver_jwt_token.as_deref(), Some("filetoken"));
         assert_eq!(s.safekeeper_jwt_token.as_deref(), Some("filetoken"));
         assert!(s.public_key.is_none());
+    }
+
+    /// A token variable that is set but not UTF-8 is present: beside its file flag it is a
+    /// conflict (never silently ignored), and the error doesn't echo its bytes. Without a file
+    /// it reads as unset, as before.
+    #[test]
+    fn a_non_utf8_variable_beside_its_file_is_a_conflict() {
+        use std::env::VarError;
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = camino_tempfile::tempdir().unwrap();
+        let file = dir.path().join("t.jwt");
+        std::fs::write(&file, "filetoken\n").unwrap();
+        for (file_flag, var) in [
+            ("--pageserver-jwt-token-file", "PAGESERVER_JWT_TOKEN"),
+            ("--safekeeper-jwt-token-file", "SAFEKEEPER_JWT_TOKEN"),
+            ("--control-plane-jwt-token-file", "CONTROL_PLANE_JWT_TOKEN"),
+        ] {
+            let vars = move |name: &str| {
+                if name == var {
+                    let mut raw = b"EnvNeedle".to_vec();
+                    raw.push(0xff);
+                    Err(VarError::NotUnicode(std::ffi::OsString::from_vec(raw)))
+                } else {
+                    Err(VarError::NotPresent)
+                }
+            };
+            let args = Cli::try_parse_from([
+                "storage_controller".to_string(),
+                "--listen=127.0.0.1:1234".to_string(),
+                "--database-url=postgresql://x@127.0.0.1:1/db".to_string(),
+                format!("{file_flag}={file}"),
+            ])
+            .unwrap();
+            let e = Secrets::load_with_vars(&args, &vars)
+                .err()
+                .unwrap_or_else(|| panic!("{file_flag} beside a non-UTF-8 {var} is refused"));
+            let text = format!("{e} | {e:#} | {e:?}");
+            assert!(text.contains(file_flag) && text.contains(var), "{text}");
+            assert!(
+                !text.contains("EnvNeedle") && !text.contains("filetoken"),
+                "{text}"
+            );
+
+            let args = Cli::try_parse_from([
+                "storage_controller",
+                "--listen=127.0.0.1:1234",
+                "--database-url=postgresql://x@127.0.0.1:1/db",
+            ])
+            .unwrap();
+            let s = Secrets::load_with_vars(&args, &vars).unwrap();
+            assert!(
+                s.pageserver_jwt_token.is_none()
+                    && s.safekeeper_jwt_token.is_none()
+                    && s.control_plane_jwt_token.is_none(),
+                "{var}"
+            );
+        }
     }
 
     /// The flag-and-file error names both flags and never the flag's value.
