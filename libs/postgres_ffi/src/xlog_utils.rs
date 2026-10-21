@@ -553,5 +553,40 @@ mod tests {
         assert_eq!(now_pg, round_trip_pg);
     }
 
+    /// The compute's `StartupXLOG` (v17 fork, `startedFromBasebackup`) tells a basebackup start
+    /// from a restart of its own data directory by exactly this: `DB_SHUTDOWNED` with no
+    /// checkpoint location. Postgres itself never writes that pair (a shutdown checkpoint
+    /// always has its record's LSN), whatever the control file the pageserver holds says.
+    #[test]
+    fn a_basebackup_control_file_is_shut_down_without_a_checkpoint() {
+        for (state, check_point) in [
+            (
+                super::super::bindings::DBState_DB_IN_PRODUCTION,
+                0x0000_0001_0000_0128u64,
+            ),
+            (DBState_DB_SHUTDOWNED, 0x0000_0001_0000_0028),
+            (DBState_DB_SHUTDOWNED, 0),
+        ] {
+            let control = ControlFileData {
+                state,
+                checkPoint: check_point,
+                ..Default::default()
+            };
+            let checkpoint = CheckPoint {
+                redo: 0x0000_0001_0000_0028,
+                ..Default::default()
+            };
+            let (bytes, _, _) = generate_pg_control(
+                &control.encode(),
+                &checkpoint.encode().unwrap(),
+                Lsn(0x0000_0001_0000_0028),
+            )
+            .unwrap();
+            let out = ControlFileData::decode(&bytes).unwrap();
+            assert_eq!(out.state, DBState_DB_SHUTDOWNED);
+            assert_eq!(out.checkPoint, 0);
+        }
+    }
+
     // If you need to craft WAL and write tests for this module, put it at wal_craft crate.
 }

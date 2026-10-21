@@ -46,12 +46,17 @@ export FAILED_FILE=/tmp/failed
 rm -f ${FAILED_FILE}
 mapfile -t LIST < <( (echo -e "${SKIP//","/"\n"}"; ls) | sort | uniq -u)
 # ONLY=<dir,...> restricts the run to those directories. An entry runs even if SKIP lists it;
-# an entry that is not a directory is an error and nothing runs.
+# an entry that is not a plain name (^[A-Za-z0-9._-]+$, never `.` or `..`) or not a directory
+# is an error and nothing runs.
 if [[ -n ${ONLY:-} ]]; then
   LIST=()
   IFS=',' read -r -a ONLY_LIST <<< "${ONLY}"
   for d in "${ONLY_LIST[@]}"; do
-    if [[ -z ${d} || ${d} == */* || ! -d ${d} ]]; then
+    if [[ ! ${d} =~ ^[A-Za-z0-9._-]+$ || ${d} == . || ${d} == .. ]]; then
+      echo "ONLY: '${d}' is not a plain directory name" >&2
+      exit 2
+    fi
+    if [[ ! -d ${d} ]]; then
       echo "ONLY: '${d}' is not a directory of ${extdir}" >&2
       exit 2
     fi

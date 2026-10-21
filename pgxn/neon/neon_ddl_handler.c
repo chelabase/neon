@@ -1991,6 +1991,8 @@ CheckManagedRoleStatement(Node *parseTree)
 		case T_GrantRoleStmt:
 		case T_GrantStmt:
 		case T_AlterSystemStmt:
+		case T_CommentStmt:
+		case T_SecLabelStmt:
 			break;
 		default:
 			return;
@@ -2071,7 +2073,33 @@ CheckManagedRoleStatement(Node *parseTree)
 		case T_AlterSystemStmt:
 			RefuseMarkerChange(castNode(AlterSystemStmt, parseTree)->setstmt->name);
 			break;
+		case T_CommentStmt:
+			{
+				/*
+				 * A role's comment is shown wherever the role is listed; a
+				 * CREATEROLE role (with ADMIN OPTION on PG16+) may set it.
+				 */
+				CommentStmt *stmt = castNode(CommentStmt, parseTree);
+
+				if (stmt->objtype == OBJECT_ROLE)
+					RefuseManagedRoleName(strVal(stmt->object));
+				break;
+			}
+		case T_SecLabelStmt:
+			{
+				/*
+				 * A role's security label is a provider's policy input (with
+				 * anon, it decides whether the role sees masked data).
+				 */
+				SecLabelStmt *stmt = castNode(SecLabelStmt, parseTree);
+
+				if (stmt->objtype == OBJECT_ROLE)
+					RefuseManagedRoleName(strVal(stmt->object));
+				break;
+			}
+			/* The first switch let through a statement nothing here checks. */
 		default:
+			Assert(false);
 			break;
 	}
 }

@@ -16,6 +16,11 @@ neon.iml
 /integration_tests/.neon
 compaction-suite-results.*
 docker-compose/docker-compose-parallel.yml
+# The extension harness's pageserver writes its runtime state (tenants/, deletion/, ...) into
+# this bind-mounted directory; only its two config files are tracked.
+/docker-compose/pageserver_config/*
+!/docker-compose/pageserver_config/identity.toml
+!/docker-compose/pageserver_config/pageserver.toml
 
 # Coverage
 *.profraw

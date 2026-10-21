@@ -39,24 +39,57 @@ neon_download_extension_file_http(const char *filename, bool is_library)
 	CURL	   *handle;
 	struct curl_slist *headers;
 	char	   *compute_ctl_url;
+	char	   *escaped;
+	int			url_len;
+
+	/*
+	 * alloc_curl_handle() may throw, so it comes first, before anything is
+	 * held.  From here to the cleanup nothing may throw: the handle, the
+	 * escaped name (malloc'd) and the header list are freed on every path.
+	 */
+	handle = alloc_curl_handle();
+
+	/*
+	 * The name is the session's (CREATE EXTENSION's name, LOAD's library):
+	 * percent-encode it so it stays one path segment, and "?", "#", "%", "&"
+	 * or "/" in it never become a query string, a fragment, an escape or
+	 * another path.  curl_easy_escape keeps only [A-Za-z0-9._~-] as they are,
+	 * so an ordinary name is unchanged.
+	 */
+	escaped = curl_easy_escape(handle, filename, 0);
+	if (escaped == NULL)
+	{
+		curl_easy_cleanup(handle);
+		elog(WARNING, "neon_download_extension_file_http failed: could not escape the file name");
+		return false;
+	}
 
 	/*
 	 * compute_ctl's internal server listens on loopback only, and wants the
 	 * internal API secret, read from its file before every call (a missing
 	 * or invalid file means no header, and compute_ctl refuses the call).
 	 */
-	compute_ctl_url = psprintf("http://127.0.0.1:%d/extension_server/%s%s",
-							   hadron_extension_server_port, filename, is_library ? "?is_library=true" : "");
+#define EXTENSION_SERVER_URL_FORMAT "http://127.0.0.1:%d/extension_server/%s%s"
+	url_len = snprintf(NULL, 0, EXTENSION_SERVER_URL_FORMAT,
+					   hadron_extension_server_port, escaped,
+					   is_library ? "?is_library=true" : "");
+	compute_ctl_url = url_len < 0 ? NULL :
+		palloc_extended(url_len + 1, MCXT_ALLOC_NO_OOM);
+	if (compute_ctl_url == NULL)
+	{
+		curl_free(escaped);
+		curl_easy_cleanup(handle);
+		elog(WARNING, "neon_download_extension_file_http failed: out of memory");
+		return false;
+	}
+	snprintf(compute_ctl_url, url_len + 1, EXTENSION_SERVER_URL_FORMAT,
+			 hadron_extension_server_port, escaped,
+			 is_library ? "?is_library=true" : "");
+#undef EXTENSION_SERVER_URL_FORMAT
+	curl_free(escaped);
 
-	elog(LOG, "Sending request to compute_ctl: %s", compute_ctl_url);
-
-	handle = alloc_curl_handle();
 	headers = neon_compute_ctl_auth_headers();
 
-	/*
-	 * Nothing between here and the cleanup can throw, so the handle and the
-	 * header list are freed on every path.
-	 */
 	curl_easy_setopt(handle, CURLOPT_CUSTOMREQUEST, "POST");
 	if (extension_server_request_timeout > 0)
 		curl_easy_setopt(handle, CURLOPT_TIMEOUT, (long)extension_server_request_timeout /* seconds */ );
@@ -71,6 +104,8 @@ neon_download_extension_file_http(const char *filename, bool is_library)
 		res = curl_easy_getinfo(handle, CURLINFO_RESPONSE_CODE, &http_code);
 	curl_easy_cleanup(handle);
 	curl_slist_free_all(headers);
+
+	elog(LOG, "Requested from compute_ctl: %s", compute_ctl_url);
 
 	/*
 	 * Don't error here because postgres will try to find the file and will

@@ -4,8 +4,17 @@ import json
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from fixtures.pg_version import PgVersion
+from fixtures.utils import run_only_on_postgres
 from psycopg2.errors import InsufficientPrivilege, UndefinedObject
 from werkzeug.wrappers.response import Response
+
+# K6 H4: statements and catalog functions that exist only from PG16 (GRANT ... WITH INHERIT,
+# ALTER ROLE ALL's PG16 error text) or PG15 (GRANT ... ON PARAMETER, pg_settings_get_flags).
+PG16_PLUS = run_only_on_postgres(
+    [PgVersion.V16, PgVersion.V17],
+    "uses PG16+ syntax or messages (ON PARAMETER, WITH INHERIT, pg_settings_get_flags)",
+)
 
 if TYPE_CHECKING:
     from fixtures.httpserver import ListenAddress
@@ -326,6 +335,7 @@ MARKED_ON_ITSELF = [
 ]
 
 
+@PG16_PLUS
 def test_marked_role_statements_refused_for_owner(neon_pg: VanillaPostgres):
     setup_marked(neon_pg)
     for sql in OWNER_ON_MARKED:
@@ -416,6 +426,7 @@ def test_marked_role_marker_rules(neon_pg: VanillaPostgres):
         cur.execute("ALTER ROLE CURRENT_USER PASSWORD 'pw'")
 
 
+@PG16_PLUS
 def test_marked_role_marker_changes_refused_for_non_superusers(neon_pg: VanillaPostgres):
     """
     Changing the marker is refused to every non-superuser, for any role, even
@@ -561,6 +572,7 @@ def test_marked_role_unknown_names_are_not_marked(neon_pg: VanillaPostgres):
             run_as(neon_pg, "owner", sql)
 
 
+@PG16_PLUS
 def test_marked_role_guc_is_a_superuser_string(neon_pg: VanillaPostgres):
     rows = neon_pg.safe_psql(
         "SELECT context, vartype, boot_val, reset_val FROM pg_catalog.pg_settings"
@@ -578,6 +590,7 @@ def test_marked_role_guc_is_a_superuser_string(neon_pg: VanillaPostgres):
     )
 
 
+@PG16_PLUS
 def test_marked_role_refusal_forwards_nothing(neon_pg: VanillaPostgres, patches: list[Any]):
     setup_marked(neon_pg)
     for user, statements in [("owner", OWNER_ON_MARKED), ("alice", MARKED_ON_ITSELF)]:

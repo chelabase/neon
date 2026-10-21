@@ -28,7 +28,11 @@
  * Fail closed: a missing, unreadable, empty, oversized or invalid file gives
  * no token, and the cached token is dropped. One WARNING names the path and
  * the reason (never the content) per state change; the file becoming usable
- * again is logged at LOG.
+ * again is logged at LOG. A failure is cached under the file's identity (no
+ * new open until the file changes) only when it belongs to the file: a path
+ * that isn't a regular file (refused from the stat(), never opened), a
+ * permission error, or bad content. A transient open or read error (EMFILE,
+ * ENFILE, ENOMEM, EIO...) is retried at the next call.
  *
  * A valid file holds one line of [A-Za-z0-9._~+/=-], 1-8191 bytes, with one
  * optional trailing '\n'; the whole file is at most 8 KiB. A symlink is
@@ -177,6 +181,20 @@ token_char(unsigned char c)
 		c == '/' || c == '=' || c == '-';
 }
 
+/*
+ * Whether a failed open() or read() of a file is decided for that file, so
+ * the failure is cached under its identity until the file changes: only a
+ * permission error, which a chmod or a replacement (both change st_ctim)
+ * ends.  Every other error (EMFILE, ENFILE, ENOMEM, EIO, EINTR...) is the
+ * process's or the moment's, not the file's: it is cached under no identity,
+ * so the next call reads the unchanged file again.
+ */
+static bool
+permanent_error(int err)
+{
+	return err == EACCES || err == EPERM;
+}
+
 static void
 forget_token(TokenFile *tf)
 {
@@ -269,7 +287,10 @@ token_file_read(TokenFile *tf, const char *path, const TokenFileIdentity *seen)
 	int			fd;
 	int			err;
 
-	/* O_NONBLOCK: a FIFO put in the file's place must not hang the open. */
+	/*
+	 * O_NONBLOCK: a FIFO put in the file's place between the caller's stat()
+	 * and this open must not hang the open.
+	 */
 	fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
 	if (fd < 0)
 	{
@@ -277,7 +298,8 @@ token_file_read(TokenFile *tf, const char *path, const TokenFileIdentity *seen)
 		if (err == ENOENT)
 			token_file_fail(tf, path, TF_MISSING, NULL, 0);
 		else
-			token_file_fail(tf, path, TF_OPEN_FAILED, seen, err);
+			token_file_fail(tf, path, TF_OPEN_FAILED,
+							permanent_error(err) ? seen : NULL, err);
 		return;
 	}
 
@@ -316,7 +338,8 @@ token_file_read(TokenFile *tf, const char *path, const TokenFileIdentity *seen)
 			err = errno;
 			close(fd);
 			explicit_bzero(read_buf, sizeof(read_buf));
-			token_file_fail(tf, path, TF_READ_FAILED, &id, err);
+			token_file_fail(tf, path, TF_READ_FAILED,
+							permanent_error(err) ? &id : NULL, err);
 			return;
 		}
 		if (n == 0)
@@ -408,6 +431,17 @@ token_file_get(TokenFile *tf)
 	/* The file the cached state was decided on: nothing to read. */
 	if (tf->has_ident && identity_equal(&tf->ident, &seen))
 		return tf->state == TF_VALID ? tf->value : NULL;
+
+	/*
+	 * Refused from the stat() alone, before any open(): opening a FIFO can
+	 * wake a writer blocked on it, and a device or directory is never a token
+	 * file.  The refusal is cached under this identity.
+	 */
+	if (!S_ISREG(st.st_mode))
+	{
+		token_file_fail(tf, path, TF_NOT_REGULAR, &seen, 0);
+		return NULL;
+	}
 
 	token_file_read(tf, path, &seen);
 	return tf->state == TF_VALID ? tf->value : NULL;
