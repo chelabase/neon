@@ -262,9 +262,11 @@ impl std::fmt::Debug for StorageAuthToken {
     }
 }
 
-/// Who may log in as a member role (`cb_m_*`): `allowed_cidrs` are the source
-/// addresses (`<ip>/<prefix>`; empty means any address), `client_cns` the client
-/// certificate CNs mapped to the member roles (must not be empty).
+/// Who may log in as a member role (`cb_m_*`, [`ComputeSpec::member_logins`])
+/// or as `chelabase_realtime` ([`ComputeSpec::realtime_logins`]):
+/// `allowed_cidrs` are the source addresses (`<ip>/<prefix>`; empty means any
+/// address), `client_cns` the client certificate CNs mapped to those roles
+/// (must not be empty).
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct MemberLogins {
     pub allowed_cidrs: Vec<String>,
