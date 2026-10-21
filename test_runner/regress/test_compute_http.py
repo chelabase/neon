@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import re
 import stat
 from http.client import (
@@ -264,11 +265,13 @@ def test_internal_api_listens_on_loopback_only(neon_simple_env: NeonEnv):
     endpoint = env.endpoints.create_start("main")
 
     def listening(port: int) -> set[str]:
-        return {
-            c.laddr.ip
-            for c in psutil.net_connections(kind="tcp")
-            if c.status == psutil.CONN_LISTEN and c.laddr.port == port
-        }
+        ips = set()
+        for c in psutil.net_connections(kind="tcp"):
+            # laddr is an empty tuple for a socket without a local address.
+            ip, lport = c.laddr if c.laddr else ("", 0)
+            if c.status == psutil.CONN_LISTEN and lport == port:
+                ips.add(ip)
+        return ips
 
     internal = listening(endpoint.internal_http_port)
     assert internal, "nothing listens on the internal port"
@@ -327,7 +330,7 @@ def test_internal_grants_are_narrowed(neon_simple_env: NeonEnv):
     for role in ["k3_super", "k3_marked", "k3_marked_empty", "k3_ghost", "public"]:
         _refused_with(
             FORBIDDEN,
-            lambda role=role: client.set_role_grants("postgres", role, "k3_app", ["CREATE"]),
+            functools.partial(client.set_role_grants, "postgres", role, "k3_app", ["CREATE"]),
             f"grantee {role}",
         )
     assert not has("k3_user", "k3_app", "CREATE"), "PUBLIC got nothing"
@@ -376,7 +379,7 @@ def test_internal_extensions_need_a_trusted_extension(neon_simple_env: NeonEnv):
     ]:
         _refused_with(
             FORBIDDEN,
-            lambda name=name, version=version: client.extensions(name, version, "postgres"),
+            functools.partial(client.extensions, name, version, "postgres"),
             f"{name} {version}",
         )
         assert not installed(name), name
