@@ -54,6 +54,7 @@
 #include "neon.h"
 #include "neon_perf_counters.h"
 #include "neon_walreader.h"
+#include "token_file.h"
 #include "walproposer.h"
 
 #define XLOG_HDR_SIZE (1 + 8 * 3)	/* 'w' + startPos + walEnd + timestamp */
@@ -1026,18 +1027,22 @@ libpqwp_connect_start(char *conninfo)
 	const char *keywords[3];
 	const char *values[3];
 	int			n;
-	char	   *password = neon_auth_token;
-
+	const char *password;
 
 	/*
-	 * Connect using the given connection string. If the NEON_AUTH_TOKEN
-	 * environment variable was set, use that as the password.
+	 * Connect using the given connection string, with the storage token read
+	 * from neon.storage_auth_token_file as the password. The file is looked
+	 * at (one stat()) on every connect, in --sync-safekeepers too (the path
+	 * comes from postgresql.conf), so a reconnect presents the token
+	 * compute_ctl wrote last. No usable file means no password: the
+	 * safekeeper refuses the connection.
 	 *
 	 * The connection options are parsed in the order they're given, so when
 	 * we set the password before the connection string, the connection string
-	 * can override the password from the env variable. Seems useful, although
-	 * we don't currently use that capability anywhere.
+	 * can override it. Seems useful, although we don't currently use that
+	 * capability anywhere.
 	 */
+	password = neon_storage_auth_token();
 	n = 0;
 	if (password)
 	{

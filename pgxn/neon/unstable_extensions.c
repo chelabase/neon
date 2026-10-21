@@ -66,7 +66,7 @@ CheckUnstableExtension(
 				ereport(ERROR,
 						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 						 errmsg("%s extension is in beta and may be unstable or introduce backward-incompatible changes.\nWe recommend testing it in a separate, dedicated Neon project.", stmt->extname),
-						 errhint("to proceed with installation, run SET neon.allow_unstable_extensions='true'")));
+						 errhint("A superuser can allow it with SET neon.allow_unstable_extensions = 'true'.")));
 			}
 			break;
 		}
@@ -104,13 +104,19 @@ process:
 void
 InitUnstableExtensionsSupport(void)
 {
+	/*
+	 * PGC_SUSET: an unstable extension may be trusted yet unsafe (one that
+	 * reads local files would expose compute_ctl's token files), so only a
+	 * superuser can let one in; an owner can't, in a session, per role or per
+	 * database.
+	 */
 	DefineCustomBoolVariable(
 		"neon.allow_unstable_extensions",
 		"Allow unstable extensions to be installed and used",
 		NULL,
 		&allow_unstable_extensions,
 		false,
-		PGC_USERSET,
+		PGC_SUSET,
 		0,
 		NULL, NULL, NULL);
 

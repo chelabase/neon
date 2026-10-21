@@ -39,6 +39,7 @@
 #include "neon_lwlsncache.h"
 #include "neon_perf_counters.h"
 #include "logical_replication_monitor.h"
+#include "token_file.h"
 #include "unstable_extensions.h"
 #include "walsender_hooks.h"
 #if PG_MAJORVERSION_NUM >= 16
@@ -509,6 +510,7 @@ _PG_init(void)
 	 */
 
 	/* Stage 1: Define GUCs, and other early intialization */
+	pg_init_token_files();
 	pg_init_libpagestore();
 	relsize_hash_init();
 	lfc_init();
