@@ -20,6 +20,10 @@ The route list is read from the router itself, and proven complete:
   (`make_router(...)?.build()`), so no route is added anywhere else;
 - every parsed route is then requested on the running server: a path the parser got
   wrong answers 404, not 403, and fails the test.
+
+The control-plane routes in `GLOBAL_ONLY_ROUTES` (user rulings, final fix round) refuse a
+tenant token for their own tenant too: they take the server's global scope only
+(`PageServerApi`, `SafekeeperData`).
 """
 
 from __future__ import annotations
@@ -100,6 +104,31 @@ ROUTERS: dict[str, RouterSource] = {
 }
 
 BASE_ROUTER_FILE = "libs/http-utils/src/endpoint.rs"
+
+# User ruling (fork round 4, final fix round): no tenant token reaches the pageserver's
+# control-plane routes, not even for the tenant the route names. These take the global
+# scope (`PageServerApi`) only; a tenant token gets 403 on its own tenant too.
+GLOBAL_ONLY_ROUTES: dict[str, frozenset[Route]] = {
+    "pageserver": frozenset(
+        {
+            Route("PUT", "/v1/tenant/:tenant_shard_id/shard_split"),
+            Route("POST", "/v1/tenant/:tenant_shard_id/heatmap_upload"),
+            Route("POST", "/v1/tenant/:tenant_shard_id/secondary/download"),
+            Route("GET", "/v1/tenant/:tenant_shard_id/secondary/status"),
+            Route("POST", "/v1/tenant/:tenant_shard_id/wait_lsn"),
+            Route("GET", "/v1/location_config/:tenant_shard_id"),
+            Route("GET", "/v1/tenant/:tenant_id/scan_remote_storage"),
+            Route("PUT", "/v1/tenant/:tenant_shard_id/break"),
+            Route("DELETE", "/v1/tenant/:tenant_shard_id"),
+            Route("PUT", "/v1/tenant/:tenant_shard_id/location_config"),
+            Route("PUT", "/v1/tenant/config"),
+            Route("PATCH", "/v1/tenant/config"),
+        }
+    ),
+    # User ruling (F1 audit): timeline creation is the control plane's (storcon's), with
+    # the safekeeper's global scope (`SafekeeperData`) only.
+    "safekeeper": frozenset({Route("POST", "/v1/tenant/timeline")}),
+}
 
 CHAR_LITERAL = re.compile(r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F]+\}|.)|[^\\'\n])'")
 RAW_STRING_START = re.compile(r'b?r(#*)"')
@@ -494,4 +523,57 @@ def test_every_route_refuses_metrics_and_foreign_tenant_tokens(
     assert not violations, (
         f"{server}: {len(violations)} of {probed} probes broke the route-scope invariant:\n"
         + "\n".join(violations)
+    )
+
+
+def test_global_only_routes_are_registered():
+    """
+    Every route of the global-only table is a route its server registers (a renamed or
+    removed route can't leave a stale entry that checks nothing), and none is public.
+    """
+    for server, global_only in GLOBAL_ONLY_ROUTES.items():
+        routes, public = route_table(server)
+        missing = sorted(global_only - set(routes), key=lambda r: (r.path, r.method))
+        assert not missing, f"{server}: global-only routes it doesn't register: {missing}"
+        assert not {r.path for r in global_only} & public, f"{server}: a public global route"
+
+
+@pytest.mark.parametrize("server", list(GLOBAL_ONLY_ROUTES))
+def test_global_only_routes_refuse_the_own_tenant_token(
+    neon_env_builder: NeonEnvBuilder, server: str
+):
+    """
+    The user's ruling: every global-only route answers 403 to a tenant token for the
+    very tenant it names (the body's tenant, for `/v1/tenant/config`), before its
+    handler does anything.
+    """
+    global_only = GLOBAL_ONLY_ROUTES[server]
+
+    neon_env_builder.auth_enabled = True
+    env = neon_env_builder.init_start()
+    env.pageserver.allowed_errors.extend(
+        [
+            ".*Error processing HTTP request: Forbidden.*",
+            ".*JWT scope '.+' is ineligible for Pageserver auth.*",
+        ]
+    )
+    env.storage_controller.allowed_errors.extend([".*Forbidden.*"])
+
+    tenant, timeline = env.create_tenant()
+    own = env.auth_keys.generate_tenant_token(tenant)
+
+    base = server_url(env, server)
+    # Reads first, deletions last: a route that let the token through can't hide the
+    # others' answers by removing the tenant first.
+    order = {"GET": 0, "HEAD": 0, "DELETE": 2}
+    violations: list[str] = []
+    for route in sorted(global_only, key=lambda r: (order.get(r.method, 1), r.path)):
+        url = base + fill(route.path, tenant, timeline)
+        status = probe(route.method, url, own, request_body(server, route, tenant))
+        if status != 403:
+            violations.append(f"{route.method} {route.path} with its own tenant's token: {status}")
+
+    assert not violations, (
+        f"{server}: {len(violations)} of {len(global_only)} global-only routes let a tenant "
+        "token through:\n" + "\n".join(violations)
     )

@@ -1,0 +1,2 @@
+# Version 1.0 alone is untrusted: only a superuser may run its install script.
+trusted = false

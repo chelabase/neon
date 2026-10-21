@@ -246,6 +246,9 @@ fn a_file_without_the_realtime_block_gets_it_after_the_member_block() {
 
 /// Each block is replaced between its own markers; the other block and the
 /// rest of the file are kept; N entries to 0 and back; absent → reject only.
+/// A line edited in between the blocks follows the realtime block (final fix
+/// round: nothing may sit between them, as a hand-written `trust` line there
+/// would admit `chelabase_realtime` before its reject lines).
 #[test]
 fn each_block_is_rewritten_between_its_own_markers() {
     let dir = pgdata("k4_rt_hba_replace", Some("17"));
@@ -259,12 +262,20 @@ fn each_block_is_rewritten_between_its_own_markers() {
     let r2 = logins(&["fd00::12/128"], &[RT_CN]);
     let expect = |m: Option<&MemberLogins>, r: Option<&MemberLogins>| {
         format!(
-            "{before}{}{between}{}{after}{MD5}",
+            "{before}{}{}{between}{after}{MD5}",
             member_hba_block(m, true).unwrap(),
             realtime_hba_block(r, true).unwrap()
         )
     };
-    std::fs::write(&hba, expect(Some(&m1), Some(&r1))).unwrap();
+    std::fs::write(
+        &hba,
+        format!(
+            "{before}{}{between}{}{after}{MD5}",
+            member_hba_block(Some(&m1), true).unwrap(),
+            realtime_hba_block(Some(&r1), true).unwrap()
+        ),
+    )
+    .unwrap();
 
     update_pg_hba(&dir, None, Some(&m1), Some(&r2), true).unwrap();
     assert_eq!(read(&hba), expect(Some(&m1), Some(&r2)), "realtime only");

@@ -626,7 +626,8 @@ components:
             type: string
           description: |
             What this compute_ctl can do beyond the base API (also sent in the
-            `Compute-Capabilities` header of its spec fetch). An older
+            `Compute-Capabilities` header of its spec fetch). `storage_token_refresh`
+            is listed only while the compute holds a storage token. An older
             compute_ctl sends none.
           example: ["storage_token_refresh"]
 

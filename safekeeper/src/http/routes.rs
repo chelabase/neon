@@ -76,10 +76,10 @@ enum RouteAuth {
     /// `SafekeeperData`. A path naming no tenant (or one that doesn't parse) is a
     /// management route: `SafekeeperData` only.
     Path,
-    /// The route names its tenant only in the request body, so the handler checks that
-    /// tenant once it has read the body. Before that, a token that can't pass for any
-    /// tenant (its own one, for a tenant token) is refused.
-    TenantInBody,
+    /// A control-plane route (`POST /v1/tenant/timeline`): `SafekeeperData` only,
+    /// whatever tenant the path or the body names. No tenant token passes, not even
+    /// for its own tenant.
+    Global,
 }
 
 /// Authorizes `request` for its route, before its handler reads the body or the query
@@ -102,7 +102,7 @@ fn route_permission(
 ) -> Result<(), AuthError> {
     match auth {
         RouteAuth::Path => crate::auth::check_permission(claims, route_tenant),
-        RouteAuth::TenantInBody => crate::auth::check_permission(claims, claims.tenant_id),
+        RouteAuth::Global => crate::auth::check_permission(claims, None),
     }
 }
 
@@ -116,9 +116,9 @@ where
     api_handler_with(RouteAuth::Path, request, handler).await
 }
 
-/// `api_handler` for a route that names its tenant only in the request body
-/// ([`RouteAuth::TenantInBody`]): its handler must check the body's tenant.
-async fn api_handler_tenant_in_body<R, H>(
+/// `api_handler` for a control-plane route that takes `SafekeeperData` only
+/// ([`RouteAuth::Global`]), whatever tenant it names.
+async fn api_handler_global<R, H>(
     request: Request<Body>,
     handler: H,
 ) -> Result<Response<Body>, ApiError>
@@ -126,7 +126,7 @@ where
     R: std::future::Future<Output = Result<Response<Body>, ApiError>> + Send + 'static,
     H: FnOnce(Request<Body>) -> R + Send + Sync + 'static,
 {
-    api_handler_with(RouteAuth::TenantInBody, request, handler).await
+    api_handler_with(RouteAuth::Global, request, handler).await
 }
 
 async fn api_handler_with<R, H>(
@@ -176,7 +176,8 @@ async fn timeline_create_handler(mut request: Request<Body>) -> Result<Response<
         tenant_id: request_data.tenant_id,
         timeline_id: request_data.timeline_id,
     };
-    check_permission(&request, Some(ttid.tenant_id))?;
+    // Timeline creation is the control plane's: `SafekeeperData` only.
+    check_permission(&request, None)?;
 
     let server_info = ServerInfo {
         pg_version: request_data.pg_version,
@@ -845,7 +846,7 @@ pub fn make_router(
         })
         // Will be used in the future instead of implicit timeline creation
         .post("/v1/tenant/timeline", |r| {
-            api_handler_tenant_in_body(r, timeline_create_handler)
+            api_handler_global(r, timeline_create_handler)
         })
         .get("/v1/tenant/timeline", |r| {
             api_handler(r, timeline_list_handler)
@@ -953,8 +954,9 @@ mod tests {
     }
 
     /// Invariant: the check every `api_handler` route runs first is total and allows
-    /// exactly `SafekeeperData` everywhere and a tenant token on its own tenant's routes
-    /// (or, for a tenant-in-body route, until its handler checks the body's tenant).
+    /// exactly `SafekeeperData` everywhere and a tenant token on its own tenant's routes,
+    /// except on a global-only route (`RouteAuth::Global`, the user's ruling: `POST
+    /// /v1/tenant/timeline`), which no tenant token passes, whatever tenant it names.
     #[test]
     fn route_permission_is_total_over_every_scope_route_and_tenant() {
         use std::panic::catch_unwind;
@@ -965,7 +967,7 @@ mod tests {
         let foreign = TenantId::generate();
         for scope in all_scopes() {
             for token_tenant in [None, Some(own)] {
-                for auth in [RouteAuth::Path, RouteAuth::TenantInBody] {
+                for auth in [RouteAuth::Path, RouteAuth::Global] {
                     for route in [None, Some(own), Some(foreign)] {
                         let claims = Claims::new(token_tenant, scope);
                         let case = format!(
@@ -977,7 +979,7 @@ mod tests {
                             Scope::SafekeeperData => true,
                             Scope::Tenant => match auth {
                                 RouteAuth::Path => token_tenant.is_some() && route == token_tenant,
-                                RouteAuth::TenantInBody => token_tenant.is_some(),
+                                RouteAuth::Global => false,
                             },
                             _ => false,
                         };

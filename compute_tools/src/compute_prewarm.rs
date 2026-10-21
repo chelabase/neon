@@ -40,7 +40,7 @@ impl EndpointStoragePair {
         let Some(ref token) = pspec.endpoint_storage_token else {
             bail!("pspec.endpoint_storage_token missing")
         };
-        let token = token.clone();
+        let token = token.as_str().to_owned();
         Ok(EndpointStoragePair { url, token })
     }
 }

@@ -206,31 +206,39 @@ impl AsyncAuthorizeRequest<Body> for Authorize {
 impl Authorize {
     /// Verify the token using the JSON Web Key set and return the token data.
     /// Neither the token nor its claims are logged; a key without `kid` is
-    /// named `<no kid>`.
+    /// named `<no kid>`. A refused token logs one WARN line, naming each key's
+    /// error, however many keys the set holds.
     fn verify(
         jwks: &JwkSet,
         token: &str,
         validation: &Validation,
     ) -> Result<TokenData<ComputeClaims>> {
+        let mut failures: Vec<String> = Vec::new();
         for jwk in jwks.keys.iter() {
             let kid = jwk.common.key_id.as_deref().unwrap_or("<no kid>");
             let decoding_key = match DecodingKey::from_jwk(jwk) {
                 Ok(key) => key,
                 Err(e) => {
-                    warn!("failed to construct decoding key from {kid}: {e}");
+                    failures.push(format!("{kid}: no decoding key: {e}"));
                     continue;
                 }
             };
 
             match jsonwebtoken::decode::<ComputeClaims>(token, &decoding_key, validation) {
                 Ok(data) => return Ok(data),
-                Err(e) => {
-                    warn!("failed to decode authorization token using {kid}: {e}");
-                    continue;
-                }
+                Err(e) => failures.push(format!("{kid}: {e}")),
             }
         }
 
+        if failures.is_empty() {
+            warn!("failed to verify an authorization token: the JWKS holds no key");
+        } else {
+            warn!(
+                "failed to verify an authorization token with any of {} keys: {}",
+                failures.len(),
+                failures.join("; ")
+            );
+        }
         Err(anyhow!("failed to verify authorization token"))
     }
 }

@@ -98,12 +98,16 @@ fn write_file_atomically(path: &Path, data: &[u8]) -> Result<()> {
 }
 
 /// What [`ComputeNode::reconfigure`](crate::compute::ComputeNode::reconfigure)
-/// writes before it reloads, all-or-nothing: `postgresql.conf`, the pg_hba
+/// writes before it reloads: `postgresql.conf`, the pg_hba
 /// member and realtime blocks and the pg_ident member and realtime lines
 /// (databricks settings from the spec). Every new content is computed and
 /// checked first (and with TLS on, the key and certificate are copied once,
-/// without retrying); on any failure nothing is written and the error is
-/// returned.
+/// without retrying); a failure there writes nothing. Then `postgresql.conf`
+/// is written, then `pg_ident.conf` and `pg_hba.conf` together (see
+/// `spec::write_ident_then_hba`); when either of those fails, every file is
+/// put back byte for byte (`postgresql.conf` included) and the error returned.
+/// The caller holds `ComputeNode::config_files_lock`, so no reload sees a
+/// half-written set.
 pub fn rewrite_config_files(
     pgdata_path: &Path,
     params: &ComputeNodeParams,
@@ -140,9 +144,29 @@ pub fn rewrite_config_files(
         tls::copy_tls_files(pgdata_path, tls_config)
             .context("copy the TLS key and certificate into pgdata")?;
     }
-    write_file_atomically(&pgdata_path.join("postgresql.conf"), &conf)?;
-    hba.write()?;
-    ident.write()?;
+    let conf_path = pgdata_path.join("postgresql.conf");
+    let old_conf = match std::fs::read(&conf_path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("read {}", conf_path.display())),
+    };
+    write_file_atomically(&conf_path, &conf)?;
+    // pg_ident.conf first, put back when pg_hba.conf can't be written: new hba
+    // lines never map through an old ident map. When either fails,
+    // postgresql.conf is put back too: all three files are as they were.
+    if let Err(e) = spec::write_ident_then_hba(&ident, &hba) {
+        let restored = match &old_conf {
+            Some(bytes) => write_file_atomically(&conf_path, bytes),
+            None => std::fs::remove_file(&conf_path)
+                .with_context(|| format!("remove {}", conf_path.display())),
+        };
+        if let Err(restore) = restored {
+            tracing::error!(
+                "pg_ident.conf or pg_hba.conf couldn't be written and postgresql.conf couldn't be put back: {restore:#}"
+            );
+        }
+        return Err(e);
+    }
     Ok(())
 }
 

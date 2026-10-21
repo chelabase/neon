@@ -158,8 +158,9 @@ pub struct ComputeStatusResponse {
 /// given expiring tenant storage tokens and refreshed while it runs.
 pub const STORAGE_TOKEN_REFRESH: &str = "storage_token_refresh";
 
-/// Every capability this compute_ctl advertises, in `/status` and in the
-/// [`COMPUTE_CAPABILITIES_HEADER`] of its spec fetch.
+/// Every capability this compute_ctl can advertise: always in the
+/// [`COMPUTE_CAPABILITIES_HEADER`] of its spec fetch, and in `/status` while the
+/// compute holds a storage token (one without can't refresh it, SP6).
 pub const COMPUTE_CAPABILITIES: &[&str] = &[STORAGE_TOKEN_REFRESH];
 
 /// The request header of compute_ctl's spec fetch that lists its capabilities

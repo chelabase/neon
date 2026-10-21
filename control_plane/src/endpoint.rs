@@ -818,7 +818,7 @@ impl Endpoint {
                 audit_log_level: ComputeAudit::Disabled,
                 logs_export_host: None::<String>,
                 endpoint_storage_addr: Some(args.endpoint_storage_addr),
-                endpoint_storage_token: Some(args.endpoint_storage_token),
+                endpoint_storage_token: Some(args.endpoint_storage_token.into()),
                 autoprewarm: args.autoprewarm,
                 offload_lfc_interval_seconds: args.offload_lfc_interval_seconds,
                 suspend_timeout_seconds: -1, // Only used in neon_local.
