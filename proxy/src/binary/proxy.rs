@@ -9,7 +9,6 @@ use std::time::Duration;
 use anyhow::Context;
 use anyhow::{bail, ensure};
 use arc_swap::ArcSwapOption;
-#[cfg(any(test, feature = "testing"))]
 use camino::{Utf8Path, Utf8PathBuf};
 use futures::future::Either;
 use itertools::{Itertools, Position};
