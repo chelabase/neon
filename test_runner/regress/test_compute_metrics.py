@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import enum
 import os
+import re
 import shutil
+import subprocess
 from enum import StrEnum
 from logging import debug
 from pathlib import Path
@@ -207,6 +209,43 @@ class SqlExporterRunner:
 
 SQL_EXPORTER = shutil.which("sql_exporter")
 
+# The one sql_exporter version of the repo. Keep it the same as in
+# compute/compute-node.Dockerfile and build-tools/Dockerfile (the tests below check that).
+SQL_EXPORTER_VERSION = "0.24.11"
+
+
+def test_sql_exporter_pins_agree():
+    """
+    The compute image's exporters stage, the build-tools image and this file pin the same
+    sql_exporter release, and every download URL of it uses that release.
+    """
+    build_tools = (BASE_DIR / "build-tools" / "Dockerfile").read_text(encoding="utf-8")
+    m = re.search(r"^ENV SQL_EXPORTER_VERSION=(\S+)$", build_tools, re.MULTILINE)
+    assert m is not None, "build-tools/Dockerfile has no ENV SQL_EXPORTER_VERSION"
+    assert m.group(1) == SQL_EXPORTER_VERSION
+
+    compute = (BASE_DIR / "compute" / "compute-node.Dockerfile").read_text(encoding="utf-8")
+    urls = re.findall(
+        r"burningalchemist/sql_exporter/releases/download/(\S+?)/sql_exporter-(\S+?)\.linux-",
+        compute,
+    )
+    assert urls, "compute-node.Dockerfile downloads no sql_exporter release"
+    for tag, name_version in urls:
+        assert tag == SQL_EXPORTER_VERSION
+        assert name_version == SQL_EXPORTER_VERSION
+
+
+def test_sql_exporter_binary_version():
+    """
+    The sql_exporter on PATH (the build-tools image ships one) is the pinned release. Without
+    one, the metrics tests run it in a container of the pinned tag, which is checked above.
+    """
+    if SQL_EXPORTER is None:
+        pytest.skip("no sql_exporter on PATH; the container runner uses the pinned tag")
+    out = subprocess.run([SQL_EXPORTER, "--version"], capture_output=True, text=True, check=True)
+    assert out.stdout.startswith(f"sql_exporter, version {SQL_EXPORTER_VERSION} "), out.stdout
+
+
 if SQL_EXPORTER is None:
     from testcontainers.core.container import DockerContainer
     from testcontainers.core.waiting_utils import wait_for_logs
@@ -221,7 +260,10 @@ if SQL_EXPORTER is None:
             #
             # The "host" network mode allows sql_exporter to talk to the
             # endpoint which is running on the host.
-            super().__init__("docker.io/burningalchemist/sql_exporter:0.17.3", network_mode="host")
+            super().__init__(
+                f"docker.io/burningalchemist/sql_exporter:{SQL_EXPORTER_VERSION}",
+                network_mode="host",
+            )
 
             self.__logs_dir = logs_dir
             self.__port = port
