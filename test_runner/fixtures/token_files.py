@@ -39,12 +39,11 @@ if TYPE_CHECKING:
 # pageserver restart raises it for itself (`SET`, it is `PGC_USERSET`).
 FAST_FAIL = "neon.max_reconnect_attempts=3"
 
-# What the pageserver logs when a compute presents a bad token.
+# The one line the pageserver logs when it refuses a compute's bad token (the
+# `Caused by: Unauthorized: …` follows on the next line, which isn't a log
+# record). Only tests that make the pageserver refuse a connection allow it.
 PAGESERVER_AUTH_ERRORS = [
-    ".*Unauthorized.*",
-    ".*[Aa]uthentication error.*",
-    ".*JWT.*",
-    ".*[Pp]ermission denied.*",
+    ".*error in page_service connection task: Postgres query error.*",
 ]
 
 TABLE_ROWS = 2000

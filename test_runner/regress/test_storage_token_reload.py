@@ -52,6 +52,21 @@ def _conf_load_time(endpoint: Endpoint) -> Any:
     return row[0]
 
 
+def _conf_load_time_on(cur: Any) -> Any:
+    """
+    `pg_conf_load_time()` seen by an open session, for when a new session
+    can't connect (an expired token in the file). A backend takes a pending
+    SIGHUP before its next command, so the first command after a short wait
+    processes any reload and the second reports it.
+    """
+    time.sleep(0.5)
+    cur.execute("SELECT 1")
+    cur.execute("SELECT pg_conf_load_time()")
+    row = cur.fetchone()
+    assert row is not None
+    return row[0]
+
+
 def test_configure_with_a_new_token_reaches_new_sessions(neon_env_builder: NeonEnvBuilder):
     """
     `/configure` with a new token rewrites the file, and the next new session's
@@ -101,11 +116,12 @@ def test_an_expired_token_refuses_new_sessions_only(neon_env_builder: NeonEnvBui
         open_cur.execute("SELECT count(*) FROM k5_t")
         assert open_cur.fetchone() == (TABLE_ROWS,)
 
-        loaded = _conf_load_time(endpoint)
+        loaded = _conf_load_time_on(open_cur)
         expired = expired_tenant_token(env, env.initial_tenant)
         http.storage_token(expired)
         assert endpoint.storage_auth_token_file.read_text() == expired + "\n"
-        assert _conf_load_time(endpoint) == loaded, "the refresh reloaded the configuration"
+        # Measured on the open session: a new one is refused from now on.
+        assert _conf_load_time_on(open_cur) == loaded, "the refresh reloaded the configuration"
 
         endpoint.clear_buffers(cursor=admin)
         new_session_cannot_read(endpoint, "an expired token through /storage_token")
@@ -116,11 +132,16 @@ def test_an_expired_token_refuses_new_sessions_only(neon_env_builder: NeonEnvBui
         open_cur.execute("SELECT count(*) FROM k5_t")
         assert open_cur.fetchone() == (TABLE_ROWS,)
 
-        loaded = _conf_load_time(endpoint)
+        # `clear_buffers` above reloaded (ALTER SYSTEM resets the LFC); take the
+        # baseline after it, on the open session (the expired token is still in
+        # the file, so a new session is refused).
+        loaded = _conf_load_time_on(open_cur)
         fresh = fresh_tenant_token(env, env.initial_tenant)
         http.storage_token(fresh)
-        assert _conf_load_time(endpoint) == loaded, "the refresh reloaded the configuration"
         assert new_session_reads(endpoint) == TABLE_ROWS
+        # The same session's view both times: each backend stamps a reload
+        # when it takes the SIGHUP, so sessions can differ.
+        assert _conf_load_time_on(open_cur) == loaded, "the refresh reloaded the configuration"
 
     assert http.status()["status"] == "running"
     assert_no_token_in_logs(env, endpoint, [original, expired, fresh])

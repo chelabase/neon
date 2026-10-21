@@ -162,6 +162,8 @@ def test_owner_cannot_read_the_token_files(neon_env_builder: NeonEnvBuilder):
     )
     endpoint.reconfigure()
     endpoint.safe_psql("GRANT pg_monitor TO k5_owner")
+    # PG15+: the owner can't create in `public`; a schema of its own it can.
+    endpoint.safe_psql("CREATE SCHEMA k5_owned AUTHORIZATION k5_owner")
     file_fdw = endpoint.safe_psql(
         "SELECT count(*) FROM pg_available_extensions WHERE name = 'file_fdw'"
     ) == [(1,)]
@@ -169,7 +171,7 @@ def test_owner_cannot_read_the_token_files(neon_env_builder: NeonEnvBuilder):
     with endpoint.cursor(user="k5_owner") as cur:
         cur.execute("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")
         assert cur.fetchone() == (False,)
-        cur.execute("CREATE TABLE k5_copy (line text)")
+        cur.execute("CREATE TABLE k5_owned.k5_copy (line text)")
         for path in (endpoint.storage_auth_token_file, endpoint.internal_api_token_file):
             p = str(path).replace("'", "''")
             d = str(path.parent).replace("'", "''")
@@ -178,7 +180,7 @@ def test_owner_cannot_read_the_token_files(neon_env_builder: NeonEnvBuilder):
                 f"SELECT pg_read_binary_file('{p}')",
                 f"SELECT pg_stat_file('{p}')",
                 f"SELECT pg_ls_dir('{d}')",
-                f"COPY k5_copy FROM '{p}'",
+                f"COPY k5_owned.k5_copy FROM '{p}'",
                 f"SELECT lo_import('{p}')",
             ]:
                 with pytest.raises(psycopg2.errors.InsufficientPrivilege):
