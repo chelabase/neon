@@ -11,6 +11,8 @@ import json
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from fixtures.pg_version import PgVersion
+from fixtures.utils import run_only_on_postgres
 from psycopg2.errors import DivisionByZero, DuplicateObject, InsufficientPrivilege
 from werkzeug.wrappers.response import Response
 
@@ -73,6 +75,11 @@ def refusal(pg: VanillaPostgres, user: str, sql: str) -> InsufficientPrivilege:
     pytest.fail(f"{sql!r} as {user} succeeded; the role guard must refuse it")
 
 
+@run_only_on_postgres(
+    [PgVersion.V16, PgVersion.V17],
+    "K6 H4: GRANT ... ON PARAMETER and a non-superuser's ALTER SYSTEM need PG15+, and the "
+    "ADMIN rules this relies on are PG16's",
+)
 def test_marker_changes_through_other_shapes(neon_pg: VanillaPostgres):
     """
     With SET and ALTER SYSTEM on the marker granted by mistake, a non-superuser

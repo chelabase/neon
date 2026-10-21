@@ -271,7 +271,8 @@ def replication_conn(pg: VanillaPostgres, user: str, slot: str):
 @run_only_on_postgres([PgVersion.V17], "chelabase_keys is in the v17 fork only")
 def test_role_setting_streams_in_the_walsender(vanilla_pg: VanillaPostgres):
     """W9: a database walsender applies chelabase_realtime's role setting
-    (logical_decoding_work_mem = 64kB, as RT1 sets it) and the plugin streams a
+    (logical_decoding_work_mem = 64kB here; RT1 sets 8MB the same way, as a role
+    setting) and the plugin streams a
     transaction past it, reporting each relation as "c", without spilling; a
     replication login without the setting (64MB) decodes the same transaction at its
     commit, with keys."""

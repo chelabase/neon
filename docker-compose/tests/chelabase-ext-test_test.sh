@@ -46,7 +46,15 @@
 # Interface pinned for the harness scripts:
 #   * run-tests.sh: ONLY=<dir,...> restricts the run to those directories of <extdir>; an entry
 #     in ONLY runs even if SKIP lists it; an ONLY entry that is not a directory is an error
-#     (non-zero exit, nothing run).
+#     (non-zero exit, nothing run). F3: an ONLY entry must match ^[A-Za-z0-9._-]+$ and not be
+#     `.` or `..`; otherwise run-tests.sh exits 2 before running anything, even when such a
+#     directory exists.
+#   * F3: the wrapper's cleanup runs a best-effort `docker compose ... down` of the harness's
+#     project (docker-compose/docker-compose.yml, profile test-extensions: by `-f`/`--file`, by
+#     COMPOSE_FILE, or from that directory; by `--profile` or COMPOSE_PROFILES) after the harness,
+#     pass or fail, with or without --keep-images, before any `docker rmi`; a failing down
+#     doesn't change the exit status. `--help` says, in the sentence naming
+#     chelabase-local/neon:<tag>, that the retag is removed afterwards.
 #   * docker_compose_test.sh: when ONLY is set it passes `-e ONLY=<value>` to the `/ext-src`
 #     run-tests.sh exec and does not run the `/postgres/contrib` suite; without ONLY neither
 #     changes. The SKIP of the `/ext-src` exec is exactly
@@ -94,6 +102,9 @@ build | buildx)
     if [[ "${FAKE_DOCKER_FAIL:-}" == build ]]; then exit 1; fi
     ;;
 compose)
+    # F3: where each compose call points (cwd, compose env, arguments), separated by \037.
+    printf '%s\037%s\037%s\037%s\n' "$(pwd -P)" "${COMPOSE_FILE-}" "${COMPOSE_PROFILES-}" "$*" >>"${FAKE_LOG:?}.compose"
+    if [[ "${FAKE_DOCKER_FAIL:-}" == down && " $* " == *" down "* ]]; then exit 1; fi
     if [[ "${2:-}" == logs ]]; then echo "All computes are started"; fi
     ;;
 esac
@@ -429,6 +440,113 @@ case_run_tests_only_unknown() {
     eq "nothing runs when ONLY names a missing directory" "" "$(ran)"
 }
 
+# F3 (X0 hardening): run-tests.sh takes only ONLY entries matching ^[A-Za-z0-9._-]+$, never
+# `.` or `..`, even when such a directory exists; a refused entry exits 2 before anything runs.
+# A `make` shim logs into the ran file, so a directory without neon-test.sh shows up too.
+make_shim_logs_runs() {
+    printf '#!/usr/bin/env bash\necho "make $*" >>%s\n' "$SB/ran" >"$SHIMS/make"
+    chmod +x "$SHIMS/make"
+}
+
+case_run_tests_only_refuses_odd_names() {
+    local entry
+    for entry in "." ".." "we ird-src" 'a$b-src' "semi;colon-src" "star*-src" "alpha-src,.." \
+        "..,alpha-src" "./alpha-src" "alpha-src/"; do
+        ext_dirs alpha-src "we ird-src" 'a$b-src' "semi;colon-src" "star*-src"
+        make_shim_logs_runs
+        run_tests ONLY="$entry" SKIP=
+        eq "exit status for ONLY=[$entry]" 2 "$RC"
+        eq "nothing runs for ONLY=[$entry]" "" "$(ran)"
+    done
+}
+
+case_run_tests_only_takes_plain_names() {
+    ext_dirs alpha-src a.b_c-1 Z9
+    make_shim_logs_runs
+    run_tests ONLY=a.b_c-1,Z9 SKIP=
+    eq "exit status" 0 "$RC"
+    eq "directories run" "Z9,a.b_c-1" "$(LC_ALL=C sort "$SB/ran" | paste -sd, -)"
+}
+
+# F3 (X0 hardening): the wrapper's cleanup runs a best-effort `docker compose down` of the
+# harness's project (docker-compose/docker-compose.yml with the test-extensions profile) after
+# the harness, pass or fail, with or without --keep-images, and before any `docker rmi`.
+compose_log() {
+    cat "$LOG.compose" 2>/dev/null || true
+}
+
+# down_line: the first logged compose call whose arguments include `down`.
+down_line() {
+    compose_log | awk -F'\037' '{ n = split($4, a, " "); for (i = 1; i <= n; i++) if (a[i] == "down") { print; exit } }'
+}
+
+# down_targets_harness <compose log line: cwd, COMPOSE_FILE, COMPOSE_PROFILES, args, \037-separated>
+down_targets_harness() {
+    local pwd_ file profiles args harness_dir="$CO/docker-compose"
+    IFS=$'\037' read -r pwd_ file profiles args <<<"$1"
+    local f="$harness_dir/docker-compose.yml" by_file=false by_profile=false
+    if [[ " $args " == *" -f $f "* || " $args " == *" --file $f "* || " $args " == *" --file=$f "* ||
+        "$file" == "$f" ]]; then
+        by_file=true
+    elif [[ ("$pwd_" == "$harness_dir" || " $args " == *" --project-directory $harness_dir "*) &&
+        ("$file" == "" || "$file" == "docker-compose.yml") ]]; then
+        by_file=true
+    fi
+    if [[ " $args " == *" --profile test-extensions "* || " $args " == *" --profile=test-extensions "* ||
+        ",$profiles," == *",test-extensions,"* ]]; then
+        by_profile=true
+    fi
+    $by_file || die_case "the down doesn't use docker-compose/docker-compose.yml: [$1]"
+    $by_profile || die_case "the down doesn't select the test-extensions profile: [$1]"
+}
+
+line_of() {
+    grep -nE "$1" "$LOG" | head -1 | cut -d: -f1
+}
+
+case_cleanup_compose_down() {
+    need_wrapper
+    local rc_case d h r
+    for rc_case in 0 3; do
+        sandbox "down-$rc_case"
+        FAKE_HARNESS_RC=$rc_case run_wrapper --only hll-src
+        eq "exit status" "$rc_case" "$RC"
+        d="$(down_line)"
+        [[ -n "$d" ]] || die_case "no docker compose down after a harness exiting $rc_case: $(cat "$LOG")"
+        down_targets_harness "$d"
+        h="$(line_of '^HARNESS ')"
+        local down_at
+        down_at="$(grep -nE '^docker compose .*(^| )down( |$)' "$LOG" | head -1 | cut -d: -f1)"
+        [[ -n "$down_at" ]] || die_case "the down isn't in the docker log: $(cat "$LOG")"
+        ((down_at > h)) || die_case "the down ran before the harness"
+        r="$(line_of '^docker (rmi|image rm) ')"
+        [[ -n "$r" ]] || die_case "images not removed: $(cat "$LOG")"
+        ((r > down_at)) || die_case "images removed before the containers went down"
+    done
+    sandbox "down-keep"
+    run_wrapper --keep-images kept --only hll-src
+    eq "exit status" 0 "$RC"
+    d="$(down_line)"
+    [[ -n "$d" ]] || die_case "no docker compose down with --keep-images: $(cat "$LOG")"
+    down_targets_harness "$d"
+    # A down that fails doesn't change the wrapper's exit status (best effort).
+    sandbox "down-fails"
+    FAKE_DOCKER_FAIL=down run_wrapper --only hll-src
+    eq "exit status with a failing down" 0 "$RC"
+}
+
+# F3 (X0 hardening): --help says the storage image is retagged as chelabase-local/neon:<tag>
+# and that the retag is removed afterwards (in the same sentence).
+case_help_mentions_storage_retag_removal() {
+    need_wrapper
+    sandbox "help-retag"
+    run_wrapper --help
+    eq "exit status" 0 "$RC"
+    local flat re='chelabase-local/neon:<tag>[^.]*[Rr]emov'
+    flat="$(tr '\n' ' ' <<<"$OUT")"
+    [[ "$flat" =~ $re ]] || die_case "--help doesn't say chelabase-local/neon:<tag> is removed: [$OUT]"
+}
+
 # ---------------------------------------------------------------------------------------------
 # Removals
 
@@ -436,7 +554,7 @@ case_removed_names_grep() {
     local hits
     hits="$(cd "$ROOT" && grep -rIn "mooncake\|pgrag\|pgjwt\|tiktoken\|rag_bge\|rag_jina\|onnx" . \
         --exclude-dir=vendor --exclude-dir=target --exclude-dir=.git --exclude-dir=.ci-local \
-        --exclude="$SELF" | cut -c1-110 || true)"
+        --exclude="$SELF" --exclude=FORK.md | cut -c1-110 || true)"
     [[ -z "$hits" ]] || die_case "$(wc -l <<<"$hits" | tr -d ' ') hits, in $(cut -d: -f1 <<<"$hits" | sort -u | wc -l | tr -d ' ') files; first:
 $(head -8 <<<"$hits")"
 }
@@ -789,7 +907,9 @@ for c in \
     case_extensions_minimal_build_failure case_extensions_usage_errors case_help_mentions_extensions \
     case_extension_tests_minimal_stage case_extension_tests_full_stage_unchanged \
     case_ext_src_version_scripts_exist case_ext_src_timescaledb_version case_ext_src_pg_partman_version \
-    case_ext_src_pg_cron_version case_harness_compute_config case_harness_compose_has_no_minio; do
+    case_ext_src_pg_cron_version case_harness_compute_config case_harness_compose_has_no_minio \
+    case_run_tests_only_refuses_odd_names case_run_tests_only_takes_plain_names \
+    case_cleanup_compose_down case_help_mentions_storage_retag_removal; do
     run_case "$c"
 done
 
