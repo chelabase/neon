@@ -163,6 +163,66 @@ fn the_endpoint_storage_token_is_never_printed() {
     }
 }
 
+/// F1 audit: `neon.endpoint_storage_token` as a cluster setting would land in
+/// `postgresql.conf` as a placeholder GUC every role can `SHOW`. A spec that
+/// carries it is refused (fail closed), with or without the spec field, and
+/// `ParsedSpec` never takes the token from the setting.
+#[test]
+fn an_endpoint_storage_token_setting_is_refused() {
+    for with_field in [false, true] {
+        let mut json = spec_json();
+        json["endpoint_storage_addr"] = json!("127.0.0.1:9993");
+        if with_field {
+            json["endpoint_storage_token"] = json!(ENDPOINT_STORAGE_TOKEN);
+        }
+        json["cluster"]["settings"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "name": "neon.endpoint_storage_token",
+                "value": ENDPOINT_STORAGE_TOKEN,
+                "vartype": "string",
+            }));
+        let spec: ComputeSpec = serde_json::from_value(json).unwrap();
+
+        let Err(e) = ParsedSpec::try_from(spec.clone()) else {
+            panic!(
+                "field {with_field}: a spec with the neon.endpoint_storage_token setting must be refused"
+            );
+        };
+        for text in [format!("{e}"), format!("{e:#}"), format!("{e:?}")] {
+            assert!(
+                !text.contains(ENDPOINT_STORAGE_NEEDLE),
+                "the refusal shows the token: {text}"
+            );
+        }
+        let dir = fresh(&format!("f1_ep_setting_{with_field}"));
+        let started = ComputeNode::new(
+            params(&dir.join("pgdata")),
+            ComputeConfig {
+                spec: Some(spec),
+                compute_ctl_config: ComputeCtlConfig::default(),
+            },
+        );
+        assert!(
+            started.is_err(),
+            "field {with_field}: compute_ctl starts with the setting"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // The spec field alone still works.
+    let mut json = spec_json();
+    json["endpoint_storage_token"] = json!(ENDPOINT_STORAGE_TOKEN);
+    let spec: ComputeSpec = serde_json::from_value(json).unwrap();
+    assert!(
+        ParsedSpec::try_from(spec)
+            .unwrap()
+            .endpoint_storage_token
+            .is_some()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // pg_ident.conf before pg_hba.conf (K4 audit, deferred)
 // ---------------------------------------------------------------------------
@@ -194,6 +254,39 @@ fn a_failed_ident_write_leaves_pg_hba_as_it_was() {
     );
     assert_eq!(read(&dir.join("pg_ident.conf")), ident_before);
     fs::remove_dir_all(&dir).unwrap();
+}
+
+/// F1 audit: a rewrite is all-or-nothing across the three files. When the
+/// `pg_ident.conf` or the `pg_hba.conf` write fails, `postgresql.conf` is put
+/// back too, so no reload (the TLS watcher's included) can apply a new
+/// `postgresql.conf` with the old hba and ident files.
+#[test]
+fn a_failed_ident_or_hba_write_restores_every_file() {
+    for failing in ["pg_ident", "pg_hba"] {
+        let dir = pgdata(&format!("f1_rollback_{failing}"));
+        fs::write(dir.join("postgresql.conf"), "# the running config\n").unwrap();
+        fs::write(dir.join("pg_hba.conf"), format!("{BASEBACKUP}{MD5}")).unwrap();
+        fs::write(dir.join("pg_ident.conf"), "# hand-written ident\n").unwrap();
+        let files = ["postgresql.conf", "pg_hba.conf", "pg_ident.conf"];
+        let before = files.map(|f| read(&dir.join(f)));
+        // The writers' temporary file is `<stem>.tmp.<pid>` in pgdata.
+        fs::create_dir(dir.join(format!("{failing}.tmp.{}", std::process::id()))).unwrap();
+
+        let mut spec: ComputeSpec = serde_json::from_value(spec_json()).unwrap();
+        spec.member_logins = Some(logins(&["10.213.4.10/32"], &[ORCH]));
+        spec.realtime_logins = Some(logins(&["10.213.4.12/32"], &[RT_CN]));
+        let result = rewrite_config_files(&dir, &params(&dir), &spec, None, 3082, &None, false);
+
+        assert!(result.is_err(), "{failing}.conf can't be written");
+        for (file, old) in files.iter().zip(&before) {
+            assert_eq!(
+                &read(&dir.join(file)),
+                old,
+                "{file} isn't the old one after the {failing}.conf write failed"
+            );
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }
 
 // ---------------------------------------------------------------------------

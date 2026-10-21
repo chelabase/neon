@@ -21,8 +21,9 @@ The route list is read from the router itself, and proven complete:
 - every parsed route is then requested on the running server: a path the parser got
   wrong answers 404, not 403, and fails the test.
 
-The pageserver's control-plane routes in `GLOBAL_ONLY_ROUTES` (user ruling, final fix
-round) refuse a tenant token for their own tenant too: they take `PageServerApi` only.
+The control-plane routes in `GLOBAL_ONLY_ROUTES` (user rulings, final fix round) refuse a
+tenant token for their own tenant too: they take the server's global scope only
+(`PageServerApi`, `SafekeeperData`).
 """
 
 from __future__ import annotations
@@ -124,6 +125,9 @@ GLOBAL_ONLY_ROUTES: dict[str, frozenset[Route]] = {
             Route("PATCH", "/v1/tenant/config"),
         }
     ),
+    # User ruling (F1 audit): timeline creation is the control plane's (storcon's), with
+    # the safekeeper's global scope (`SafekeeperData`) only.
+    "safekeeper": frozenset({Route("POST", "/v1/tenant/timeline")}),
 }
 
 CHAR_LITERAL = re.compile(r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F]+\}|.)|[^\\'\n])'")

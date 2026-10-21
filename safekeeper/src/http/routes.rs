@@ -953,8 +953,9 @@ mod tests {
     }
 
     /// Invariant: the check every `api_handler` route runs first is total and allows
-    /// exactly `SafekeeperData` everywhere and a tenant token on its own tenant's routes
-    /// (or, for a tenant-in-body route, until its handler checks the body's tenant).
+    /// exactly `SafekeeperData` everywhere and a tenant token on its own tenant's routes,
+    /// except on a global-only route (`RouteAuth::Global`, the user's ruling: `POST
+    /// /v1/tenant/timeline`), which no tenant token passes, whatever tenant it names.
     #[test]
     fn route_permission_is_total_over_every_scope_route_and_tenant() {
         use std::panic::catch_unwind;
@@ -965,7 +966,7 @@ mod tests {
         let foreign = TenantId::generate();
         for scope in all_scopes() {
             for token_tenant in [None, Some(own)] {
-                for auth in [RouteAuth::Path, RouteAuth::TenantInBody] {
+                for auth in [RouteAuth::Path, RouteAuth::Global] {
                     for route in [None, Some(own), Some(foreign)] {
                         let claims = Claims::new(token_tenant, scope);
                         let case = format!(
@@ -977,7 +978,7 @@ mod tests {
                             Scope::SafekeeperData => true,
                             Scope::Tenant => match auth {
                                 RouteAuth::Path => token_tenant.is_some() && route == token_tenant,
-                                RouteAuth::TenantInBody => token_tenant.is_some(),
+                                RouteAuth::Global => false,
                             },
                             _ => false,
                         };

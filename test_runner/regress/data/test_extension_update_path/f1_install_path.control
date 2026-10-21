@@ -1,0 +1,11 @@
+# A test extension whose install scripts differ in trust: 1.0's install script
+# runs under an untrusted control file (f1_install_path--1.0.control), so
+# CREATE ... VERSION '1.1' (no install script of its own: 1.0's script plus the
+# 1.0--1.1 update) must be refused although 1.1 itself is trusted. 2.0 has its
+# own trusted install script, so CREATE ... VERSION '2.1' (2.0 plus 2.0--2.1)
+# is allowed.
+comment = 'fork round 4 final fix round: an install path through an untrusted version'
+default_version = '2.0'
+relocatable = true
+superuser = true
+trusted = true

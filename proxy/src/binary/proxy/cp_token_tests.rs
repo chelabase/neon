@@ -125,3 +125,32 @@ async fn the_control_plane_backends_refuse_to_start_without_their_token_file() {
         );
     }
 }
+
+/// F1 audit: like `--redis-plain-password-file` without plain auth, the token
+/// file given to a backend that never calls the control plane (the testing
+/// `local` and `postgres` backends) is a startup error naming the flag, not
+/// silently ignored. Without the flag those backends start as before.
+#[tokio::test]
+async fn the_token_file_with_a_backend_that_ignores_it_is_an_error() {
+    let dir = camino_tempfile::tempdir().unwrap();
+    let file = dir.path().join("proxy-api.token");
+    std::fs::write(&file, format!("{CP_TOKEN}\n")).unwrap();
+    let postgres = ["--auth-endpoint", "postgresql://u:p@127.0.0.1:1/db"];
+    for (backend, extra) in [("local", &[][..]), ("postgres", &postgres[..])] {
+        let mut argv = vec!["--auth-backend", backend];
+        argv.extend_from_slice(extra);
+
+        let args = cp_args(Some(&file), &argv);
+        let Err(e) = build_auth_backend(&args) else {
+            panic!("{backend}: --{CP_FLAG} must be refused for a backend that doesn't use it");
+        };
+        assert!(format!("{e:#}").contains(CP_FLAG), "{backend}: {e:#}");
+        assert_clean(&e, &["CpTokenNeedle"]);
+
+        let args = cp_args(None, &argv);
+        assert!(
+            build_auth_backend(&args).is_ok(),
+            "{backend} without the flag"
+        );
+    }
+}
