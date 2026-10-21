@@ -81,7 +81,8 @@ def decoding_context_used(pg: VanillaPostgres, pid: int) -> int:
 
 def start_walsender(pg: VanillaPostgres, slot: str):
     """A logical-decoding server with a UTF-8 database, and chelabase_realtime's
-    walsender (logical_decoding_work_mem = 64kB as a role setting, as RT1 sets it)
+    walsender (logical_decoding_work_mem = 64kB as a role setting, the way RT1 sets
+    its 8MB)
     streaming `slot`."""
     pg.configure(["wal_level = logical", "max_replication_slots = 8", "max_wal_senders = 8"])
     pg.start()
