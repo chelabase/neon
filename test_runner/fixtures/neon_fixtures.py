@@ -5201,6 +5201,19 @@ class Endpoint(PgProtocol, LogUtils):
                 return
             cursor.execute("ALTER SYSTEM SET neon.file_cache_size_limit=0")
             cursor.execute("SELECT pg_reload_conf()")
+
+            # The LFC shrinks in the assign hook of a backend that reloads the file while
+            # it says 0. The reload is asynchronous: restoring the limit before any backend
+            # has processed it can leave the LFC full. This backend processes its pending
+            # reload at its next command, so wait until it has seen 0 (and shrunk the LFC).
+            def lfc_limit_is_zero():
+                cursor.execute(
+                    "SELECT setting FROM pg_settings WHERE name = 'neon.file_cache_size_limit'"
+                )
+                row = cursor.fetchone()
+                assert row is not None and row[0] == "0", f"LFC limit is still {row}"
+
+            wait_until(lfc_limit_is_zero)
             cursor.execute(f"ALTER SYSTEM SET neon.file_cache_size_limit='{file_cache_size_limit}'")
             cursor.execute("SELECT pg_reload_conf()")
         else:
