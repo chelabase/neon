@@ -2795,11 +2795,14 @@ mod backoff_tests {
     //! - `retry_delay_cap(n: usize) -> Duration`: cap of the delay before retry `n` (1-based),
     //!   `min(500 ms, 10 ms * 2^(n-1))`, without overflow for any `n`.
     //! - `retry_delay(n: usize, rng: &mut impl rand::Rng) -> Duration`: uniform in `[0, cap(n)]`.
-    //! - `retry_on_serialization_failure(acquire, run)`: the retry driver `with_conn` is built on.
-    //!   `acquire: impl AsyncFn() -> DatabaseResult<C>` hands out a connection, `run: impl
-    //!   AsyncFn(&mut C) -> DatabaseResult<T>` is one attempt. The connection is dropped before
-    //!   the sleep. The number of retries a call needed is observed once per call (also when 0)
-    //!   in `storage_controller_database_query_retries`.
+    //! - `retry_on_serialization_failure<T, F, Fut>(attempt: F) -> DatabaseResult<T>` with
+    //!   `F: FnMut() -> Fut`, `Fut: Future<Output = DatabaseResult<T>>`: the retry driver
+    //!   `with_conn` calls directly. Each attempt acquires its own connection and runs the
+    //!   transaction; the connection is owned by the attempt's future, so it is back in the pool
+    //!   when that future completes, before the driver sleeps. The driver retries only a
+    //!   `SerializationFailure` (whatever its source), at most `MAX_RETRIES` times, with a
+    //!   full-jitter sleep, and observes the number of retries a call needed once per call (also
+    //!   when 0) in `storage_controller_database_query_retries`.
     //! - the metric `METRICS_REGISTRY.metrics_group.storage_controller_database_query_retries`,
     //!   exported as `storage_controller_database_query_retries_{count,sum,bucket}`.
 
@@ -2973,18 +2976,18 @@ mod backoff_tests {
     async fn run_fake(failures: usize) -> (DatabaseResult<u32>, usize, Arc<Log>) {
         let log = Arc::new(Log::default());
         let attempts = std::sync::atomic::AtomicUsize::new(0);
-        let res = retry_on_serialization_failure(
-            async || Ok(FakeConn::new(&log)),
-            async |conn: &mut FakeConn| {
-                let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if attempt < failures {
-                    conn.0.push(Event::Failed(Instant::now()));
-                    Err(serialization_failure())
-                } else {
-                    Ok(42)
-                }
-            },
-        )
+        let (log_ref, attempts_ref) = (&log, &attempts);
+        let res = retry_on_serialization_failure(move || async move {
+            // The connection belongs to this future: it is dropped when the attempt ends.
+            let conn = FakeConn::new(log_ref);
+            let attempt = attempts_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt < failures {
+                conn.0.push(Event::Failed(Instant::now()));
+                Err(serialization_failure())
+            } else {
+                Ok(42)
+            }
+        })
         .await;
         let attempts = atomic_get(&attempts);
         (res, attempts, log)
@@ -3070,13 +3073,12 @@ mod backoff_tests {
         let attempts = std::sync::atomic::AtomicUsize::new(0);
         let started = Instant::now();
 
-        let res: DatabaseResult<u32> = retry_on_serialization_failure(
-            async || Ok(FakeConn::new(&log)),
-            async |_conn: &mut FakeConn| {
-                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Err(DatabaseError::Logical("nope".to_string()))
-            },
-        )
+        let (log_ref, attempts_ref) = (&log, &attempts);
+        let res: DatabaseResult<u32> = retry_on_serialization_failure(move || async move {
+            let _conn = FakeConn::new(log_ref);
+            attempts_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(DatabaseError::Logical("nope".to_string()))
+        })
         .await;
 
         assert!(matches!(res, Err(DatabaseError::Logical(_))));
@@ -3089,13 +3091,13 @@ mod backoff_tests {
         let _guard = HISTOGRAM_LOCK.lock().await;
         let acquires = std::sync::atomic::AtomicUsize::new(0);
 
-        let res: DatabaseResult<u32> = retry_on_serialization_failure(
-            async || -> DatabaseResult<()> {
-                acquires.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Err(DatabaseError::Logical("pool exhausted".to_string()))
-            },
-            async |_conn: &mut ()| Ok(1),
-        )
+        // An attempt whose connection acquisition fails returns that error; it is not a
+        // serialization failure, so it is not retried.
+        let acquires_ref = &acquires;
+        let res: DatabaseResult<u32> = retry_on_serialization_failure(move || async move {
+            acquires_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(DatabaseError::Logical("pool exhausted".to_string()))
+        })
         .await;
 
         assert!(matches!(res, Err(DatabaseError::Logical(_))));
@@ -3223,16 +3225,14 @@ mod backoff_edge_tests {
     #[tokio::test(start_paused = true)]
     async fn a_serialization_failure_followed_by_another_error_stops_there() {
         let attempts = AtomicUsize::new(0);
-        let res: DatabaseResult<u32> = retry_on_serialization_failure(
-            async || Ok(()),
-            async |_: &mut ()| {
-                if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
-                    Err(serialization_failure())
-                } else {
-                    Err(DatabaseError::Logical("boom".to_string()))
-                }
-            },
-        )
+        let attempts_ref = &attempts;
+        let res: DatabaseResult<u32> = retry_on_serialization_failure(move || async move {
+            if attempts_ref.fetch_add(1, Ordering::SeqCst) < 2 {
+                Err(serialization_failure())
+            } else {
+                Err(DatabaseError::Logical("boom".to_string()))
+            }
+        })
         .await;
         assert!(matches!(res, Err(DatabaseError::Logical(_))));
         assert_eq!(AtomicUsize::load(&attempts, Ordering::SeqCst), 3);
@@ -3242,16 +3242,15 @@ mod backoff_edge_tests {
     async fn every_attempt_acquires_a_fresh_connection() {
         let acquires = AtomicUsize::new(0);
         let attempts = AtomicUsize::new(0);
-        let res: DatabaseResult<usize> = retry_on_serialization_failure(
-            async || Ok(acquires.fetch_add(1, Ordering::SeqCst)),
-            async |conn: &mut usize| {
-                if attempts.fetch_add(1, Ordering::SeqCst) < 3 {
-                    Err(serialization_failure())
-                } else {
-                    Ok(*conn)
-                }
-            },
-        )
+        let (acquires_ref, attempts_ref) = (&acquires, &attempts);
+        let res: DatabaseResult<usize> = retry_on_serialization_failure(move || async move {
+            let conn = acquires_ref.fetch_add(1, Ordering::SeqCst);
+            if attempts_ref.fetch_add(1, Ordering::SeqCst) < 3 {
+                Err(serialization_failure())
+            } else {
+                Ok(conn)
+            }
+        })
         .await;
         assert_eq!(
             res.unwrap(),
