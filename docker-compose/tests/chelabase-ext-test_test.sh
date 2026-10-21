@@ -11,6 +11,23 @@
 #   * flags take their value as the next argument (no `--flag=value` form); a missing, empty or
 #     flag-looking value, an unknown flag or a positional argument prints "usage" to stderr and
 #     exits 2 before any docker call; --help prints usage on stdout and exits 0.
+#   * X4: `--extensions minimal|all` (default all; any other value is a usage error). The value
+#     is the compute build's and the tests build's `--build-arg EXTENSIONS=<value>`. With `all`
+#     the tests build targets `extension-tests`; with `minimal` it targets
+#     `extension-tests-minimal` (a Dockerfile stage `FROM pg-build` that copies only the
+#     `docker-compose/ext-src/{pg_cron,pg_partman,timescaledb}-src` directories, their upstream
+#     `*-src` stages, and run-tests.sh; no PostGIS or other stage). Tags, ONLY, --storage-image,
+#     --keep-images and the cleanup behave the same for both. `--help` documents the option, and so does every usage error:
+#     the usage text contains the literal `[--extensions minimal|all]` on its first line and a
+#     `  --extensions ` description line.
+#   * X4 ext-src: each of timescaledb-src, pg_partman-src and pg_cron-src has an executable
+#     neon-test.sh that fails unless `SELECT extversion FROM pg_extension WHERE extname = ...`
+#     is 2.31.0, 5.5.0 and 1.6 (pg_cron's default_version stays 1.6 through v1.6.8, so it also
+#     needs the v1.6.8-only GUC cron.match_dom_and_dow). timescaledb-src and pg_partman-src also
+#     run a smoke.sql; pg_cron-src then runs `make installcheck`.
+#   * X4 harness compute config (docker-compose/compute_wrapper/var/db/postgres/configs/config.json):
+#     shared_preload_libraries lists pg_cron and timescaledb, and pg_cron's database is set with
+#     its real name `cron.database_name` (the base has the nonexistent `cron.database`).
 #   * REPOSITORY=chelabase-local, TAG=ext-test (or the --keep-images tag), exported to the harness.
 #   * two `docker build` / `docker buildx build` calls from the checkout root (the last argument),
 #     in the form `--file X`, `--target X`, `--tag X`, `--build-arg K=V` (space-separated):
@@ -33,7 +50,7 @@
 #   * docker_compose_test.sh: when ONLY is set it passes `-e ONLY=<value>` to the `/ext-src`
 #     run-tests.sh exec and does not run the `/postgres/contrib` suite; without ONLY neither
 #     changes. The SKIP of the `/ext-src` exec is exactly
-#     pg_jsonschema-src,rdkit-src,timescaledb-src (X1/X3/X4 un-skip theirs later, P9).
+#     pg_jsonschema-src,rdkit-src (X4 un-skipped timescaledb-src; X1/X3 un-skip theirs later, P9).
 set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -347,7 +364,7 @@ case_harness_skip_list() {
     skip="$(grep -o -- '-e SKIP=[^ ]*' <<<"$l" | head -1)"
     skip="${skip#-e SKIP=}"
     got="$(tr ',' '\n' <<<"$skip" | sort | paste -sd, -)"
-    eq "SKIP list of the /ext-src suite" "pg_jsonschema-src,rdkit-src,timescaledb-src" "$got"
+    eq "SKIP list of the /ext-src suite" "pg_jsonschema-src,rdkit-src" "$got"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -458,6 +475,284 @@ case_extension_tests_stage_kept() {
 }
 
 # ---------------------------------------------------------------------------------------------
+# X4: --extensions minimal|all and the slim test image
+
+case_extensions_default_is_all() {
+    need_wrapper
+    sandbox "ext-default"
+    run_wrapper
+    eq "exit status" 0 "$RC"
+    has "compute extensions" "$(compute_build)" "--build-arg EXTENSIONS=all"
+    has "tests extensions" "$(tests_build)" "--build-arg EXTENSIONS=all"
+    has "tests target" "$(tests_build)" "--target extension-tests"
+    lacks "slim target" "$(tests_build)" "--target extension-tests-minimal"
+}
+
+case_extensions_all_explicit() {
+    need_wrapper
+    sandbox "ext-all"
+    run_wrapper --extensions all
+    eq "exit status (stderr: $ERR)" 0 "$RC"
+    eq "number of builds" 2 "$(build_lines | wc -l | tr -d ' ')"
+    has "compute extensions" "$(compute_build)" "--build-arg EXTENSIONS=all"
+    has "tests extensions" "$(tests_build)" "--build-arg EXTENSIONS=all"
+    has "tests target" "$(tests_build)" "--target extension-tests"
+    lacks "slim target" "$(tests_build)" "--target extension-tests-minimal"
+    has "tests tag" "$(tests_build)" "--tag chelabase-local/neon-test-extensions-v17:ext-test"
+}
+
+case_extensions_minimal_builds() {
+    need_wrapper
+    sandbox "ext-min"
+    run_wrapper --extensions minimal
+    eq "exit status (stderr: $ERR)" 0 "$RC"
+    local c t l
+    c="$(compute_build)"
+    t="$(tests_build)"
+    [[ -n "$c" ]] || die_case "no compute build in: $(cat "$LOG")"
+    [[ -n "$t" ]] || die_case "no tests build in: $(cat "$LOG")"
+    eq "number of builds" 2 "$(build_lines | wc -l | tr -d ' ')"
+    for l in "$c" "$t"; do
+        has "file" "$l" "--file $CO/compute/compute-node.Dockerfile"
+        has "pg version" "$l" "--build-arg PG_VERSION=v17"
+        has "extensions" "$l" "--build-arg EXTENSIONS=minimal"
+        lacks "all extensions" "$l" "--build-arg EXTENSIONS=all"
+        has "debian" "$l" "--build-arg DEBIAN_VERSION=bookworm"
+        has "build tag" "$l" "--build-arg BUILD_TAG=ext-test"
+        eq "build context (the checkout root, last argument)" "$CO" "${l##* }"
+    done
+    has "compute tag" "$c" "--tag chelabase-local/compute-node-v17:ext-test"
+    lacks "compute target" "$c" "--target extension-tests-minimal"
+    has "tests target" "$t" "--target extension-tests-minimal"
+    lacks "full tests target" "$t" "--target extension-tests"
+    has "tests tag" "$t" "--tag chelabase-local/neon-test-extensions-v17:ext-test"
+}
+
+case_extensions_minimal_harness_and_cleanup() {
+    need_wrapper
+    sandbox "ext-min2"
+    run_wrapper --extensions minimal --only pg_cron-src,timescaledb-src
+    eq "exit status" 0 "$RC"
+    local h
+    h="$(harness_line)"
+    has "pg version" "$h" "TEST_VERSION_ONLY=17"
+    has "ONLY" "$h" "ONLY=pg_cron-src,timescaledb-src"
+    has "tag" "$h" "TAG=ext-test"
+    local last
+    last="$(grep -nE '^(HARNESS|docker (buildx )?build )' "$LOG" | tail -1)"
+    [[ "$last" == *HARNESS* ]] || die_case "the harness did not run after both builds"
+    grep -E '^docker (rmi|image rm) ' "$LOG" | grep -qF "compute-node-v17:ext-test" ||
+        die_case "compute image not removed: $(cat "$LOG")"
+    grep -E '^docker (rmi|image rm) ' "$LOG" | grep -qF "neon-test-extensions-v17:ext-test" ||
+        die_case "test image not removed: $(cat "$LOG")"
+}
+
+case_extensions_minimal_with_keep_and_storage() {
+    need_wrapper
+    sandbox "ext-min3"
+    # The option may come anywhere among the flags.
+    run_wrapper --keep-images round4-min --extensions minimal --storage-image some/storage:1
+    eq "exit status (stderr: $ERR)" 0 "$RC"
+    has "compute tag" "$(compute_build)" "--tag chelabase-local/compute-node-v17:round4-min"
+    has "compute extensions" "$(compute_build)" "--build-arg EXTENSIONS=minimal"
+    has "tests tag" "$(tests_build)" "--tag chelabase-local/neon-test-extensions-v17:round4-min"
+    has "tests target" "$(tests_build)" "--target extension-tests-minimal"
+    has "tests build tag" "$(tests_build)" "--build-arg BUILD_TAG=round4-min"
+    has "harness tag" "$(harness_line)" "TAG=round4-min"
+    eq "storage tag" "docker tag some/storage:1 chelabase-local/neon:round4-min" "$(grep -E '^docker tag ' "$LOG" | head -1)"
+    ! grep -qE '^docker (rmi|image rm|image prune|system prune|builder prune)' "$LOG" ||
+        die_case "images removed despite --keep-images: $(cat "$LOG")"
+}
+
+case_extensions_minimal_build_failure() {
+    need_wrapper
+    sandbox "ext-min-fail"
+    FAKE_DOCKER_FAIL=build run_wrapper --extensions minimal
+    [[ "$RC" -ne 0 ]] || die_case "exit status 0 after a failed build"
+    ! grep -q '^HARNESS ' "$LOG" || die_case "the harness ran after a failed build"
+    grep -E '^docker (buildx )?build ' "$LOG" | grep -qF -- "EXTENSIONS=minimal" ||
+        die_case "no minimal build was attempted: $(cat "$LOG")"
+}
+
+case_extensions_usage_errors() {
+    need_wrapper
+    local args
+    for args in "--extensions" "--extensions bogus" "--extensions Minimal" "--extensions ALL" \
+        "--extensions --only a" "--extensions=minimal" "--extensions minimal,all" "--extensions mini"; do
+        sandbox "ext-usage"
+        # shellcheck disable=SC2086
+        run_wrapper $args
+        eq "exit status for [$args]" 2 "$RC"
+        [[ "$ERR" == *[Uu]sage* ]] || die_case "no usage on stderr for [$args]: [$ERR]"
+        # The usage text names the option's values (the base rejects --extensions as an unknown flag).
+        [[ "$ERR" == *"--extensions minimal|all"* ]] || die_case "usage for [$args] does not document '--extensions minimal|all': [$ERR]"
+        [[ ! -s "$LOG" ]] || die_case "docker or the harness ran for [$args]: $(cat "$LOG")"
+    done
+    sandbox "ext-usage-empty"
+    run_wrapper --extensions ""
+    eq "exit status for an empty --extensions" 2 "$RC"
+    [[ "$ERR" == *"--extensions minimal|all"* ]] || die_case "usage for an empty --extensions does not document it: [$ERR]"
+    [[ ! -s "$LOG" ]] || die_case "docker ran for an empty --extensions"
+}
+
+case_help_mentions_extensions() {
+    need_wrapper
+    sandbox "ext-help"
+    run_wrapper --help
+    eq "exit status" 0 "$RC"
+    has "usage line" "$(grep -i '^usage' <<<"$OUT" | head -1)" "[--extensions minimal|all]"
+    grep -qE '^ +--extensions ' <<<"$OUT" || die_case "no --extensions description in the help: [$OUT]"
+}
+
+# The slim stage: only the three minimal extensions' directories and sources.
+extension_tests_minimal_copies() {
+    awk '/^FROM .* AS extension-tests-minimal$/ {on=1; next} /^FROM / {on=0} on && /^COPY / {print}' "$dockerfile"
+}
+
+case_extension_tests_minimal_stage() {
+    grep -qE '^FROM pg-build AS extension-tests-minimal$' "$dockerfile" ||
+        die_case "no 'FROM pg-build AS extension-tests-minimal' stage"
+    local copies froms dirs
+    copies="$(extension_tests_minimal_copies)"
+    [[ -n "$copies" ]] || die_case "the stage has no COPY lines"
+    # COPY --from=<stage> sources, minus pg-build (the base).
+    froms="$(grep -oE -- '--from=[A-Za-z0-9_.-]+' <<<"$copies" | cut -d= -f2 | grep -vx pg-build | sort -u | paste -sd, -)"
+    eq "upstream source stages copied into extension-tests-minimal" "pg_cron-src,pg_partman-src,timescaledb-src" "$froms"
+    # COPY docker-compose/ext-src/<dir>/ ... : exactly the three directories, never the whole tree.
+    dirs="$(grep -oE 'docker-compose/ext-src/[A-Za-z0-9_.-]*/?' <<<"$copies" | sed 's|docker-compose/ext-src/||; s|/$||' | sort -u | paste -sd, -)"
+    eq "docker-compose/ext-src directories copied into extension-tests-minimal" "pg_cron-src,pg_partman-src,timescaledb-src" "$dirs"
+    ! grep -qE 'COPY docker-compose/ext-src/ ' <<<"$copies" || die_case "the stage copies the whole ext-src tree"
+    grep -qF 'docker-compose/run-tests.sh /run-tests.sh' <<<"$copies" || die_case "the stage does not copy run-tests.sh"
+    # None of the heavy stages.
+    ! grep -qE 'postgis|plv8|sfcgal|pgrouting|h3-pg|rdkit|duckdb|pg_repack' <<<"$copies" ||
+        die_case "the stage copies a heavy extension: $(grep -E 'postgis|plv8|sfcgal|pgrouting|h3-pg|rdkit|duckdb|pg_repack' <<<"$copies")"
+}
+
+case_extension_tests_full_stage_unchanged() {
+    grep -qE '^FROM pg-build AS extension-tests$' "$dockerfile" || die_case "the extension-tests stage is gone"
+    grep -qE '^COPY docker-compose/ext-src/ /ext-src/$' "$dockerfile" || die_case "extension-tests lost its ext-src COPY"
+    local full
+    full="$(awk '/^FROM .* AS extension-tests$/ {on=1; next} /^FROM / {on=0} on' "$dockerfile")"
+    grep -qF -- '--from=postgis-build' <<<"$full" || die_case "extension-tests no longer copies postgis-build"
+}
+
+# ---------------------------------------------------------------------------------------------
+# X4: the three ext-src version tests
+
+# ext_shims <dir>: PATH shims for psql, dropdb, createdb and make. `psql` logs its arguments (and
+# stdin, which is empty) and answers the version query with $FAKE_EXTVERSION and the pg_settings
+# query with $FAKE_GUC_COUNT (default 1); every other call succeeds.
+ext_shims() {
+    local d="$1"
+    mkdir -p "$d"
+    cat >"$d/psql" <<'EOF'
+#!/usr/bin/env bash
+printf 'psql %s\n' "$*" >>"${FAKE_LOG:?}"
+case "$*" in
+*extversion*) echo "${FAKE_EXTVERSION:-}" ;;
+*pg_settings*) echo "${FAKE_GUC_COUNT:-1}" ;;
+esac
+exit "${FAKE_PSQL_RC:-0}"
+EOF
+    for t in dropdb createdb make; do
+        printf '#!/usr/bin/env bash\nprintf "%s %%s\\n" "$*" >>"${FAKE_LOG:?}"\nexit 0\n' "$t" >"$d/$t"
+    done
+    chmod +x "$d"/*
+}
+
+# run_ext_test <dir> <extversion> [guc count]: runs <dir>/neon-test.sh with the shims.
+run_ext_test() {
+    local dir="$1" ver="$2" guc="${3:-1}"
+    local sb="$tmp/ext-test"
+    rm -rf "$sb"
+    mkdir -p "$sb"
+    : >"$sb/log"
+    ext_shims "$sb/shims"
+    RC=0
+    FAKE_LOG="$sb/log" FAKE_EXTVERSION="$ver" FAKE_GUC_COUNT="$guc" PATH="$sb/shims:$PATH" \
+        bash "$ROOT/docker-compose/ext-src/$dir/neon-test.sh" >"$sb/out" 2>"$sb/err" </dev/null || RC=$?
+    ERR="$(cat "$sb/err")"
+    EXT_LOG="$(cat "$sb/log")"
+}
+
+case_ext_src_version_scripts_exist() {
+    local d
+    for d in timescaledb-src pg_partman-src pg_cron-src; do
+        [[ -f "$ROOT/docker-compose/ext-src/$d/neon-test.sh" ]] || die_case "docker-compose/ext-src/$d/neon-test.sh does not exist"
+        [[ -x "$ROOT/docker-compose/ext-src/$d/neon-test.sh" ]] || die_case "$d/neon-test.sh is not executable"
+        bash -n "$ROOT/docker-compose/ext-src/$d/neon-test.sh" || die_case "$d/neon-test.sh: syntax error"
+    done
+    for d in timescaledb-src pg_partman-src; do
+        [[ -s "$ROOT/docker-compose/ext-src/$d/smoke.sql" ]] || die_case "$d/smoke.sql does not exist or is empty"
+    done
+    # The version queries are the pinned form.
+    grep -qF "SELECT extversion FROM pg_extension WHERE extname = 'timescaledb'" "$ROOT/docker-compose/ext-src/timescaledb-src/neon-test.sh" ||
+        die_case "timescaledb-src does not query extversion"
+    grep -qF "SELECT extversion FROM pg_extension WHERE extname = 'pg_partman'" "$ROOT/docker-compose/ext-src/pg_partman-src/neon-test.sh" ||
+        die_case "pg_partman-src does not query extversion"
+    grep -qF "SELECT extversion FROM pg_extension WHERE extname = 'pg_cron'" "$ROOT/docker-compose/ext-src/pg_cron-src/neon-test.sh" ||
+        die_case "pg_cron-src does not query extversion"
+}
+
+case_ext_src_timescaledb_version() {
+    [[ -f "$ROOT/docker-compose/ext-src/timescaledb-src/neon-test.sh" ]] || die_case "timescaledb-src/neon-test.sh does not exist"
+    run_ext_test timescaledb-src 2.31.0
+    eq "exit status at 2.31.0 (stderr: $ERR)" 0 "$RC"
+    grep -q 'smoke.sql' <<<"$EXT_LOG" || die_case "the smoke test did not run: $EXT_LOG"
+    for v in 2.17.1 2.30.2 2.31.1 "" 2.31; do
+        run_ext_test timescaledb-src "$v"
+        [[ "$RC" -ne 0 ]] || die_case "timescaledb-src passed with extversion [$v]"
+        ! grep -q 'smoke.sql' <<<"$EXT_LOG" || die_case "the smoke test ran after a wrong version [$v]"
+    done
+}
+
+case_ext_src_pg_partman_version() {
+    [[ -f "$ROOT/docker-compose/ext-src/pg_partman-src/neon-test.sh" ]] || die_case "pg_partman-src/neon-test.sh does not exist"
+    run_ext_test pg_partman-src 5.5.0
+    eq "exit status at 5.5.0 (stderr: $ERR)" 0 "$RC"
+    grep -q 'smoke.sql' <<<"$EXT_LOG" || die_case "the smoke test did not run: $EXT_LOG"
+    for v in 5.1.0 5.4.0 5.5.1 "" 5.5; do
+        run_ext_test pg_partman-src "$v"
+        [[ "$RC" -ne 0 ]] || die_case "pg_partman-src passed with extversion [$v]"
+        ! grep -q 'smoke.sql' <<<"$EXT_LOG" || die_case "the smoke test ran after a wrong version [$v]"
+    done
+}
+
+case_ext_src_pg_cron_version() {
+    [[ -f "$ROOT/docker-compose/ext-src/pg_cron-src/neon-test.sh" ]] || die_case "pg_cron-src/neon-test.sh does not exist"
+    run_ext_test pg_cron-src 1.6 1
+    eq "exit status at 1.6 with the v1.6.8 GUC (stderr: $ERR)" 0 "$RC"
+    grep -q '^make .*installcheck' <<<"$EXT_LOG" || die_case "make installcheck did not run: $EXT_LOG"
+    # v1.6.4 also reports 1.6: the missing cron.match_dom_and_dow is what fails.
+    run_ext_test pg_cron-src 1.6 0
+    [[ "$RC" -ne 0 ]] || die_case "pg_cron-src passed without cron.match_dom_and_dow"
+    ! grep -q '^make ' <<<"$EXT_LOG" || die_case "installcheck ran after a failed GUC check"
+    for v in 1.5 1.7 1.6.8 ""; do
+        run_ext_test pg_cron-src "$v" 1
+        [[ "$RC" -ne 0 ]] || die_case "pg_cron-src passed with extversion [$v]"
+    done
+}
+
+# ---------------------------------------------------------------------------------------------
+# X4: the harness compute's configuration
+
+harness_config="$ROOT/docker-compose/compute_wrapper/var/db/postgres/configs/config.json"
+
+case_harness_compute_config() {
+    local spl
+    spl="$(grep -A1 '"name": "shared_preload_libraries"' "$harness_config" | grep '"value"')"
+    [[ -n "$spl" ]] || die_case "no shared_preload_libraries setting in $harness_config"
+    has "shared_preload_libraries has pg_cron" "$(tr ',"' '  ' <<<"$spl")" "pg_cron"
+    has "shared_preload_libraries has timescaledb" "$(tr ',"' '  ' <<<"$spl")" "timescaledb"
+    grep -qF '"name": "cron.database_name"' "$harness_config" ||
+        die_case "pg_cron's database is not set through cron.database_name"
+    ! grep -qE '"name": "cron\.database"' "$harness_config" ||
+        die_case "the nonexistent setting cron.database is still there"
+    # pg_partman's background worker stays off this round (spec 17.4): not preloaded.
+    ! grep -q 'pg_partman_bgw' "$harness_config" || die_case "pg_partman_bgw must not be preloaded in this round"
+}
+
+# ---------------------------------------------------------------------------------------------
 
 run_case() {
     local name="$1" out
@@ -479,7 +774,13 @@ for c in \
     case_run_tests_only_one case_run_tests_only_two case_run_tests_no_only \
     case_run_tests_only_beats_skip case_run_tests_only_unknown \
     case_removed_names_grep case_removed_paths case_old_pgx_ulid_gone_pgrx12_kept \
-    case_extensions_minimal_stage case_extension_tests_stage_kept; do
+    case_extensions_minimal_stage case_extension_tests_stage_kept \
+    case_extensions_default_is_all case_extensions_all_explicit case_extensions_minimal_builds \
+    case_extensions_minimal_harness_and_cleanup case_extensions_minimal_with_keep_and_storage \
+    case_extensions_minimal_build_failure case_extensions_usage_errors case_help_mentions_extensions \
+    case_extension_tests_minimal_stage case_extension_tests_full_stage_unchanged \
+    case_ext_src_version_scripts_exist case_ext_src_timescaledb_version case_ext_src_pg_partman_version \
+    case_ext_src_pg_cron_version case_harness_compute_config; do
     run_case "$c"
 done
 
