@@ -12,7 +12,12 @@ def test_role_grants(neon_simple_env: NeonEnv):
     endpoint = env.endpoints.create_start("test_role_grants")
 
     endpoint.safe_psql("CREATE DATABASE test_role_grants")
-    endpoint.safe_psql("CREATE SCHEMA IF NOT EXISTS test_schema", dbname="test_role_grants")
+    # /grants works only on a schema a non-superuser owns (RT4-6), as an owner's are.
+    endpoint.safe_psql("CREATE ROLE test_schema_owner", dbname="test_role_grants")
+    endpoint.safe_psql(
+        "CREATE SCHEMA IF NOT EXISTS test_schema AUTHORIZATION test_schema_owner",
+        dbname="test_role_grants",
+    )
     endpoint.safe_psql("CREATE ROLE test_role WITH LOGIN", dbname="test_role_grants")
 
     # confirm we do not yet have access
