@@ -90,6 +90,19 @@ static bool RegressTestMode = false;
 static bool BornClosed = false;
 
 #define BORN_CLOSED_GUC "neon.born_closed"
+
+/*
+ * chelabase.managed_role: a marker only (no runtime effect). A superuser (the
+ * worker, for a personal login) sets it as a role-wide setting
+ * (pg_db_role_setting, setdatabase = 0, setrole = the role), whatever its
+ * value; CheckManagedRoleStatement then treats the role as managed by
+ * Chelabase. PGC_SUSET, and the guard refuses every non-superuser change of
+ * it (even with a SET privilege granted by mistake), so only a superuser
+ * marks or unmarks a role.
+ */
+static char *ManagedRoleMarker = NULL;
+
+#define MANAGED_ROLE_GUC "chelabase.managed_role"
 /* The protected-branch schema guard's event trigger (see SessionDatabaseGuarded) */
 #define SCHEMA_GUARD_TRIGGER "chelabase_schema_guard_ddl"
 
@@ -1773,9 +1786,82 @@ ProcessCreateEventTrigger(
 
 
 /*
+ * Does the pg_db_role_setting row (dboid, roleid) hold an entry for which
+ * match returns true? (No row, or a NULL setconfig: no.)
+ */
+static bool
+DbRoleSettingHasEntry(Oid dboid, Oid roleid, bool (*match) (const char *entry))
+{
+	Relation	rel;
+	ScanKeyData keys[2];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	bool		found = false;
+
+	rel = table_open(DbRoleSettingRelationId, AccessShareLock);
+	ScanKeyInit(&keys[0], Anum_pg_db_role_setting_setdatabase,
+				BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(dboid));
+	ScanKeyInit(&keys[1], Anum_pg_db_role_setting_setrole,
+				BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(roleid));
+	scan = systable_beginscan(rel, DbRoleSettingDatidRolidIndexId, true, NULL, 2, keys);
+	tuple = systable_getnext(scan);
+	if (HeapTupleIsValid(tuple))
+	{
+		bool		isnull;
+		Datum		config = heap_getattr(tuple, Anum_pg_db_role_setting_setconfig,
+										  RelationGetDescr(rel), &isnull);
+
+		if (!isnull)
+		{
+			ArrayType  *array = DatumGetArrayTypeP(config);
+			Datum	   *elems;
+			bool	   *nulls;
+			int			count;
+
+			deconstruct_array(array, TEXTOID, -1, false, TYPALIGN_INT,
+							  &elems, &nulls, &count);
+			for (int i = 0; i < count && !found; i++)
+			{
+				char	   *entry;
+
+				if (nulls[i])
+					continue;
+				entry = TextDatumGetCString(elems[i]);
+				found = match(entry);
+				pfree(entry);
+			}
+		}
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	return found;
+}
+
+/*
+ * The one marker predicate (SP22), the same as compute_ctl's /grants refusal
+ * and Chelabase's is_marked_sql: an entry starting "chelabase.managed_role=",
+ * exactly (case-sensitive: with the extension loaded, Postgres stores the
+ * GUC's own spelling), whatever its value.
+ */
+static bool
+IsManagedRoleMarkerEntry(const char *entry)
+{
+	return strncmp(entry, MANAGED_ROLE_GUC "=", strlen(MANAGED_ROLE_GUC "=")) == 0;
+}
+
+/* Is the role marked: its role-wide row (setdatabase = 0) holds the marker? */
+static bool
+RoleMarkedManaged(Oid roleid)
+{
+	return DbRoleSettingHasEntry(InvalidOid, roleid, IsManagedRoleMarkerEntry);
+}
+
+/*
  * Member roles (cb_m_*, in any case) and chelabase_realtime are managed by
  * Chelabase as a superuser: no other role may create, alter, rename, drop,
- * grant or revoke them, or change their settings or memberships.
+ * grant or revoke them, or change their settings or memberships. This checks
+ * the name only; a role marked with chelabase.managed_role (a personal
+ * login), whatever its name, is caught by RefuseManagedRoleName's lookup.
  */
 static bool
 IsChelabaseManagedRole(const char *name)
@@ -1785,13 +1871,46 @@ IsChelabaseManagedRole(const char *name)
 		 strcmp(name, "chelabase_realtime") == 0);
 }
 
+/* A name a statement gives a role (CREATE ROLE, RENAME TO): by name only */
 static void
-RefuseManagedRoleName(const char *name)
+RefuseManagedRoleNewName(const char *name)
 {
 	if (IsChelabaseManagedRole(name))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("member role \"%s\" is managed by Chelabase", name)));
+}
+
+/*
+ * A role a statement acts on: by name, then, for a role that exists, by its
+ * marker. A missing role is left to Postgres's own error.
+ */
+static void
+RefuseManagedRoleName(const char *name)
+{
+	Oid			roleid;
+
+	if (name == NULL)
+		return;
+	RefuseManagedRoleNewName(name);
+	roleid = get_role_oid(name, true);
+	if (OidIsValid(roleid) && RoleMarkedManaged(roleid))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("role \"%s\" is managed by Chelabase", name)));
+}
+
+/*
+ * The marker itself: only a superuser sets, resets or grants it, for any
+ * role. GUC names match case-insensitively, as Postgres matches them.
+ */
+static void
+RefuseMarkerChange(const char *parameter)
+{
+	if (parameter != NULL && pg_strcasecmp(parameter, MANAGED_ROLE_GUC) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to change parameter \"%s\"", MANAGED_ROLE_GUC)));
 }
 
 /* The role a RoleSpec names, whatever its kind; NULL for PUBLIC (no role) */
@@ -1847,13 +1966,35 @@ RefuseManagedRoleOptions(List *options)
 }
 
 /*
- * Refuses a role statement that names a Chelabase-managed role unless the
- * current user is a superuser. Runs for nested statements too (DO blocks,
- * functions, any SPI caller), since they go through ProcessUtility_hook.
+ * Refuses a role statement that names a Chelabase-managed role, and any
+ * change of the chelabase.managed_role marker, unless the current user is a
+ * superuser. Runs for nested statements too (DO blocks, functions, any SPI
+ * caller), since they go through ProcessUtility_hook; it keys on the current
+ * user, so SECURITY DEFINER functions and SET ROLE are covered.
  */
 static void
 CheckManagedRoleStatement(Node *parseTree)
 {
+	/*
+	 * Other statements need no check, and get no catalog lookup: superuser()
+	 * may have to read pg_authid, which a ROLLBACK in an aborted transaction
+	 * can't. Keep this list in step with the switch below: a case missing
+	 * here is never checked.
+	 */
+	switch (nodeTag(parseTree))
+	{
+		case T_CreateRoleStmt:
+		case T_AlterRoleStmt:
+		case T_AlterRoleSetStmt:
+		case T_RenameStmt:
+		case T_DropRoleStmt:
+		case T_GrantRoleStmt:
+		case T_GrantStmt:
+		case T_AlterSystemStmt:
+			break;
+		default:
+			return;
+	}
 	if (superuser())
 		return;
 	switch (nodeTag(parseTree))
@@ -1862,7 +2003,7 @@ CheckManagedRoleStatement(Node *parseTree)
 			{
 				CreateRoleStmt *stmt = castNode(CreateRoleStmt, parseTree);
 
-				RefuseManagedRoleName(stmt->role);
+				RefuseManagedRoleNewName(stmt->role);
 				RefuseManagedRoleOptions(stmt->options);
 				break;
 			}
@@ -1875,9 +2016,21 @@ CheckManagedRoleStatement(Node *parseTree)
 				break;
 			}
 		case T_AlterRoleSetStmt:
-			/* role is NULL for ALTER ROLE ALL, which needs a superuser */
-			RefuseManagedRoleSpec(castNode(AlterRoleSetStmt, parseTree)->role);
-			break;
+			{
+				AlterRoleSetStmt *stmt = castNode(AlterRoleSetStmt, parseTree);
+
+				/* name is NULL for RESET ALL */
+				RefuseMarkerChange(stmt->setstmt->name);
+
+				/*
+				 * role is NULL for ALTER ROLE ALL. Without IN DATABASE it
+				 * needs a superuser; with it, the database's ownership, and
+				 * it writes a database-wide row (setrole = 0), which marks no
+				 * role and touches no role's settings.
+				 */
+				RefuseManagedRoleSpec(stmt->role);
+				break;
+			}
 		case T_RenameStmt:
 			{
 				RenameStmt *stmt = castNode(RenameStmt, parseTree);
@@ -1885,7 +2038,7 @@ CheckManagedRoleStatement(Node *parseTree)
 				if (stmt->renameType == OBJECT_ROLE)
 				{
 					RefuseManagedRoleName(stmt->subname);
-					RefuseManagedRoleName(stmt->newname);
+					RefuseManagedRoleNewName(stmt->newname);
 				}
 				break;
 			}
@@ -1902,6 +2055,22 @@ CheckManagedRoleStatement(Node *parseTree)
 					RefuseManagedRoleName(((AccessPriv *) lfirst(item))->priv_name);
 				break;
 			}
+		case T_GrantStmt:
+#if PG_MAJORVERSION_NUM >= 15
+			{
+				/* GRANT/REVOKE SET, ALTER SYSTEM or ALL ON PARAMETER */
+				GrantStmt  *stmt = castNode(GrantStmt, parseTree);
+				ListCell   *item;
+
+				if (stmt->objtype == OBJECT_PARAMETER_ACL)
+					foreach(item, stmt->objects)
+						RefuseMarkerChange(strVal(lfirst(item)));
+			}
+#endif
+			break;
+		case T_AlterSystemStmt:
+			RefuseMarkerChange(castNode(AlterSystemStmt, parseTree)->setstmt->name);
+			break;
 		default:
 			break;
 	}
@@ -1961,56 +2130,22 @@ BranchProtected(void)
 	return BranchProtectedFlag || SessionDatabaseGuarded();
 }
 
+/* A neon.born_closed entry whose value is true */
+static bool
+IsBornClosedEntry(const char *entry)
+{
+	const size_t prefix_len = strlen(BORN_CLOSED_GUC "=");
+	bool		value;
+
+	return pg_strncasecmp(entry, BORN_CLOSED_GUC "=", prefix_len) == 0 &&
+		parse_bool(entry + prefix_len, &value) && value;
+}
+
 /* Does the database carry neon.born_closed = on (its setrole = 0 setting)? */
 static bool
 DatabaseBornClosed(Oid dboid)
 {
-	Relation	rel;
-	ScanKeyData keys[2];
-	SysScanDesc scan;
-	HeapTuple	tuple;
-	bool		marked = false;
-	const size_t prefix_len = strlen(BORN_CLOSED_GUC "=");
-
-	rel = table_open(DbRoleSettingRelationId, AccessShareLock);
-	ScanKeyInit(&keys[0], Anum_pg_db_role_setting_setdatabase,
-				BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(dboid));
-	ScanKeyInit(&keys[1], Anum_pg_db_role_setting_setrole,
-				BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(InvalidOid));
-	scan = systable_beginscan(rel, DbRoleSettingDatidRolidIndexId, true, NULL, 2, keys);
-	tuple = systable_getnext(scan);
-	if (HeapTupleIsValid(tuple))
-	{
-		bool		isnull;
-		Datum		config = heap_getattr(tuple, Anum_pg_db_role_setting_setconfig,
-										  RelationGetDescr(rel), &isnull);
-
-		if (!isnull)
-		{
-			ArrayType  *array = DatumGetArrayTypeP(config);
-			Datum	   *elems;
-			bool	   *nulls;
-			int			count;
-
-			deconstruct_array(array, TEXTOID, -1, false, TYPALIGN_INT,
-							  &elems, &nulls, &count);
-			for (int i = 0; i < count && !marked; i++)
-			{
-				char	   *item;
-				bool		value;
-
-				if (nulls[i])
-					continue;
-				item = TextDatumGetCString(elems[i]);
-				marked = pg_strncasecmp(item, BORN_CLOSED_GUC "=", prefix_len) == 0 &&
-					parse_bool(item + prefix_len, &value) && value;
-				pfree(item);
-			}
-		}
-	}
-	systable_endscan(scan);
-	table_close(rel, AccessShareLock);
-	return marked;
+	return DbRoleSettingHasEntry(dboid, InvalidOid, IsBornClosedEntry);
 }
 
 static void
@@ -2444,6 +2579,18 @@ InitDDLHandler()
 							 NULL,
 							 NULL,
 							 NULL);
+
+	DefineCustomStringVariable(
+							   MANAGED_ROLE_GUC,
+							   "Marks a role managed by Chelabase (set as a role-wide setting by a superuser only)",
+							   NULL,
+							   &ManagedRoleMarker,
+							   "",
+							   PGC_SUSET,
+							   GUC_NOT_IN_SAMPLE,
+							   NULL,
+							   NULL,
+							   NULL);
 
 	DefineCustomBoolVariable(
 							 "neon.regress_test_mode",
