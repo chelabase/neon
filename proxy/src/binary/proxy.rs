@@ -1030,6 +1030,9 @@ async fn configure_redis(
 mod secret_tests;
 
 #[cfg(test)]
+mod cp_token_tests;
+
+#[cfg(test)]
 mod tests {
     use std::time::Duration;
 

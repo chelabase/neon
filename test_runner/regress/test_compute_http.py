@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import re
+import shutil
 import stat
 import time
 from http.client import (
@@ -19,13 +20,16 @@ import psutil
 import pytest
 import requests
 from fixtures.endpoint.http import COMPUTE_AUDIENCE, ComputeClaimsScope, EndpointHttpClient
+from fixtures.paths import BASE_DIR
 from fixtures.utils import run_only_on_default_postgres
 from requests import HTTPError, RequestException
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
 
-    from fixtures.neon_fixtures import Endpoint, NeonEnv
+    from fixtures.neon_fixtures import Endpoint, NeonEnv, NeonEnvBuilder
+    from fixtures.pg_version import PgVersion
 
 
 @run_only_on_default_postgres("The code path being tested is not dependent on Postgres version")
@@ -387,6 +391,71 @@ def test_internal_extensions_need_a_trusted_extension(neon_simple_env: NeonEnv):
 
     client.extensions("pg_trgm", available("pg_trgm"), "postgres")
     assert installed("pg_trgm"), "a trusted extension installs"
+
+
+UPDATE_PATH_EXTENSION = "f1_update_path"
+
+
+@pytest.fixture(scope="function")
+def neon_env_builder_update_path(
+    neon_env_builder_local: NeonEnvBuilder,
+    test_output_dir: Path,
+    pg_version: PgVersion,
+) -> NeonEnvBuilder:
+    """A local pg_install with the `f1_update_path` test extension in it."""
+    extension_dir = (
+        test_output_dir / "pg_install" / f"v{pg_version}" / "share" / "postgresql" / "extension"
+    )
+    source = BASE_DIR / "test_runner" / "regress" / "data" / "test_extension_update_path"
+    for f in sorted(source.iterdir()):
+        shutil.copy(f, extension_dir)
+    return neon_env_builder_local
+
+
+@run_only_on_default_postgres("compute_ctl's HTTP server doesn't depend on the Postgres version")
+def test_internal_extensions_check_every_version_on_the_update_path(
+    neon_env_builder_update_path: NeonEnvBuilder,
+):
+    """
+    RT4-6, final fix round: `ALTER EXTENSION ... UPDATE` runs the script of every version
+    on its update path, each under that version's control file, so `/extensions`
+    updates only when every version on the path is trusted, not just the target.
+    """
+    env = neon_env_builder_update_path.init_start()
+    endpoint = env.endpoints.create_start("main")
+    client = endpoint.http_client()
+    ext = UPDATE_PATH_EXTENSION
+
+    # The fixture: 1.1 alone is untrusted, and 1.0 -> 1.2 goes through it.
+    rows = endpoint.safe_psql(
+        f"SELECT version, trusted FROM pg_available_extension_versions WHERE name = '{ext}'"
+    )
+    assert dict(rows) == {"1.0": True, "1.1": False, "1.2": True, "1.3": True}, rows
+    paths = endpoint.safe_psql(
+        f"SELECT target, path FROM pg_extension_update_paths('{ext}') WHERE source = '1.0'"
+    )
+    assert dict(paths)["1.2"] == "1.0--1.1--1.2", paths
+    assert dict(paths)["1.3"] == "1.0--1.3", paths
+
+    def installed() -> str | None:
+        rows = endpoint.safe_psql(f"SELECT extversion FROM pg_extension WHERE extname = '{ext}'")
+        return str(rows[0][0]) if rows else None
+
+    client.extensions(ext, "1.0", "postgres")
+    assert installed() == "1.0"
+
+    _refused_with(
+        FORBIDDEN,
+        lambda: client.extensions(ext, "1.2", "postgres"),
+        "1.0 -> 1.2 through the untrusted 1.1",
+    )
+    assert installed() == "1.0", "a refused update changes nothing"
+    _refused_with(FORBIDDEN, lambda: client.extensions(ext, "1.1", "postgres"), "untrusted 1.1")
+    assert installed() == "1.0"
+
+    # A path whose every version is trusted still updates.
+    client.extensions(ext, "1.3", "postgres")
+    assert installed() == "1.3"
 
 
 @run_only_on_default_postgres("compute_ctl's HTTP server doesn't depend on the Postgres version")

@@ -516,6 +516,31 @@ while read -r bin_name bin_src; do
 done <<<"$bins_listing"
 expect "every bin target installs the crypto provider first in main (offenders listed)" "" "$no_provider"
 
+# Fork round 4, final fix round (F1): the image builds compile the proxy with its default
+# features, but every other step builds with `--features testing`, which hid a default-feature
+# compile error (K8 audit). Pinned: lint_proxy_default_features runs
+# `cargo check --locked -p proxy` without any feature flag, and the lint step runs it.
+if declare -F lint_proxy_default_features >/dev/null; then
+    echo "ok: lint_proxy_default_features is defined"
+else
+    echo "FAIL: lint_proxy_default_features is not defined in ci-local.sh"
+    failures=$((failures + 1))
+fi
+pdf="$(declare -f lint_proxy_default_features 2>/dev/null)"
+if [[ "$pdf" == *"cargo check"* && "$pdf" == *"--locked"* && "$pdf" == *"-p proxy"* &&
+    "$pdf" != *"--features"* && "$pdf" != *"--all-features"* && "$pdf" != *CARGO_FLAGS* ]]; then
+    echo "ok: lint_proxy_default_features checks the proxy with its default features"
+else
+    echo "FAIL: lint_proxy_default_features must run 'cargo check --locked -p proxy' with no feature flags, got [$pdf]"
+    failures=$((failures + 1))
+fi
+if [[ "$(declare -f step_lint)" == *lint_proxy_default_features* ]]; then
+    echo "ok: the lint step runs lint_proxy_default_features"
+else
+    echo "FAIL: step_lint must run lint_proxy_default_features"
+    failures=$((failures + 1))
+fi
+
 if ((failures > 0)); then
     echo "$failures check(s) failed"
     exit 1

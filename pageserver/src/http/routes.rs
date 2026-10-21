@@ -4418,15 +4418,17 @@ mod route_auth_tests {
     }
 
     /// Invariant: the check every `api_handler` route runs first is total and allows
-    /// exactly `PageServerApi` everywhere and a tenant token on its own tenant's routes
-    /// (or, for a tenant-in-body route, until its handler checks the body's tenant).
+    /// exactly `PageServerApi` everywhere and a tenant token on its own tenant's routes,
+    /// except on a global-only route (`RouteAuth::Global`, the user's ruling: the
+    /// control-plane routes and the tenant config routes), which no tenant token passes,
+    /// whatever tenant the route names.
     #[test]
     fn route_permission_is_total_over_every_scope_route_and_tenant() {
         let own = TenantId::generate();
         let foreign = TenantId::generate();
         for scope in all_scopes() {
             for token_tenant in [None, Some(own)] {
-                for auth in [RouteAuth::Path, RouteAuth::TenantInBody] {
+                for auth in [RouteAuth::Path, RouteAuth::Global] {
                     for route in [None, Some(own), Some(foreign)] {
                         let claims = Claims::new(token_tenant, scope);
                         let case = format!(
@@ -4438,7 +4440,7 @@ mod route_auth_tests {
                             Scope::PageServerApi => true,
                             Scope::Tenant => match auth {
                                 RouteAuth::Path => token_tenant.is_some() && route == token_tenant,
-                                RouteAuth::TenantInBody => token_tenant.is_some(),
+                                RouteAuth::Global => false,
                             },
                             _ => false,
                         };

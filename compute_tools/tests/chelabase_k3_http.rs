@@ -17,7 +17,8 @@
 //!   `[127.0.0.1:<port>, [::1]:<port>]` (`::1` best effort when binding), external
 //!   `[[::]:<port>]` (unchanged).
 //! - `ParsedSpec.storage_auth_token: Option<StorageAuthToken>` (`as_str()`).
-//! - `ComputeStatusResponse.capabilities` = `["storage_token_refresh"]`.
+//! - `ComputeStatusResponse.capabilities` = `["storage_token_refresh"]` when the
+//!   compute holds a storage token, `[]` otherwise (SP6, final fix round).
 //! - `POST /storage_token` on the external router, body `{"token": …}`, this
 //!   compute's control token or an admin token: `204` (file written, then the
 //!   token in `state.pspec` and `pspec.spec` replaced; status unchanged) in
@@ -518,33 +519,43 @@ fn the_internal_server_listens_on_loopback_only() {
 // The capability (RT4-2)
 // ---------------------------------------------------------------------------
 
+/// SP6 (final fix round): `/status` advertises `storage_token_refresh` only when
+/// the compute holds a storage token. One started without (or with no spec yet)
+/// answers `POST /storage_token` with 400, so advertising the capability would
+/// make the control plane hand it expiring tokens it can never refresh.
 #[tokio::test]
 async fn status_advertises_the_storage_token_refresh() {
     let from_state = ComputeStatusResponse::from(&ComputeState::new());
     assert_eq!(
         from_state.capabilities,
-        vec!["storage_token_refresh".to_string()]
+        Vec::<String>::new(),
+        "no spec yet: no storage token to refresh"
     );
 
-    let dir = fresh("k3_http_status");
     let keys = keys();
-    let compute = make_compute(&dir, &keys, Some(OLD), ComputeStatus::Running);
-    let req = Request::builder()
-        .method("GET")
-        .uri("/status")
-        .header("authorization", format!("Bearer {}", control_token(&keys)))
-        .body(Body::empty())
-        .unwrap();
-    let (status, _, text) = call(&external(&compute, &keys), req).await;
-    assert_eq!(status, StatusCode::OK, "{text}");
-    let json: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(
-        json["capabilities"],
-        json!(["storage_token_refresh"]),
-        "{text}"
-    );
-    assert!(!text.contains("k3old"), "/status shows no token: {text}");
-    fs::remove_dir_all(&dir).unwrap();
+    for (name, token, want) in [
+        (
+            "k3_http_status",
+            Some(OLD),
+            json!(["storage_token_refresh"]),
+        ),
+        ("f1_http_status_no_token", None, json!([])),
+    ] {
+        let dir = fresh(name);
+        let compute = make_compute(&dir, &keys, token, ComputeStatus::Running);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/status")
+            .header("authorization", format!("Bearer {}", control_token(&keys)))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, text) = call(&external(&compute, &keys), req).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let json: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(json["capabilities"], want, "token {token:?}: {text}");
+        assert!(!text.contains("k3old"), "/status shows no token: {text}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }
 
 // ---------------------------------------------------------------------------

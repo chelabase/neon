@@ -78,16 +78,16 @@ fn url_plus_file_gives_user_host_and_password() {
 #[test]
 fn one_trailing_newline_is_trimmed_and_not_required() {
     let dir = camino_tempfile::tempdir().unwrap();
-    for (content, want) in [
-        ("pw\n", "pw"),
-        ("pw", "pw"),
-        // Only one newline is trimmed.
-        ("pw\n\n", "pw\n"),
-    ] {
+    for (content, want) in [("pw\n", "pw"), ("pw", "pw")] {
         let file = write_pw(&dir, content.as_bytes());
         let info = plain_redis_connection_info(URL, Some(&file)).unwrap();
         assert_eq!(info.redis.password.as_deref(), Some(want), "{content:?}");
     }
+    // Only one newline is trimmed: a second one is a control character in the
+    // password, refused (final fix round).
+    let file = write_pw(&dir, b"pw\n\n");
+    let e = plain_redis_connection_info(URL, Some(&file)).unwrap_err();
+    assert!(format!("{e:#}").contains(FLAG), "{e:#}");
 }
 
 #[test]
@@ -315,4 +315,92 @@ fn without_the_flag_the_local_backend_sends_no_header() {
         local_token_file(&["proxy", "--auth-backend", "local"]),
         None
     );
+}
+
+// ---- Final fix round (F1, K8 audit hardening) --------------------------------------
+//
+// Pinned (`--control-plane-token-file` is in `cp_token_tests.rs`):
+// - `plain_redis_connection_info` takes only `redis://` and `rediss://` URLs (with or
+//   without a password file); any other scheme is an error naming `--redis-plain`, never
+//   echoing the URL.
+// - The password file's content (one trailing `\n` trimmed) holds no control character
+//   (`char::is_control`): an error naming the flag.
+// - `configure_redis`: `--redis-plain-password-file` without `--redis-auth-type=plain` is a
+//   startup error naming the flag.
+
+#[test]
+fn only_redis_and_rediss_urls_are_taken() {
+    let dir = camino_tempfile::tempdir().unwrap();
+    let file = write_pw(&dir, format!("{PW}\n").as_bytes());
+    for url in [
+        "unix:///run/valkey.sock",
+        "redis+unix:///run/valkey.sock",
+        "valkey://proxy@valkey:6379",
+        "valkeys://proxy@valkey:6379",
+        "redis+sentinel://proxy@valkey:26379",
+    ] {
+        for password_file in [Some(file.as_path()), None] {
+            let Err(e) = plain_redis_connection_info(url, password_file) else {
+                panic!("{url} (file: {password_file:?}) must be refused");
+            };
+            assert!(format!("{e:#}").contains("--redis-plain"), "{url}: {e:#}");
+            assert_clean(&e, &[PW, "valkey.sock"]);
+        }
+    }
+    // The two schemes still work (the scheme is case-insensitive in a URL).
+    for url in [
+        "redis://proxy@valkey:6379",
+        "rediss://proxy@valkey:6380",
+        "Redis://proxy@valkey:6379",
+    ] {
+        plain_redis_connection_info(url, Some(&file)).unwrap_or_else(|e| panic!("{url}: {e:#}"));
+    }
+}
+
+#[test]
+fn a_control_character_in_the_password_is_refused() {
+    let dir = camino_tempfile::tempdir().unwrap();
+    let pw = "CtlPwNeedle";
+    for content in [
+        format!("{pw}\r\n"),
+        format!("{pw}\r"),
+        format!("{pw}\nsecond\n"),
+        format!("{pw}\t\n"),
+        format!("{pw}\0\n"),
+        format!("{pw}\u{1b}[0m\n"),
+        format!("{pw}\u{7f}\n"),
+        format!("{pw}\u{85}\n"),
+        format!("\u{9b}{pw}\n"),
+    ] {
+        let file = write_pw(&dir, content.as_bytes());
+        let Err(e) = plain_redis_connection_info(URL, Some(&file)) else {
+            panic!("{content:?} must be refused");
+        };
+        assert!(format!("{e:#}").contains(FLAG), "{content:?}: {e:#}");
+        assert_clean(&e, &[pw]);
+    }
+    // A space and non-ASCII letters are no control characters.
+    for content in ["p w\n", "pa\u{e9}ss\n"] {
+        let file = write_pw(&dir, content.as_bytes());
+        plain_redis_connection_info(URL, Some(&file)).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_password_file_without_plain_auth_is_a_startup_error() {
+    let dir = camino_tempfile::tempdir().unwrap();
+    let good = dir.path().join("good.password");
+    std::fs::write(&good, format!("{PW}\n")).unwrap();
+    for auth_type in [None, Some("irsa")] {
+        let mut argv: Vec<String> = vec!["proxy".into()];
+        if let Some(t) = auth_type {
+            argv.push(format!("--redis-auth-type={t}"));
+        }
+        argv.push(format!("--redis-plain-password-file={good}"));
+        let Err(e) = configure_redis(&ProxyCliArgs::parse_from(argv)).await else {
+            panic!("--redis-auth-type {auth_type:?} with a password file must fail");
+        };
+        assert!(format!("{e:#}").contains(FLAG), "{auth_type:?}: {e:#}");
+        assert_clean(&e, &[PW]);
+    }
 }

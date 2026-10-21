@@ -375,3 +375,93 @@ async fn the_token_never_reaches_logs_or_errors() {
 
     assert!(!logs_contain(secret), "the token appeared in a log line");
 }
+
+// ---- Final fix round (F1, K8 audit hardening) --------------------------------------
+//
+// Pinned behaviour of `read_token`:
+// - it opens the file with `O_NONBLOCK` and reads it only when the open descriptor is a
+//   regular file (`fstat`), so a FIFO, a socket or a device at the path never blocks a
+//   call: no header, as for any invalid file. A symlink to a regular file is still read.
+// - an invalid file (bad content, not a regular file) logs a WARN naming the path, never
+//   the content, rate-limited: repeated invalid reads log it once (within a minute).
+
+/// A FIFO (nobody writes to it) at the token path: the call still goes out at once,
+/// without a header. Without `O_NONBLOCK` the open blocks a pool thread forever.
+#[tokio::test]
+async fn a_fifo_at_the_token_path_never_blocks_a_call() {
+    let fake = FakeComputeCtl::start(SECRET).await;
+    let dir = camino_tempfile::tempdir().unwrap();
+    let path = token_path(&dir);
+    let made = std::process::Command::new("mkfifo")
+        .arg(path.as_str())
+        .status()
+        .unwrap();
+    assert!(made.success(), "mkfifo failed");
+    let backend = fake.backend(Some(path.clone()));
+
+    let Ok(r) = tokio::time::timeout(std::time::Duration::from_secs(10), call(&backend)).await
+    else {
+        // Let the blocked open finish, so the runtime can shut down after the failure.
+        let fifo = path.clone();
+        std::thread::spawn(move || drop(std::fs::OpenOptions::new().write(true).open(fifo)));
+        panic!("a FIFO at the token path blocked the compute_ctl call");
+    };
+    assert!(is_refused(&r), "a FIFO: expected a 401, got {r:?}");
+    assert_eq!(fake.requests(), vec![Vec::<String>::new()], "no header");
+
+    // A regular file in its place works again.
+    std::fs::remove_file(&path).unwrap();
+    std::fs::write(&path, format!("{SECRET}\n")).unwrap();
+    call(&backend).await.unwrap();
+}
+
+/// compute_ctl never makes the token file a symlink, but one to a regular file is
+/// read like the file (as the neon extension's reader does).
+#[tokio::test]
+async fn a_symlink_to_a_regular_file_is_read() {
+    let fake = FakeComputeCtl::start(SECRET).await;
+    let dir = camino_tempfile::tempdir().unwrap();
+    let target = dir.path().join("real.token");
+    std::fs::write(&target, format!("{SECRET}\n")).unwrap();
+    let path = token_path(&dir);
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    call(&fake.backend(Some(path))).await.unwrap();
+    assert_eq!(fake.requests(), vec![vec![format!("Bearer {SECRET}")]]);
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn an_invalid_token_file_warns_once_without_its_content() {
+    let fake = FakeComputeCtl::start(SECRET).await;
+    let dir = camino_tempfile::tempdir().unwrap();
+    let path = token_path(&dir);
+    std::fs::write(&path, "f1BadTokenNeedle has spaces\n").unwrap();
+    let backend = fake.backend(Some(path.clone()));
+
+    for i in 0..5 {
+        assert_no_header_and_refused(&fake, &backend, &format!("invalid, call {i}")).await;
+    }
+    let wanted = path.to_string();
+    logs_assert(|lines: &[&str]| {
+        let warnings = lines
+            .iter()
+            .filter(|l| l.contains("WARN") && l.contains(&wanted))
+            .count();
+        if warnings == 1 {
+            Ok(())
+        } else {
+            Err(format!(
+                "{warnings} WARN lines naming {wanted} for 5 invalid reads (want exactly 1)"
+            ))
+        }
+    });
+    assert!(
+        !logs_contain("f1BadTokenNeedle"),
+        "the invalid file's content appeared in a log line"
+    );
+
+    // A valid file logs no warning.
+    std::fs::write(&path, format!("{SECRET}\n")).unwrap();
+    call(&backend).await.unwrap();
+    assert!(!logs_contain(SECRET), "the token appeared in a log line");
+}

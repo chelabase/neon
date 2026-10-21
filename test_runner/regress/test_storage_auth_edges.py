@@ -77,10 +77,11 @@ def test_route_check_keeps_own_tenant_global_and_public_access(
 ):
     """
     The route check every API route runs first (K7 fix round) refuses only what it
-    must: a tenant token still reaches its own tenant's routes (and a tenant-in-body
-    route naming its tenant), each server's own global scope still reaches management
-    routes, the public routes take no token, and the storage controller refuses the
-    scopes none of its routes take.
+    must: a tenant token still reaches its own tenant's data routes (but not the
+    control-plane routes the user's ruling makes global-only, the tenant config routes
+    included), each server's own global scope still reaches management routes, the
+    public routes take no token, and the storage controller refuses the scopes none of
+    its routes take.
     """
     neon_env_builder.auth_enabled = True
     env = neon_env_builder.init_start()
@@ -117,10 +118,18 @@ def test_route_check_keeps_own_tenant_global_and_public_access(
     assert call("GET", f"{ps}/v1/location_config", pageserverapi) == 200
     assert call("GET", f"{ps}/v1/tenant/{other}", pageserverapi) == 200
     assert call("GET", f"{ps}/v1/tenant", admin) == 403
-    # A tenant-in-body route: the token's own tenant passes, another or none doesn't.
-    assert call("PATCH", f"{ps}/v1/tenant/config", own, {"tenant_id": str(tenant)}) == 200
-    assert call("PATCH", f"{ps}/v1/tenant/config", own, {"tenant_id": str(other)}) == 403
-    assert call("PATCH", f"{ps}/v1/tenant/config", no_tenant, {"tenant_id": str(tenant)}) == 403
+    # The tenant config routes take the global scope only (user ruling, final fix
+    # round): no tenant token passes, whatever tenant the body names.
+    for method in ("PATCH", "PUT"):
+        for token in (own, no_tenant):
+            for body_tenant in (tenant, other):
+                body = {"tenant_id": str(body_tenant)}
+                assert call(method, f"{ps}/v1/tenant/config", token, body) == 403, method
+    assert call("PATCH", f"{ps}/v1/tenant/config", pageserverapi, {"tenant_id": str(tenant)}) == 200
+    # So do the other control-plane routes that name a tenant (`test_route_scopes.py`
+    # probes them all); the global scope still reaches them.
+    assert call("GET", f"{ps}/v1/location_config/{tenant}", own) == 403
+    assert call("GET", f"{ps}/v1/location_config/{tenant}", pageserverapi) == 200
     # A path parameter that isn't a tenant id is a management route for the check.
     assert call("GET", f"{ps}/v1/tenant/not-a-tenant", own) == 403
     assert call("GET", f"{ps}/v1/tenant/not-a-tenant", pageserverapi) == 400
