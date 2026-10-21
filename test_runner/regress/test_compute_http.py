@@ -3,6 +3,7 @@ from __future__ import annotations
 import functools
 import re
 import stat
+import time
 from http.client import (
     BAD_REQUEST,
     CREATED,
@@ -416,3 +417,94 @@ def test_storage_token_on_a_compute_without_storage_auth(neon_simple_env: NeonEn
         "the fixture's storage_token",
     )
     assert endpoint.http_client().status()["status"] == "running"
+
+
+# ---------------------------------------------------------------------------
+# Fork round 4, K4: compute_ctl's metrics routes need a token (spec §7: U4,
+# S18, RT4-9; plan SP17). `GET /metrics` and `GET /autoscaling_metrics` accept
+# a `metrics` token (any or no `compute_id`, no `aud`), an admin token and this
+# compute's control token; a `metrics` token opens nothing else (403), an
+# expired one nothing at all (401). The fixture's `metrics()` and
+# `autoscaling_metrics()` send the endpoint's control token.
+# ---------------------------------------------------------------------------
+
+METRICS_ROUTES = ["/metrics", "/autoscaling_metrics"]
+
+
+def _external(
+    endpoint: Endpoint, method: str, route: str, token: str | None, body: Any = None
+) -> requests.Response:
+    headers = {} if token is None else {"Authorization": f"Bearer {token}"}
+    return requests.request(
+        method,
+        f"http://localhost:{endpoint.external_http_port}{route}",
+        json=body,
+        headers=headers,
+        timeout=30,
+    )
+
+
+@run_only_on_default_postgres("compute_ctl's HTTP server doesn't depend on the Postgres version")
+def test_metrics_need_a_token(neon_simple_env: NeonEnv):
+    env = neon_simple_env
+    endpoint = env.endpoints.create_start("main")
+
+    for route in METRICS_ROUTES:
+        for token in [None, "k4.not.ajwt"]:
+            res = _external(endpoint, "GET", route, token)
+            assert res.status_code == UNAUTHORIZED, (
+                f"{route} with token {token!r}: {res.status_code} {res.text[:200]}"
+            )
+            challenge = res.headers.get("WWW-Authenticate", "")
+            assert challenge.startswith("Bearer"), f"{route}: WWW-Authenticate {challenge!r}"
+
+    def mint(claims: dict[str, Any]) -> str:
+        return jwt.encode(claims, env.auth_keys.priv, algorithm="EdDSA")
+
+    now = int(time.time())
+    metrics_tokens = {
+        # neon_local's token carries this compute's compute_id (RT4-9's case).
+        "generate_jwt(METRICS)": endpoint.generate_jwt(ComputeClaimsScope.METRICS).strip(),
+        # Chelabase's form: no compute_id, no aud, no exp.
+        "PyJWT, no compute_id": mint({"scope": str(ComputeClaimsScope.METRICS), "iat": now}),
+        "PyJWT, another compute_id": mint(
+            {"scope": str(ComputeClaimsScope.METRICS), "compute_id": "ep-k4-other"}
+        ),
+    }
+    for what, token in metrics_tokens.items():
+        res = _external(endpoint, "GET", "/metrics", token)
+        assert res.status_code == OK, f"/metrics with {what}: {res.status_code} {res.text}"
+        assert "# TYPE " in res.text, f"/metrics with {what}: {res.text[:200]}"
+        res = _external(endpoint, "GET", "/autoscaling_metrics", token)
+        assert res.status_code not in (UNAUTHORIZED, FORBIDDEN), (
+            f"/autoscaling_metrics with {what}: {res.status_code} {res.text}"
+        )
+        for method, route, body in [
+            ("GET", "/status", None),
+            ("GET", "/metrics.json", None),
+            ("GET", "/dbs_and_roles", None),
+            ("POST", "/configure", {}),
+            ("POST", "/storage_token", {"token": "k4.eyJ0IjoxfQ.c2ln"}),
+        ]:
+            res = _external(endpoint, method, route, token, body)
+            assert res.status_code == FORBIDDEN, (
+                f"{method} {route} with {what}: {res.status_code} {res.text}"
+            )
+    assert endpoint.http_client().status()["status"] == "running"
+
+    # SP8: compute_ctl allows 60 s of leeway on `exp`.
+    expired = mint({"scope": str(ComputeClaimsScope.METRICS), "exp": now - 300})
+    for route in METRICS_ROUTES:
+        res = _external(endpoint, "GET", route, expired)
+        assert res.status_code == UNAUTHORIZED, f"{route}, expired: {res.status_code}"
+
+    # The other tokens the metrics routes take (S18), and one they don't.
+    admin = mint({"scope": str(ComputeClaimsScope.ADMIN), "aud": [COMPUTE_AUDIENCE]})
+    for what, token in [("admin", admin), ("control", endpoint.generate_jwt().strip())]:
+        res = _external(endpoint, "GET", "/metrics", token)
+        assert res.status_code == OK, f"/metrics with the {what} token: {res.status_code}"
+    res = _external(endpoint, "GET", "/metrics", mint({"compute_id": "ep-k4-other"}))
+    assert res.status_code == FORBIDDEN, f"another compute's token: {res.status_code}"
+
+    # The fixture sends the endpoint's control token.
+    assert "# TYPE " in endpoint.http_client().metrics()

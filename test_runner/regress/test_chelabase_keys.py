@@ -16,9 +16,25 @@ from psycopg2.extensions import make_dsn
 from psycopg2.extras import LogicalReplicationConnection
 
 if TYPE_CHECKING:
-    from fixtures.neon_fixtures import NeonEnv, PgProtocol, VanillaPostgres
+    from fixtures.neon_fixtures import Endpoint, NeonEnv, PgProtocol, VanillaPostgres
 
 RT = "chelabase_realtime"
+
+
+def admit_realtime_on_loopback(endpoint: Endpoint):
+    """A compute admits chelabase_realtime only over TLS, from its listed addresses, with
+    the realtime certificate (W31), which neon_local's computes don't have: for a decoding
+    test, trust lines for loopback go above compute_ctl's blocks (a rewrite keeps them),
+    then a reload, waited for."""
+    hba = endpoint.pg_data_dir_path() / "pg_hba.conf"
+    lines = [f"host\tall\t{RT}\t127.0.0.1/32\ttrust", f"host\tall\t{RT}\t::1/128\ttrust"]
+    hba.write_text("\n".join(lines) + "\n" + hba.read_text())
+    before = endpoint.safe_psql("SELECT pg_conf_load_time()")[0][0]
+    endpoint.safe_psql("SELECT pg_reload_conf()")
+    deadline = time.time() + 20
+    while endpoint.safe_psql("SELECT pg_conf_load_time()")[0][0] == before:
+        assert time.time() < deadline, "the reload never happened"
+        time.sleep(0.1)
 
 
 def rt_dsn(node: PgProtocol, **kw: Any) -> str:
@@ -53,6 +69,7 @@ def test_keys_over_replication_and_restart(neon_simple_env: NeonEnv):
     endpoint = env.endpoints.create_start("main")
     endpoint.safe_psql("CREATE ROLE chelabase_realtime LOGIN REPLICATION NOBYPASSRLS NOINHERIT")
     endpoint.safe_psql("CREATE TABLE t (id int PRIMARY KEY, v int)")
+    admit_realtime_on_loopback(endpoint)
     conn = psycopg2.connect(rt_dsn(endpoint), connection_factory=LogicalReplicationConnection)
     cur = conn.cursor()
     cur.execute(

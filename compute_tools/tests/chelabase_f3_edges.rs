@@ -6,11 +6,13 @@ use std::path::{Path, PathBuf};
 
 use compute_api::responses::TlsConfig;
 use compute_api::spec::MemberLogins;
-use compute_tools::spec::{member_hba_block, update_pg_hba, update_pg_ident};
+use compute_tools::spec::{member_hba_block, realtime_hba_block, update_pg_hba, update_pg_ident};
 use compute_tools::tls::{reload_tls_files, verify_cert_chains_to_ca};
 
 const IDENT_HEAD: &str = "# chelabase: member certificate map (chelabase_member)\n";
 const IDENT_TAIL: &str = "# chelabase: end of member certificate map\n";
+const RT_IDENT: &str = "# chelabase: realtime certificate map (chelabase_realtime)\n\
+# chelabase: end of realtime certificate map\n";
 
 fn logins(cidrs: &[&str], cns: &[&str]) -> MemberLogins {
     MemberLogins {
@@ -42,12 +44,14 @@ fn unmarked_member_ident_lines_are_replaced_by_the_block() {
         "mymap\tbob\tbob\nchelabase_member\tcn-old\t/^cb_m_[0-9a-f]{32}$\n# tail comment\n",
     )
     .unwrap();
-    update_pg_ident(&dir, None, Some(&logins(&[], &["cn-new"]))).unwrap();
+    update_pg_ident(&dir, None, Some(&logins(&[], &["cn-new"])), None).unwrap();
+    // K4 (W31): the realtime map block (no CN without realtime_logins) goes right
+    // after the member one.
     assert_eq!(
         read(&ident),
         format!(
             "{IDENT_HEAD}chelabase_member\tcn-new\t/^cb_m_[0-9a-f]{{32}}$\n{IDENT_TAIL}\
-mymap\tbob\tbob\n# tail comment\n"
+{RT_IDENT}mymap\tbob\tbob\n# tail comment\n"
         )
     );
     std::fs::remove_dir_all(&dir).unwrap();
@@ -68,7 +72,7 @@ fn a_cut_ident_block_is_refused() {
         let dir = fresh(&format!("f3e_ident_cut_{i}"));
         let ident = dir.join("pg_ident.conf");
         std::fs::write(&ident, text).unwrap();
-        let err = update_pg_ident(&dir, None, Some(&logins(&[], &["cn-a"]))).unwrap_err();
+        let err = update_pg_ident(&dir, None, Some(&logins(&[], &["cn-a"])), None).unwrap_err();
         assert!(format!("{err:#}").contains("pg_ident.conf"), "{err:#}");
         assert_eq!(&read(&ident), text);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -87,20 +91,29 @@ fn a_block_at_the_end_of_the_file_is_replaced() {
     let hba = dir.join("pg_hba.conf");
     let block = member_hba_block(Some(&old), true).unwrap();
     std::fs::write(&hba, format!("{md5}{}", block.trim_end_matches('\n'))).unwrap();
-    update_pg_hba(&dir, None, Some(&new), true).unwrap();
+    update_pg_hba(&dir, None, Some(&new), None, true).unwrap();
+    // K4 (W31): the realtime block goes right after the member block.
     assert_eq!(
         read(&hba),
-        format!("{md5}{}", member_hba_block(Some(&new), true).unwrap())
+        format!(
+            "{md5}{}{}",
+            member_hba_block(Some(&new), true).unwrap(),
+            realtime_hba_block(None, true).unwrap()
+        )
     );
     std::fs::remove_dir_all(&dir).unwrap();
 
     let dir = fresh("f3e_hba_crlf");
     let hba = dir.join("pg_hba.conf");
     std::fs::write(&hba, format!("{}{md5}", block.replace('\n', "\r\n"))).unwrap();
-    update_pg_hba(&dir, None, Some(&new), true).unwrap();
+    update_pg_hba(&dir, None, Some(&new), None, true).unwrap();
     assert_eq!(
         read(&hba),
-        format!("{}{md5}", member_hba_block(Some(&new), true).unwrap())
+        format!(
+            "{}{}{md5}",
+            member_hba_block(Some(&new), true).unwrap(),
+            realtime_hba_block(None, true).unwrap()
+        )
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
