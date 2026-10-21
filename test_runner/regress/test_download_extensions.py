@@ -251,6 +251,91 @@ def test_remote_extensions(
         assert sample.value == 1
 
 
+def test_extensions_endpoint_remote_extension(
+    httpserver: HTTPServer,
+    neon_env_builder_local: NeonEnvBuilder,
+    httpserver_listen_address: ListenAddress,
+    test_output_dir: Path,
+    pg_version: PgVersion,
+    pg_config: PgConfig,
+):
+    """
+    `/extensions` installs and updates a remote extension whose scripts aren't
+    downloaded yet, as `CREATE`/`ALTER EXTENSION` would: its trust checks read
+    the extension's scripts, so compute_ctl downloads them first.
+    """
+    extension = RemoteExtension.SQL_ONLY
+    (host, port) = httpserver_listen_address
+    remote_ext_base_url = f"http://{host}:{port}/pg-ext-s3-gateway"
+
+    tarball = extension.package(test_output_dir)
+    compressed = zstandard.ZstdCompressor().compress(tarball.read_bytes())
+
+    def handler(request: Request) -> Response:
+        log.info(f"request: {request}")
+        return Response(
+            compressed,
+            mimetype="application/octet-stream",
+            headers=[("Content-Length", str(len(compressed)))],
+            direct_passthrough=True,
+        )
+
+    arch = {"aarch64": "arm64", "x86_64": "amd64"}.get(platform.machine(), platform.machine())
+    httpserver.expect_request(
+        f"/pg-ext-s3-gateway/{extension.archive_route(build_tag=os.environ.get('BUILD_TAG', 'latest'), arch=arch, pg_version=pg_version)}",
+        method="GET",
+    ).respond_with_handler(handler)
+
+    env = neon_env_builder_local.init_start()
+    env.create_branch("test_extensions_endpoint_remote_extension")
+    endpoint = env.endpoints.create("test_extensions_endpoint_remote_extension")
+    # Trusted, so `/extensions` may install it.
+    control = f"{extension.control_file_contents()}trusted = true\n"
+    endpoint.create_remote_extension_spec(
+        {
+            "public_extensions": [extension],
+            "custom_extensions": None,
+            "library_index": {extension: extension},
+            "extension_data": {
+                extension: {
+                    "archive_path": "",
+                    "control_data": {extension.control_file_name: control},
+                },
+            },
+        }
+    )
+
+    def downloads() -> float:
+        metrics = parse_metrics(endpoint.http_client().metrics())
+        samples = metrics.query_all(
+            "compute_ctl_remote_ext_requests_total",
+            {"filename": extension.compressed_tarball_name},
+        )
+        return sum(s.value for s in samples)
+
+    def installed() -> str | None:
+        rows = endpoint.safe_psql(
+            f"SELECT extversion FROM pg_extension WHERE extname = '{extension}'"
+        )
+        return str(rows[0][0]) if rows else None
+
+    # CREATE: nothing of the extension but its control file is on disk yet.
+    endpoint.start(remote_ext_base_url=remote_ext_base_url)
+    assert downloads() == 0
+    endpoint.http_client().extensions(extension, "1.0", "postgres")
+    assert installed() == "1.0"
+    assert downloads() == 1
+    endpoint.stop()
+
+    # ALTER ... UPDATE: the scripts are gone again after a restart.
+    extension.remove(test_output_dir, pg_version)
+    endpoint.start(remote_ext_base_url=remote_ext_base_url)
+    endpoint.http_client().extensions(extension, "1.1", "postgres")
+    assert installed() == "1.1"
+    assert downloads() == 1
+    endpoint.safe_psql(f"SELECT {extension}.fun_fact()")
+
+
 # TODO
 # 1. Test downloading remote library.
 #
