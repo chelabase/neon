@@ -1633,13 +1633,13 @@ impl ComputeNode {
         result
     }
 
-    // Run `postgres` in a special mode with `--sync-safekeepers` argument
-    // and return the reported LSN back to the caller.
-    #[instrument(skip_all)]
+    /// Run `postgres` in a special mode with `--sync-safekeepers` argument
+    /// and return the reported LSN back to the caller.
     ///
     /// The walproposer authenticates with the storage token file named in
     /// `postgresql.conf` (RT4-11): both are written before any sync, so no
     /// token goes through the environment.
+    #[instrument(skip_all)]
     pub fn sync_safekeepers(&self) -> Result<Lsn> {
         let start_time = Utc::now();
 
@@ -1930,10 +1930,11 @@ impl ComputeNode {
     /// Start Postgres as a child process and wait for it to start accepting
     /// connections.
     ///
+    /// The storage token reaches it only through the token file named in
+    /// `postgresql.conf`, never through its environment.
+    ///
     /// Returns a handle to the child process and a handle to the logs thread.
     #[instrument(skip_all)]
-    /// Starts the postmaster. The storage token reaches it only through the
-    /// token file named in `postgresql.conf`, never through its environment.
     fn start_postgres(&self) -> Result<PostgresHandle> {
         let pgdata_path = Path::new(&self.params.pgdata);
 
