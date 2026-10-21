@@ -79,25 +79,44 @@ for pg_version in ${TEST_VERSION_ONLY-14 15 16 17}; do
     done
 
     if [[ ${pg_version} -ge 16 ]]; then
+        # With ONLY set, a prepared piece is skipped when the tests image doesn't ship its source
+        # (the extension-tests-minimal image has no PostGIS, pg_hint_plan or contrib/file_fdw data).
+        have() { [[ -z "${ONLY:-}" ]] || docker compose exec -T neon-test-extensions test -e "$1"; }
         mkdir "${CURRENT_TMPDIR}"/{pg_hint_plan-src,file_fdw,postgis-src}
-        docker compose cp neon-test-extensions:/ext-src/postgis-src/raster/test "${CURRENT_TMPDIR}/postgis-src/test"
-        docker compose cp neon-test-extensions:/ext-src/postgis-src/regress/00-regress-install "${CURRENT_TMPDIR}/postgis-src/00-regress-install"
-        docker compose cp neon-test-extensions:/ext-src/pg_hint_plan-src/data "${CURRENT_TMPDIR}/pg_hint_plan-src/data"
-        docker compose cp neon-test-extensions:/postgres/contrib/file_fdw/data "${CURRENT_TMPDIR}/file_fdw/data"
+        HAVE_POSTGIS=0 HAVE_HINT=0 HAVE_FDW=0
+        have /ext-src/postgis-src/raster/test && HAVE_POSTGIS=1
+        have /ext-src/pg_hint_plan-src/data && HAVE_HINT=1
+        have /postgres/contrib/file_fdw/data && HAVE_FDW=1
+        if [[ ${HAVE_POSTGIS} -eq 1 ]]; then
+            docker compose cp neon-test-extensions:/ext-src/postgis-src/raster/test "${CURRENT_TMPDIR}/postgis-src/test"
+            docker compose cp neon-test-extensions:/ext-src/postgis-src/regress/00-regress-install "${CURRENT_TMPDIR}/postgis-src/00-regress-install"
+        fi
+        if [[ ${HAVE_HINT} -eq 1 ]]; then
+            docker compose cp neon-test-extensions:/ext-src/pg_hint_plan-src/data "${CURRENT_TMPDIR}/pg_hint_plan-src/data"
+        fi
+        if [[ ${HAVE_FDW} -eq 1 ]]; then
+            docker compose cp neon-test-extensions:/postgres/contrib/file_fdw/data "${CURRENT_TMPDIR}/file_fdw/data"
+        fi
 
         for compute in "${COMPUTES[@]}"; do
           # This is required for the pg_hint_plan test, to prevent flaky log message causing the test to fail
           # It cannot be moved to Dockerfile now because the database directory is created after the start of the container
           echo Adding dummy config on "${compute}"
           docker compose exec "${compute}" touch /var/db/postgres/compute/compute_ctl_temp_override.conf
-          # Prepare for the PostGIS test
-          docker compose exec "${compute}" mkdir -p /tmp/pgis_reg/pgis_reg_tmp /ext-src/postgis-src/raster /ext-src/postgis-src/regress /ext-src/postgis-src/regress/00-regress-install
-          docker compose cp "${CURRENT_TMPDIR}/postgis-src/test" "${compute}":/ext-src/postgis-src/raster/test
-          docker compose cp "${CURRENT_TMPDIR}/postgis-src/00-regress-install" "${compute}":/ext-src/postgis-src/regress
-          # The following block copies the files for the pg_hintplan test to the compute node for the extension test in an isolated docker-compose environment
-          docker compose cp "${CURRENT_TMPDIR}/pg_hint_plan-src/data" "${compute}":/ext-src/pg_hint_plan-src/
-          # The following block does the same for the contrib/file_fdw test
-          docker compose cp "${CURRENT_TMPDIR}/file_fdw/data" "${compute}":/postgres/contrib/file_fdw/data
+          if [[ ${HAVE_POSTGIS} -eq 1 ]]; then
+            # Prepare for the PostGIS test
+            docker compose exec "${compute}" mkdir -p /tmp/pgis_reg/pgis_reg_tmp /ext-src/postgis-src/raster /ext-src/postgis-src/regress /ext-src/postgis-src/regress/00-regress-install
+            docker compose cp "${CURRENT_TMPDIR}/postgis-src/test" "${compute}":/ext-src/postgis-src/raster/test
+            docker compose cp "${CURRENT_TMPDIR}/postgis-src/00-regress-install" "${compute}":/ext-src/postgis-src/regress
+          fi
+          if [[ ${HAVE_HINT} -eq 1 ]]; then
+            # The following block copies the files for the pg_hintplan test to the compute node for the extension test in an isolated docker-compose environment
+            docker compose cp "${CURRENT_TMPDIR}/pg_hint_plan-src/data" "${compute}":/ext-src/pg_hint_plan-src/
+          fi
+          if [[ ${HAVE_FDW} -eq 1 ]]; then
+            # The following block does the same for the contrib/file_fdw test
+            docker compose cp "${CURRENT_TMPDIR}/file_fdw/data" "${compute}":/postgres/contrib/file_fdw/data
+          fi
         done
         # Apply patches
         docker compose exec -T neon-test-extensions bash -c "(cd /postgres && patch -p1)" <"../compute/patches/contrib_pg${pg_version}.patch"
@@ -111,7 +130,7 @@ for pg_version in ${TEST_VERSION_ONLY-14 15 16 17}; do
         # directories and skips the contrib suite.
         ONLY_ARGS=()
         [[ -n "${ONLY:-}" ]] && ONLY_ARGS=(-e "ONLY=${ONLY}")
-        docker compose exec -e USE_PGXS=1 -e SKIP=pg_jsonschema-src,rdkit-src,timescaledb-src "${ONLY_ARGS[@]}" \
+        docker compose exec -e USE_PGXS=1 -e SKIP=pg_jsonschema-src,rdkit-src "${ONLY_ARGS[@]}" \
         -e RUN_FIRST=hll-src,postgis-src,pgtap-src -e PARALLEL_COMPUTES="${PARALLEL_COMPUTES}" \
         neon-test-extensions /run-tests.sh /ext-src | tee testout.txt && EXT_SUCCESS=1 || EXT_SUCCESS=0
         if [[ -n "${ONLY:-}" ]]; then
