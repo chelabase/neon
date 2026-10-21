@@ -87,6 +87,22 @@ struct Cli {
     #[arg(long)]
     control_plane_jwt_token: Option<String>,
 
+    /// File holding the token for the pageservers (see `--jwt-token`), so the token is in
+    /// neither the environment nor the command line. Exclusive with `--jwt-token` and
+    /// `PAGESERVER_JWT_TOKEN`.
+    #[arg(long)]
+    pageserver_jwt_token_file: Option<Utf8PathBuf>,
+
+    /// File holding the token for the safekeepers (see `--safekeeper-jwt-token`).
+    /// Exclusive with `--safekeeper-jwt-token` and `SAFEKEEPER_JWT_TOKEN`.
+    #[arg(long)]
+    safekeeper_jwt_token_file: Option<Utf8PathBuf>,
+
+    /// File holding the token for the control plane (see `--control-plane-jwt-token`).
+    /// Exclusive with `--control-plane-jwt-token` and `CONTROL_PLANE_JWT_TOKEN`.
+    #[arg(long)]
+    control_plane_jwt_token_file: Option<Utf8PathBuf>,
+
     #[arg(long)]
     peer_jwt_token: Option<String>,
 
@@ -264,18 +280,46 @@ impl Secrets {
     const PEER_JWT_TOKEN_ENV: &'static str = "PEER_JWT_TOKEN";
     const PUBLIC_KEY_ENV: &'static str = "PUBLIC_KEY";
 
+    /// [`Self::load_with_env`] with the process environment.
+    fn load(args: &Cli) -> anyhow::Result<Self> {
+        Self::load_with_env(args, &|name| std::env::var(name).ok())
+    }
+
     /// Load secrets from, in order of preference:
-    /// - CLI args if database URL is provided on the CLI
-    /// - Environment variables if DATABASE_URL is set.
-    async fn load(args: &Cli) -> anyhow::Result<Self> {
-        let Some(database_url) = Self::load_secret(&args.database_url, Self::DATABASE_URL_ENV)
-        else {
+    /// - a token file flag (`--*-jwt-token-file`), exclusive with its flag and variable
+    /// - CLI args
+    /// - environment variables, read through `env`.
+    fn load_with_env(args: &Cli, env: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
+        let load_secret = |cli: &Option<String>, env_name: &str| -> Option<String> {
+            cli.clone().or_else(|| env(env_name))
+        };
+        let load_token = |file: &Option<Utf8PathBuf>,
+                          file_flag: &str,
+                          cli: &Option<String>,
+                          cli_flag: &str,
+                          env_name: &str|
+         -> anyhow::Result<Option<String>> {
+            let Some(file) = file else {
+                return Ok(load_secret(cli, env_name));
+            };
+            if cli.is_some() {
+                anyhow::bail!("{file_flag} and {cli_flag} are exclusive: give only one");
+            }
+            if env(env_name).is_some() {
+                anyhow::bail!(
+                    "{file_flag} is given and {env_name} is set in the environment: give only one"
+                );
+            }
+            utils::secret_file::read_secret_file(file, file_flag).map(Some)
+        };
+
+        let Some(database_url) = load_secret(&args.database_url, Self::DATABASE_URL_ENV) else {
             anyhow::bail!(
                 "Database URL is not set (set `--database-url`, or `DATABASE_URL` environment)"
             )
         };
 
-        let public_key = match Self::load_secret(&args.public_key, Self::PUBLIC_KEY_ENV) {
+        let public_key = match load_secret(&args.public_key, Self::PUBLIC_KEY_ENV) {
             Some(v) => Some(JwtAuth::from_key(v).context("Loading public key")?),
             None => None,
         };
@@ -283,30 +327,31 @@ impl Secrets {
         let this = Self {
             database_url,
             public_key,
-            pageserver_jwt_token: Self::load_secret(
+            pageserver_jwt_token: load_token(
+                &args.pageserver_jwt_token_file,
+                "--pageserver-jwt-token-file",
                 &args.jwt_token,
+                "--jwt-token",
                 Self::PAGESERVER_JWT_TOKEN_ENV,
-            ),
-            safekeeper_jwt_token: Self::load_secret(
+            )?,
+            safekeeper_jwt_token: load_token(
+                &args.safekeeper_jwt_token_file,
+                "--safekeeper-jwt-token-file",
                 &args.safekeeper_jwt_token,
+                "--safekeeper-jwt-token",
                 Self::SAFEKEEPER_JWT_TOKEN_ENV,
-            ),
-            control_plane_jwt_token: Self::load_secret(
+            )?,
+            control_plane_jwt_token: load_token(
+                &args.control_plane_jwt_token_file,
+                "--control-plane-jwt-token-file",
                 &args.control_plane_jwt_token,
+                "--control-plane-jwt-token",
                 Self::CONTROL_PLANE_JWT_TOKEN_ENV,
-            ),
-            peer_jwt_token: Self::load_secret(&args.peer_jwt_token, Self::PEER_JWT_TOKEN_ENV),
+            )?,
+            peer_jwt_token: load_secret(&args.peer_jwt_token, Self::PEER_JWT_TOKEN_ENV),
         };
 
         Ok(this)
-    }
-
-    fn load_secret(cli: &Option<String>, env_name: &str) -> Option<String> {
-        if let Some(v) = cli {
-            Some(v.clone())
-        } else {
-            std::env::var(env_name).ok()
-        }
     }
 }
 
@@ -368,7 +413,7 @@ async fn async_main() -> anyhow::Result<()> {
         StrictMode::Strict
     };
 
-    let secrets = Secrets::load(&args).await?;
+    let secrets = Secrets::load(&args)?;
 
     // Validate required secrets and arguments are provided in strict mode
     match strict_mode {
@@ -645,3 +690,68 @@ async fn async_main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod main_secret_file_tests;
+
+#[cfg(test)]
+mod secret_file_edges {
+    use clap::Parser;
+
+    use super::{Cli, Secrets};
+
+    /// The token files leave the other secrets (the database URL, the peer token, the public
+    /// key) and the tokens without a file to their flags and variables, as before.
+    #[test]
+    fn the_other_secrets_are_untouched() {
+        let dir = camino_tempfile::tempdir().unwrap();
+        let file = dir.path().join("t.jwt");
+        std::fs::write(&file, "filetoken\n").unwrap();
+        let args = Cli::try_parse_from([
+            "storage_controller".to_string(),
+            "--listen=127.0.0.1:1234".to_string(),
+            format!("--pageserver-jwt-token-file={file}"),
+            format!("--safekeeper-jwt-token-file={file}"),
+        ])
+        .unwrap();
+        let env = |name: &str| match name {
+            "DATABASE_URL" => Some("postgresql://x@127.0.0.1:1/db".to_string()),
+            "PEER_JWT_TOKEN" => Some("peer".to_string()),
+            "CONTROL_PLANE_JWT_TOKEN" => Some("cp".to_string()),
+            _ => None,
+        };
+        let s = Secrets::load_with_env(&args, &env).unwrap();
+        assert_eq!(s.database_url, "postgresql://x@127.0.0.1:1/db");
+        assert_eq!(s.peer_jwt_token.as_deref(), Some("peer"));
+        assert_eq!(s.control_plane_jwt_token.as_deref(), Some("cp"));
+        assert_eq!(s.pageserver_jwt_token.as_deref(), Some("filetoken"));
+        assert_eq!(s.safekeeper_jwt_token.as_deref(), Some("filetoken"));
+        assert!(s.public_key.is_none());
+    }
+
+    /// The flag-and-file error names both flags and never the flag's value.
+    #[test]
+    fn the_conflict_names_both_flags() {
+        let dir = camino_tempfile::tempdir().unwrap();
+        let file = dir.path().join("t.jwt");
+        std::fs::write(&file, "filetoken\n").unwrap();
+        let args = Cli::try_parse_from([
+            "storage_controller".to_string(),
+            "--listen=127.0.0.1:1234".to_string(),
+            "--database-url=postgresql://x@127.0.0.1:1/db".to_string(),
+            format!("--control-plane-jwt-token-file={file}"),
+            "--control-plane-jwt-token=FlagNeedle".to_string(),
+        ])
+        .unwrap();
+        let e = Secrets::load_with_env(&args, &|_| None)
+            .err()
+            .expect("the file and the flag together are refused");
+        let text = format!("{e:#}");
+        assert!(
+            text.contains("--control-plane-jwt-token-file")
+                && text.contains("--control-plane-jwt-token "),
+            "{text}"
+        );
+        assert!(
+            !text.contains("FlagNeedle") && !text.contains("filetoken"),
+            "{text}"
+        );
+    }
+}

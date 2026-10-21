@@ -52,6 +52,8 @@ pub mod signals;
 
 pub mod fs_ext;
 
+pub mod secret_file;
+
 pub mod measured_stream;
 
 pub mod serde_percent;
