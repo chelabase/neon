@@ -20,6 +20,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+use utils::secret_file::read_secret_file;
 use utils::sentry_init::init_sentry;
 use utils::{project_build_tag, project_git_version};
 
@@ -948,50 +949,6 @@ fn build_auth_backend(
             Ok(Either::Left(config))
         }
     }
-}
-
-/// The longest secret file [`read_secret_file`] reads.
-const MAX_SECRET_FILE_LEN: u64 = 64 * 1024;
-
-/// The secret in the file `path` given by `flag`: its content with one
-/// trailing `\n` trimmed, read once at startup. The open is `O_NONBLOCK` and
-/// only a regular file is read, so a FIFO at the path never blocks the
-/// startup. An unreadable, missing, non-regular, oversized, non-UTF-8 or empty
-/// file, or a control character (`char::is_control`, a second newline or a
-/// `\r` included) in the secret, is an error naming `flag` and the path, never
-/// the content.
-fn read_secret_file(path: &Utf8Path, flag: &str) -> anyhow::Result<String> {
-    use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|e| anyhow::anyhow!("cannot read {flag} {path}: {e}"))?;
-    let meta = file
-        .metadata()
-        .map_err(|e| anyhow::anyhow!("cannot read {flag} {path}: {e}"))?;
-    if !meta.file_type().is_file() {
-        bail!("{flag} {path} is not a regular file");
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_SECRET_FILE_LEN + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| anyhow::anyhow!("cannot read {flag} {path}: {e}"))?;
-    if bytes.len() as u64 > MAX_SECRET_FILE_LEN {
-        bail!("{flag} {path} is larger than {MAX_SECRET_FILE_LEN} bytes");
-    }
-    let content =
-        String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("{flag} {path} is not UTF-8"))?;
-    let secret = content.strip_suffix('\n').unwrap_or(&content);
-    if secret.is_empty() {
-        bail!("{flag} {path} is empty");
-    }
-    if secret.chars().any(char::is_control) {
-        bail!("{flag} {path} holds a control character (one line, one optional trailing newline)");
-    }
-    Ok(secret.to_owned())
 }
 
 /// The JWT the proxy sends to the control plane: the content of

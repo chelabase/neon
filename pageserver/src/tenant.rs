@@ -6201,7 +6201,6 @@ mod tests {
     use storage_layer::{IoConcurrency, PersistentLayerKey};
     use tests::storage_layer::ValuesReconstructState;
     use tests::timeline::{GetVectoredError, ShutdownMode};
-    #[cfg(feature = "testing")]
     use timeline::GcInfo;
     #[cfg(feature = "testing")]
     use timeline::InMemoryLayerTestDesc;

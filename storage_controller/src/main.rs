@@ -87,6 +87,22 @@ struct Cli {
     #[arg(long)]
     control_plane_jwt_token: Option<String>,
 
+    /// File holding the token for the pageservers (see `--jwt-token`), so the token is in
+    /// neither the environment nor the command line. Exclusive with `--jwt-token` and
+    /// `PAGESERVER_JWT_TOKEN`.
+    #[arg(long)]
+    pageserver_jwt_token_file: Option<Utf8PathBuf>,
+
+    /// File holding the token for the safekeepers (see `--safekeeper-jwt-token`).
+    /// Exclusive with `--safekeeper-jwt-token` and `SAFEKEEPER_JWT_TOKEN`.
+    #[arg(long)]
+    safekeeper_jwt_token_file: Option<Utf8PathBuf>,
+
+    /// File holding the token for the control plane (see `--control-plane-jwt-token`).
+    /// Exclusive with `--control-plane-jwt-token` and `CONTROL_PLANE_JWT_TOKEN`.
+    #[arg(long)]
+    control_plane_jwt_token_file: Option<Utf8PathBuf>,
+
     #[arg(long)]
     peer_jwt_token: Option<String>,
 
@@ -264,18 +280,60 @@ impl Secrets {
     const PEER_JWT_TOKEN_ENV: &'static str = "PEER_JWT_TOKEN";
     const PUBLIC_KEY_ENV: &'static str = "PUBLIC_KEY";
 
+    /// [`Self::load_with_vars`] with the process environment.
+    fn load(args: &Cli) -> anyhow::Result<Self> {
+        Self::load_with_vars(args, &|name| std::env::var(name))
+    }
+
+    /// [`Self::load_with_vars`] with an environment that has only UTF-8 values (`None` is
+    /// an unset variable).
+    #[cfg(test)]
+    fn load_with_env(args: &Cli, env: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
+        Self::load_with_vars(args, &|name| {
+            env(name).ok_or(std::env::VarError::NotPresent)
+        })
+    }
+
     /// Load secrets from, in order of preference:
-    /// - CLI args if database URL is provided on the CLI
-    /// - Environment variables if DATABASE_URL is set.
-    async fn load(args: &Cli) -> anyhow::Result<Self> {
-        let Some(database_url) = Self::load_secret(&args.database_url, Self::DATABASE_URL_ENV)
-        else {
+    /// - a token file flag (`--*-jwt-token-file`), exclusive with its flag and with its
+    ///   variable when that is present at all (empty or not UTF-8 included)
+    /// - CLI args
+    /// - environment variables, read through `vars` (a non-UTF-8 value reads as unset).
+    fn load_with_vars(
+        args: &Cli,
+        vars: &dyn Fn(&str) -> Result<String, std::env::VarError>,
+    ) -> anyhow::Result<Self> {
+        let env = |name: &str| vars(name).ok();
+        let load_secret = |cli: &Option<String>, env_name: &str| -> Option<String> {
+            cli.clone().or_else(|| env(env_name))
+        };
+        let load_token = |file: &Option<Utf8PathBuf>,
+                          file_flag: &str,
+                          cli: &Option<String>,
+                          cli_flag: &str,
+                          env_name: &str|
+         -> anyhow::Result<Option<String>> {
+            let Some(file) = file else {
+                return Ok(load_secret(cli, env_name));
+            };
+            if cli.is_some() {
+                anyhow::bail!("{file_flag} and {cli_flag} are exclusive: give only one");
+            }
+            if !matches!(vars(env_name), Err(std::env::VarError::NotPresent)) {
+                anyhow::bail!(
+                    "{file_flag} is given and {env_name} is set in the environment: give only one"
+                );
+            }
+            utils::secret_file::read_secret_file(file, file_flag).map(Some)
+        };
+
+        let Some(database_url) = load_secret(&args.database_url, Self::DATABASE_URL_ENV) else {
             anyhow::bail!(
                 "Database URL is not set (set `--database-url`, or `DATABASE_URL` environment)"
             )
         };
 
-        let public_key = match Self::load_secret(&args.public_key, Self::PUBLIC_KEY_ENV) {
+        let public_key = match load_secret(&args.public_key, Self::PUBLIC_KEY_ENV) {
             Some(v) => Some(JwtAuth::from_key(v).context("Loading public key")?),
             None => None,
         };
@@ -283,30 +341,31 @@ impl Secrets {
         let this = Self {
             database_url,
             public_key,
-            pageserver_jwt_token: Self::load_secret(
+            pageserver_jwt_token: load_token(
+                &args.pageserver_jwt_token_file,
+                "--pageserver-jwt-token-file",
                 &args.jwt_token,
+                "--jwt-token",
                 Self::PAGESERVER_JWT_TOKEN_ENV,
-            ),
-            safekeeper_jwt_token: Self::load_secret(
+            )?,
+            safekeeper_jwt_token: load_token(
+                &args.safekeeper_jwt_token_file,
+                "--safekeeper-jwt-token-file",
                 &args.safekeeper_jwt_token,
+                "--safekeeper-jwt-token",
                 Self::SAFEKEEPER_JWT_TOKEN_ENV,
-            ),
-            control_plane_jwt_token: Self::load_secret(
+            )?,
+            control_plane_jwt_token: load_token(
+                &args.control_plane_jwt_token_file,
+                "--control-plane-jwt-token-file",
                 &args.control_plane_jwt_token,
+                "--control-plane-jwt-token",
                 Self::CONTROL_PLANE_JWT_TOKEN_ENV,
-            ),
-            peer_jwt_token: Self::load_secret(&args.peer_jwt_token, Self::PEER_JWT_TOKEN_ENV),
+            )?,
+            peer_jwt_token: load_secret(&args.peer_jwt_token, Self::PEER_JWT_TOKEN_ENV),
         };
 
         Ok(this)
-    }
-
-    fn load_secret(cli: &Option<String>, env_name: &str) -> Option<String> {
-        if let Some(v) = cli {
-            Some(v.clone())
-        } else {
-            std::env::var(env_name).ok()
-        }
     }
 }
 
@@ -368,7 +427,7 @@ async fn async_main() -> anyhow::Result<()> {
         StrictMode::Strict
     };
 
-    let secrets = Secrets::load(&args).await?;
+    let secrets = Secrets::load(&args)?;
 
     // Validate required secrets and arguments are provided in strict mode
     match strict_mode {
@@ -641,4 +700,130 @@ async fn async_main() -> anyhow::Result<()> {
     tracing::info!("Service shutdown complete");
 
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod main_secret_file_tests;
+
+#[cfg(test)]
+mod secret_file_edges {
+    use clap::Parser;
+
+    use super::{Cli, Secrets};
+
+    /// The token files leave the other secrets (the database URL, the peer token, the public
+    /// key) and the tokens without a file to their flags and variables, as before.
+    #[test]
+    fn the_other_secrets_are_untouched() {
+        let dir = camino_tempfile::tempdir().unwrap();
+        let file = dir.path().join("t.jwt");
+        std::fs::write(&file, "filetoken\n").unwrap();
+        let args = Cli::try_parse_from([
+            "storage_controller".to_string(),
+            "--listen=127.0.0.1:1234".to_string(),
+            format!("--pageserver-jwt-token-file={file}"),
+            format!("--safekeeper-jwt-token-file={file}"),
+        ])
+        .unwrap();
+        let env = |name: &str| match name {
+            "DATABASE_URL" => Some("postgresql://x@127.0.0.1:1/db".to_string()),
+            "PEER_JWT_TOKEN" => Some("peer".to_string()),
+            "CONTROL_PLANE_JWT_TOKEN" => Some("cp".to_string()),
+            _ => None,
+        };
+        let s = Secrets::load_with_env(&args, &env).unwrap();
+        assert_eq!(s.database_url, "postgresql://x@127.0.0.1:1/db");
+        assert_eq!(s.peer_jwt_token.as_deref(), Some("peer"));
+        assert_eq!(s.control_plane_jwt_token.as_deref(), Some("cp"));
+        assert_eq!(s.pageserver_jwt_token.as_deref(), Some("filetoken"));
+        assert_eq!(s.safekeeper_jwt_token.as_deref(), Some("filetoken"));
+        assert!(s.public_key.is_none());
+    }
+
+    /// A token variable that is set but not UTF-8 is present: beside its file flag it is a
+    /// conflict (never silently ignored), and the error doesn't echo its bytes. Without a file
+    /// it reads as unset, as before.
+    #[test]
+    fn a_non_utf8_variable_beside_its_file_is_a_conflict() {
+        use std::env::VarError;
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = camino_tempfile::tempdir().unwrap();
+        let file = dir.path().join("t.jwt");
+        std::fs::write(&file, "filetoken\n").unwrap();
+        for (file_flag, var) in [
+            ("--pageserver-jwt-token-file", "PAGESERVER_JWT_TOKEN"),
+            ("--safekeeper-jwt-token-file", "SAFEKEEPER_JWT_TOKEN"),
+            ("--control-plane-jwt-token-file", "CONTROL_PLANE_JWT_TOKEN"),
+        ] {
+            let vars = move |name: &str| {
+                if name == var {
+                    let mut raw = b"EnvNeedle".to_vec();
+                    raw.push(0xff);
+                    Err(VarError::NotUnicode(std::ffi::OsString::from_vec(raw)))
+                } else {
+                    Err(VarError::NotPresent)
+                }
+            };
+            let args = Cli::try_parse_from([
+                "storage_controller".to_string(),
+                "--listen=127.0.0.1:1234".to_string(),
+                "--database-url=postgresql://x@127.0.0.1:1/db".to_string(),
+                format!("{file_flag}={file}"),
+            ])
+            .unwrap();
+            let e = Secrets::load_with_vars(&args, &vars)
+                .err()
+                .unwrap_or_else(|| panic!("{file_flag} beside a non-UTF-8 {var} is refused"));
+            let text = format!("{e} | {e:#} | {e:?}");
+            assert!(text.contains(file_flag) && text.contains(var), "{text}");
+            assert!(
+                !text.contains("EnvNeedle") && !text.contains("filetoken"),
+                "{text}"
+            );
+
+            let args = Cli::try_parse_from([
+                "storage_controller",
+                "--listen=127.0.0.1:1234",
+                "--database-url=postgresql://x@127.0.0.1:1/db",
+            ])
+            .unwrap();
+            let s = Secrets::load_with_vars(&args, &vars).unwrap();
+            assert!(
+                s.pageserver_jwt_token.is_none()
+                    && s.safekeeper_jwt_token.is_none()
+                    && s.control_plane_jwt_token.is_none(),
+                "{var}"
+            );
+        }
+    }
+
+    /// The flag-and-file error names both flags and never the flag's value.
+    #[test]
+    fn the_conflict_names_both_flags() {
+        let dir = camino_tempfile::tempdir().unwrap();
+        let file = dir.path().join("t.jwt");
+        std::fs::write(&file, "filetoken\n").unwrap();
+        let args = Cli::try_parse_from([
+            "storage_controller".to_string(),
+            "--listen=127.0.0.1:1234".to_string(),
+            "--database-url=postgresql://x@127.0.0.1:1/db".to_string(),
+            format!("--control-plane-jwt-token-file={file}"),
+            "--control-plane-jwt-token=FlagNeedle".to_string(),
+        ])
+        .unwrap();
+        let e = Secrets::load_with_env(&args, &|_| None)
+            .err()
+            .expect("the file and the flag together are refused");
+        let text = format!("{e:#}");
+        assert!(
+            text.contains("--control-plane-jwt-token-file")
+                && text.contains("--control-plane-jwt-token "),
+            "{text}"
+        );
+        assert!(
+            !text.contains("FlagNeedle") && !text.contains("filetoken"),
+            "{text}"
+        );
+    }
 }

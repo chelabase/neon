@@ -86,6 +86,14 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Read before the chdir to the workdir, so a relative path means what it says.
+    let safekeeper_token = safekeeper_auth_token(
+        arg_matches
+            .get_one::<String>("auth-token-file")
+            .map(Utf8Path::new),
+        var("NEON_AUTH_TOKEN"),
+    )?;
+
     // Initialize up failpoints support
     let scenario = failpoint_support::init();
 
@@ -221,7 +229,8 @@ fn main() -> anyhow::Result<()> {
     tracing::info!("Initializing page_cache...");
     page_cache::init(conf.page_cache_size);
 
-    start_pageserver(launch_ts, conf, ignored, otel_guard).context("Failed to start pageserver")?;
+    start_pageserver(launch_ts, conf, ignored, otel_guard, safekeeper_token)
+        .context("Failed to start pageserver")?;
 
     scenario.teardown();
     Ok(())
@@ -342,6 +351,7 @@ fn start_pageserver(
     conf: &'static PageServerConf,
     ignored: ignored_fields::Paths,
     otel_guard: Option<OtelGuard>,
+    safekeeper_token: Option<String>,
 ) -> anyhow::Result<()> {
     // Monotonic time for later calculating startup duration
     let started_startup_at = Instant::now();
@@ -509,19 +519,16 @@ fn start_pageserver(
         None
     };
 
-    match var("NEON_AUTH_TOKEN") {
-        Ok(v) => {
+    match safekeeper_token {
+        Some(v) => {
             info!("Loaded JWT token for authentication with Safekeeper");
             pageserver::config::SAFEKEEPER_AUTH_TOKEN
                 .set(Arc::new(v))
                 .map_err(|_| anyhow!("Could not initialize SAFEKEEPER_AUTH_TOKEN"))?;
         }
-        Err(VarError::NotPresent) => {
+        None => {
             info!("No JWT token for authentication with Safekeeper detected");
         }
-        Err(e) => return Err(e).with_context(
-            || "Failed to either load to detect non-present NEON_AUTH_TOKEN environment variable",
-        ),
     };
 
     // Top-level cancellation token for the process
@@ -937,6 +944,32 @@ async fn create_remote_storage_client(
     Ok(remote_storage)
 }
 
+/// The JWT the pageserver presents to the safekeepers: the content of `--auth-token-file`
+/// (`token_file`, read by [`utils::secret_file::read_secret_file`]) when it's given, else
+/// `NEON_AUTH_TOKEN` (`env`) as before. The file together with a present variable (empty
+/// or not UTF-8 included) is an error. No error contains a token.
+fn safekeeper_auth_token(
+    token_file: Option<&Utf8Path>,
+    env: Result<String, VarError>,
+) -> anyhow::Result<Option<String>> {
+    const FLAG: &str = "--auth-token-file";
+    match (token_file, env) {
+        (Some(_), Ok(_) | Err(VarError::NotUnicode(_))) => {
+            anyhow::bail!(
+                "{FLAG} is given and NEON_AUTH_TOKEN is set in the environment: give only one"
+            )
+        }
+        (Some(file), Err(VarError::NotPresent)) => {
+            utils::secret_file::read_secret_file(file, FLAG).map(Some)
+        }
+        (None, Ok(v)) => Ok(Some(v)),
+        (None, Err(VarError::NotPresent)) => Ok(None),
+        (None, Err(VarError::NotUnicode(_))) => {
+            anyhow::bail!("NEON_AUTH_TOKEN in the environment is not UTF-8")
+        }
+    }
+}
+
 fn cli() -> Command {
     Command::new("Neon page server")
         .about("Materializes WAL stream to pages and serves them to the postgres")
@@ -946,6 +979,11 @@ fn cli() -> Command {
                 .short('D')
                 .long("workdir")
                 .help("Working directory for the pageserver"),
+        )
+        .arg(
+            Arg::new("auth-token-file")
+                .long("auth-token-file")
+                .help("File with the safekeepers' JWT (exclusive with NEON_AUTH_TOKEN)"),
         )
         .arg(
             Arg::new("enabled-features")
@@ -958,4 +996,25 @@ fn cli() -> Command {
 #[test]
 fn verify_cli() {
     cli().debug_assert();
+}
+
+#[cfg(test)]
+#[path = "pageserver/auth_token_file_tests.rs"]
+mod auth_token_file_tests;
+
+/// A non-UTF-8 `NEON_AUTH_TOKEN` is refused without echoing its bytes (a `VarError`'s
+/// `Display` would print them).
+#[test]
+fn a_non_utf8_neon_auth_token_is_not_echoed() {
+    use std::os::unix::ffi::OsStringExt;
+    let mut raw = b"EnvTokenNeedle".to_vec();
+    raw.push(0xff);
+    let e = safekeeper_auth_token(
+        None,
+        Err(VarError::NotUnicode(std::ffi::OsString::from_vec(raw))),
+    )
+    .unwrap_err();
+    let text = format!("{e} | {e:#} | {e:?}");
+    assert!(text.contains("NEON_AUTH_TOKEN"), "{text}");
+    assert!(!text.contains("EnvTokenNeedle"), "{text}");
 }
