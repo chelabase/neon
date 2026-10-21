@@ -107,12 +107,20 @@ for pg_version in ${TEST_VERSION_ONLY-14 15 16 17}; do
         # Tests listed in the RUN_FIRST variable will be run before others.
         # If parallelization is not used, this environment variable will be ignored.
 
-        docker compose exec -e USE_PGXS=1 -e SKIP=timescaledb-src,rdkit-src,pg_jsonschema-src,kq_imcx-src,wal2json_2_5-src,rag_jina_reranker_v1_tiny_en-src,rag_bge_small_en_v15-src \
+        # ONLY=<dir,...> (set by chelabase-ext-test.sh --only) restricts the /ext-src suite to those
+        # directories and skips the contrib suite.
+        ONLY_ARGS=()
+        [[ -n "${ONLY:-}" ]] && ONLY_ARGS=(-e "ONLY=${ONLY}")
+        docker compose exec -e USE_PGXS=1 -e SKIP=pg_jsonschema-src,rdkit-src,timescaledb-src "${ONLY_ARGS[@]}" \
         -e RUN_FIRST=hll-src,postgis-src,pgtap-src -e PARALLEL_COMPUTES="${PARALLEL_COMPUTES}" \
         neon-test-extensions /run-tests.sh /ext-src | tee testout.txt && EXT_SUCCESS=1 || EXT_SUCCESS=0
-        docker compose exec -e SKIP=start-scripts,postgres_fdw,ltree_plpython,jsonb_plpython,jsonb_plperl,hstore_plpython,hstore_plperl,dblink,bool_plperl \
-        -e PARALLEL_COMPUTES="${PARALLEL_COMPUTES}" \
-        neon-test-extensions /run-tests.sh /postgres/contrib | tee testout_contrib.txt && CONTRIB_SUCCESS=1 || CONTRIB_SUCCESS=0
+        if [[ -n "${ONLY:-}" ]]; then
+            CONTRIB_SUCCESS=1
+        else
+            docker compose exec -e SKIP=start-scripts,postgres_fdw,ltree_plpython,jsonb_plpython,jsonb_plperl,hstore_plpython,hstore_plperl,dblink,bool_plperl \
+            -e PARALLEL_COMPUTES="${PARALLEL_COMPUTES}" \
+            neon-test-extensions /run-tests.sh /postgres/contrib | tee testout_contrib.txt && CONTRIB_SUCCESS=1 || CONTRIB_SUCCESS=0
+        fi
         if [[ ${EXT_SUCCESS} -eq 0 || ${CONTRIB_SUCCESS} -eq 0 ]]; then
             CONTRIB_FAILED=
             FAILED=

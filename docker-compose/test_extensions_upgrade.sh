@@ -80,7 +80,6 @@ EXTENSIONS='[
 {"extname": "roaringbitmap", "extdir": "pg_roaringbitmap-src"},
 {"extname": "semver", "extdir": "pg_semver-src"},
 {"extname": "pg_ivm", "extdir": "pg_ivm-src"},
-{"extname": "pgjwt", "extdir": "pgjwt-src"},
 {"extname": "pgtap", "extdir": "pgtap-src"},
 {"extname": "pg_repack", "extdir": "pg_repack-src"},
 {"extname": "h3", "extdir": "h3-pg-src"}

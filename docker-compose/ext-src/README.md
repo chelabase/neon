@@ -29,18 +29,13 @@ This directory includes the following extensions:
 - `pg_roaringbitmap-src` - Roaring bitmap implementation
 - `pg_semver-src` - Semantic version data type
 - `pg_session_jwt-src` - JWT authentication for PostgreSQL
-- `pg_tiktoken-src` - OpenAI Tiktoken tokenizer
 - `pg_uuidv7-src` - UUIDv7 implementation for PostgreSQL
-- `pgjwt-src` - JWT tokens for PostgreSQL
-- `pgrag-src` - Retrieval Augmented Generation for PostgreSQL
 - `pgtap-src` - Unit testing framework for PostgreSQL
 - `pgvector-src` - Vector similarity search
 - `pgx_ulid-src` - ULID data type
 - `plv8-src` - JavaScript language for PostgreSQL stored procedures
 - `postgresql-unit-src` - SI units for PostgreSQL
 - `prefix-src` - Prefix matching for strings
-- `rag_bge_small_en_v15-src` - BGE embedding model for RAG
-- `rag_jina_reranker_v1_tiny_en-src` - Jina reranker model for RAG
 - `rum-src` - RUM access method for text search
 
 ## Usage

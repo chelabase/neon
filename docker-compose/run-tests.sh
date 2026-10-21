@@ -45,6 +45,19 @@ FAILED=
 export FAILED_FILE=/tmp/failed
 rm -f ${FAILED_FILE}
 mapfile -t LIST < <( (echo -e "${SKIP//","/"\n"}"; ls) | sort | uniq -u)
+# ONLY=<dir,...> restricts the run to those directories. An entry runs even if SKIP lists it;
+# an entry that is not a directory is an error and nothing runs.
+if [[ -n ${ONLY:-} ]]; then
+  LIST=()
+  IFS=',' read -r -a ONLY_LIST <<< "${ONLY}"
+  for d in "${ONLY_LIST[@]}"; do
+    if [[ -z ${d} || ${d} == */* || ! -d ${d} ]]; then
+      echo "ONLY: '${d}' is not a directory of ${extdir}" >&2
+      exit 2
+    fi
+    LIST+=("${d}")
+  done
+fi
 if [[ ${PARALLEL_COMPUTES} -gt 1 ]]; then
   # Avoid errors if RUN_FIRST is not defined
   RUN_FIRST=${RUN_FIRST:-}

@@ -534,28 +534,6 @@ RUN make -j $(getconf _NPROCESSORS_ONLN) OPTFLAGS="" && \
 
 #########################################################################################
 #
-# Layer "pgjwt-build"
-# compile pgjwt extension
-#
-#########################################################################################
-FROM build-deps AS pgjwt-src
-ARG PG_VERSION
-
-# not version-specific
-# doesn't use releases, last commit f3d82fd - Mar 2, 2023
-WORKDIR /ext-src
-RUN wget https://github.com/michelp/pgjwt/archive/f3d82fd30151e754e19ce5d6a06c71c20689ce3d.tar.gz -O pgjwt.tar.gz && \
-    echo "dae8ed99eebb7593b43013f6532d772b12dfecd55548d2673f2dfd0163f6d2b9 pgjwt.tar.gz" | sha256sum --check && \
-    mkdir pgjwt-src && cd pgjwt-src && tar xzf ../pgjwt.tar.gz --strip-components=1 -C .
-
-FROM pg-build AS pgjwt-build
-COPY --from=pgjwt-src /ext-src/ /ext-src/
-WORKDIR /ext-src/pgjwt-src
-RUN make -j $(getconf _NPROCESSORS_ONLN) install && \
-    echo 'trusted = true' >> /usr/local/pgsql/share/extension/pgjwt.control
-
-#########################################################################################
-#
 # Layer "hypopg-build"
 # compile hypopg extension
 #
@@ -1140,66 +1118,6 @@ USER root
 
 #########################################################################################
 #
-# Layers "pg-onnx-build" and "pgrag-build"
-# Compile "pgrag" extensions
-#
-#########################################################################################
-
-FROM build-deps AS pgrag-src
-ARG PG_VERSION
-WORKDIR /ext-src
-COPY compute/patches/onnxruntime.patch .
-
-RUN wget https://github.com/microsoft/onnxruntime/archive/refs/tags/v1.18.1.tar.gz -O onnxruntime.tar.gz && \
-    mkdir onnxruntime-src && cd onnxruntime-src && tar xzf ../onnxruntime.tar.gz --strip-components=1 -C . && \
-    patch -p1 < /ext-src/onnxruntime.patch && \
-    echo "#nothing to test here" > neon-test.sh
-
-RUN wget https://github.com/neondatabase-labs/pgrag/archive/refs/tags/v0.1.2.tar.gz -O pgrag.tar.gz &&  \
-    echo "7361654ea24f08cbb9db13c2ee1c0fe008f6114076401bb871619690dafc5225 pgrag.tar.gz" | sha256sum --check && \
-    mkdir pgrag-src && cd pgrag-src && tar xzf ../pgrag.tar.gz --strip-components=1 -C .
-
-FROM rust-extensions-build-pgrx14 AS pgrag-build
-COPY --from=pgrag-src /ext-src/ /ext-src/
-
-# Install build-time dependencies
-# cmake 3.26 or higher is required, so installing it using pip (bullseye-backports has cmake 3.25).
-# Install it using virtual environment, because Python 3.11 (the default version on Debian 12 (Bookworm)) complains otherwise
-WORKDIR /ext-src/onnxruntime-src
-RUN apt update && apt install --no-install-recommends --no-install-suggests -y \
-    python3 python3-pip python3-venv && \
-    apt clean && rm -rf /var/lib/apt/lists/* && \
-    python3 -m venv venv && \
-    . venv/bin/activate && \
-    python3 -m pip install cmake==3.30.5
-
-RUN . venv/bin/activate && \
-    ./build.sh --config Release --parallel --cmake_generator Ninja \
-    --skip_submodule_sync --skip_tests --allow_running_as_root
-
-WORKDIR /ext-src/pgrag-src
-RUN cd exts/rag && \
-    sed -i 's/pgrx = "0.14.1"/pgrx = { version = "0.14.1", features = [ "unsafe-postgres" ] }/g' Cargo.toml && \
-    cargo pgrx install --release && \
-    echo "trusted = true" >> /usr/local/pgsql/share/extension/rag.control
-
-RUN cd exts/rag_bge_small_en_v15 && \
-    sed -i 's/pgrx = "0.14.1"/pgrx = { version = "0.14.1", features = [ "unsafe-postgres" ] }/g' Cargo.toml && \
-    ORT_LIB_LOCATION=/ext-src/onnxruntime-src/build/Linux \
-        REMOTE_ONNX_URL=http://pg-ext-s3-gateway.pg-ext-s3-gateway.svc.cluster.local/pgrag-data/bge_small_en_v15.onnx \
-        cargo pgrx install --release --features remote_onnx && \
-    echo "trusted = true" >> /usr/local/pgsql/share/extension/rag_bge_small_en_v15.control
-
-RUN cd exts/rag_jina_reranker_v1_tiny_en && \
-    sed -i 's/pgrx = "0.14.1"/pgrx = { version = "0.14.1", features = [ "unsafe-postgres" ] }/g' Cargo.toml && \
-    ORT_LIB_LOCATION=/ext-src/onnxruntime-src/build/Linux \
-        REMOTE_ONNX_URL=http://pg-ext-s3-gateway.pg-ext-s3-gateway.svc.cluster.local/pgrag-data/jina_reranker_v1_tiny_en.onnx \
-        cargo pgrx install --release --features remote_onnx && \
-    echo "trusted = true" >> /usr/local/pgsql/share/extension/rag_jina_reranker_v1_tiny_en.control
-
-
-#########################################################################################
-#
 # Layer "pg_jsonschema-build"
 # Compile "pg_jsonschema" extension
 #
@@ -1255,63 +1173,6 @@ RUN cargo pgrx install --release && \
     # it's needed to enable extension because it uses untrusted C language
     sed -i 's/superuser = false/superuser = true/g' /usr/local/pgsql/share/extension/pg_graphql.control && \
     echo "trusted = true" >> /usr/local/pgsql/share/extension/pg_graphql.control
-
-#########################################################################################
-#
-# Layer "pg_tiktoken-build"
-# Compile "pg_tiktoken" extension
-#
-#########################################################################################
-
-FROM build-deps AS pg_tiktoken-src
-ARG PG_VERSION
-
-# doesn't use releases
-# 9118dd4549b7d8c0bbc98e04322499f7bf2fa6f7 - on Oct 29, 2024
-WORKDIR /ext-src
-RUN wget https://github.com/kelvich/pg_tiktoken/archive/9118dd4549b7d8c0bbc98e04322499f7bf2fa6f7.tar.gz -O pg_tiktoken.tar.gz && \
-    echo "a5bc447e7920ee149d3c064b8b9f0086c0e83939499753178f7d35788416f628 pg_tiktoken.tar.gz" | sha256sum --check && \
-    mkdir pg_tiktoken-src && cd pg_tiktoken-src && tar xzf ../pg_tiktoken.tar.gz --strip-components=1 -C . && \
-    sed -i 's/pgrx = { version = "=0.12.6",/pgrx = { version = "0.12.9",/g' Cargo.toml && \
-    sed -i 's/pgrx-tests = "=0.12.6"/pgrx-tests = "0.12.9"/g' Cargo.toml
-
-FROM rust-extensions-build-pgrx12 AS pg_tiktoken-build
-COPY --from=pg_tiktoken-src /ext-src/ /ext-src/
-WORKDIR /ext-src/pg_tiktoken-src
-RUN cargo pgrx install --release && \
-    echo "trusted = true" >> /usr/local/pgsql/share/extension/pg_tiktoken.control
-
-#########################################################################################
-#
-# Layer "pgx_ulid-build"
-# Compile "pgx_ulid" extension for v16 and below
-#
-#########################################################################################
-
-FROM build-deps AS pgx_ulid-src
-ARG PG_VERSION
-
-WORKDIR /ext-src
-RUN case "${PG_VERSION:?}" in \
-    "v14" | "v15" | "v16") \
-        ;; \
-    *) \
-        echo "skipping the version of pgx_ulid for $PG_VERSION" && exit 0 \
-        ;; \
-    esac && \
-    wget https://github.com/pksunkara/pgx_ulid/archive/refs/tags/v0.1.5.tar.gz -O pgx_ulid.tar.gz && \
-    echo "9d1659a2da65af0133d5451c454de31b37364e3502087dadf579f790bc8bef17  pgx_ulid.tar.gz" | sha256sum --check && \
-    mkdir pgx_ulid-src && cd pgx_ulid-src && tar xzf ../pgx_ulid.tar.gz --strip-components=1 -C . && \
-    sed -i 's/pgrx       = "^0.11.2"/pgrx = { version = "=0.11.3", features = [ "unsafe-postgres" ] }/g' Cargo.toml
-
-FROM rust-extensions-build AS pgx_ulid-build
-COPY --from=pgx_ulid-src /ext-src/ /ext-src/
-WORKDIR /ext-src/
-RUN if [ -d pgx_ulid-src ]; then \
-        cd pgx_ulid-src && \
-        cargo pgrx install --release && \
-        echo 'trusted = true' >> /usr/local/pgsql/share/extension/ulid.control; \
-    fi
 
 #########################################################################################
 #
@@ -1479,30 +1340,6 @@ RUN make -j $(getconf _NPROCESSORS_ONLN) && \
 
 #########################################################################################
 #
-# Layer "pg_mooncake"
-# compile pg_mooncake extension
-#
-#########################################################################################
-FROM build-deps AS pg_mooncake-src
-ARG PG_VERSION
-WORKDIR /ext-src
-COPY compute/patches/duckdb_v113.patch .
-RUN wget https://github.com/Mooncake-Labs/pg_mooncake/releases/download/v0.1.2/pg_mooncake-0.1.2.tar.gz -O pg_mooncake.tar.gz && \
-    echo "4550473784fcdd2e1e18062bc01eb9c286abd27cdf5e11a4399be6c0a426ba90 pg_mooncake.tar.gz" | sha256sum --check && \
-    mkdir pg_mooncake-src && cd pg_mooncake-src && tar xzf ../pg_mooncake.tar.gz --strip-components=1 -C . && \
-    cd third_party/duckdb && patch -p1 < /ext-src/duckdb_v113.patch && cd ../.. && \
-    echo "make -f pg_mooncake-src/Makefile.build installcheck TEST_DIR=./test SQL_DIR=./sql SRC_DIR=./src" > neon-test.sh && \
-    chmod a+x neon-test.sh
-
-FROM rust-extensions-build AS pg_mooncake-build
-COPY --from=pg_mooncake-src /ext-src/ /ext-src/
-WORKDIR /ext-src/pg_mooncake-src
-RUN make release -j $(getconf _NPROCESSORS_ONLN) && \
-    make install -j $(getconf _NPROCESSORS_ONLN) && \
-    echo 'trusted = true' >> /usr/local/pgsql/share/extension/pg_mooncake.control
-
-#########################################################################################
-#
 # Layer "pg-duckdb-pg-build"
 # compile pg_duckdb extension
 #
@@ -1652,7 +1489,6 @@ RUN mkdir /usr/local/pgsql
 #########################################################################################
 FROM build-deps AS extensions-minimal
 
-COPY --from=pgrag-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=timescaledb-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pg_cron-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pg_partman-build /usr/local/pgsql/ /usr/local/pgsql/
@@ -1674,11 +1510,8 @@ COPY --from=h3-pg-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=h3-pg-build /h3/usr /
 COPY --from=postgresql-unit-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pgvector-build /usr/local/pgsql/ /usr/local/pgsql/
-COPY --from=pgjwt-build /usr/local/pgsql/ /usr/local/pgsql/
-COPY --from=pgrag-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pg_jsonschema-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pg_graphql-build /usr/local/pgsql/ /usr/local/pgsql/
-COPY --from=pg_tiktoken-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=hypopg-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=online_advisor-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pg_hashids-build /usr/local/pgsql/ /usr/local/pgsql/
@@ -1691,7 +1524,6 @@ COPY --from=plpgsql_check-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=timescaledb-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pg_hint_plan-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pg_cron-build /usr/local/pgsql/ /usr/local/pgsql/
-COPY --from=pgx_ulid-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pgx_ulid-pgrx12-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pg_session_jwt-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=rdkit-build /usr/local/pgsql/ /usr/local/pgsql/
@@ -1702,7 +1534,6 @@ COPY --from=wal2json-build /usr/local/pgsql /usr/local/pgsql
 COPY --from=pg-anon-pg-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pg_ivm-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pg_partman-build /usr/local/pgsql/ /usr/local/pgsql/
-COPY --from=pg_mooncake-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pg_duckdb-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pg_repack-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY --from=pgaudit-build /usr/local/pgsql/ /usr/local/pgsql/
@@ -1866,11 +1697,8 @@ COPY --from=plv8-src /ext-src/ /ext-src/
 COPY --from=h3-pg-src /ext-src/h3-pg-src /ext-src/h3-pg-src
 COPY --from=postgresql-unit-src /ext-src/ /ext-src/
 COPY --from=pgvector-src /ext-src/ /ext-src/
-COPY --from=pgjwt-src /ext-src/ /ext-src/
-#COPY --from=pgrag-src /ext-src/ /ext-src/
 #COPY --from=pg_jsonschema-src /ext-src/ /ext-src/
 COPY --from=pg_graphql-src /ext-src/ /ext-src/
-#COPY --from=pg_tiktoken-src /ext-src/ /ext-src/
 COPY --from=hypopg-src /ext-src/ /ext-src/
 COPY --from=online_advisor-src /ext-src/ /ext-src/
 COPY --from=pg_hashids-src /ext-src/ /ext-src/
@@ -1885,7 +1713,6 @@ COPY --from=pg_hint_plan-src /ext-src/ /ext-src/
 COPY compute/patches/pg_hint_plan_${PG_VERSION:?}.patch /ext-src
 RUN cd /ext-src/pg_hint_plan-src && patch -p1 < /ext-src/pg_hint_plan_${PG_VERSION:?}.patch
 COPY --from=pg_cron-src /ext-src/ /ext-src/
-#COPY --from=pgx_ulid-src /ext-src/ /ext-src/
 #COPY --from=pgx_ulid-pgrx12-src /ext-src/ /ext-src/
 #COPY --from=pg_session_jwt-src /ext-src/ /ext-src/
 #COPY --from=rdkit-src /ext-src/ /ext-src/
@@ -1895,7 +1722,6 @@ COPY --from=pg_semver-src /ext-src/ /ext-src/
 #COPY --from=wal2json-src /ext-src/ /ext-src/
 COPY --from=pg_ivm-src /ext-src/ /ext-src/
 COPY --from=pg_partman-src /ext-src/ /ext-src/
-#COPY --from=pg_mooncake-src /ext-src/ /ext-src/
 COPY --from=pg_repack-src /ext-src/ /ext-src/
 COPY --from=pg_repack-build /usr/local/pgsql/ /usr/local/pgsql/
 COPY compute/patches/pg_repack.patch /ext-src
