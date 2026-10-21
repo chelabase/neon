@@ -9,8 +9,10 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import TYPE_CHECKING
 
+import jwt
 import requests
 from fixtures.log_helper import log
+from jwcrypto import jwk
 from typing_extensions import override
 
 if TYPE_CHECKING:
@@ -19,6 +21,26 @@ if TYPE_CHECKING:
     from fixtures.common_types import TenantId, TimelineId
     from fixtures.neon_fixtures import NeonEnv
     from fixtures.port_distributor import PortDistributor
+
+
+# compute_ctl's external server takes no request without a bearer verified by
+# the JWKS of `compute_ctl_config` (an `INSTANCE_ID` bypasses nothing), so the
+# fake control planes below serve the env's public key, and the tests sign
+# their calls with its private key.
+
+
+def compute_jwks(env: NeonEnv) -> dict[str, Any]:
+    """The JWKS holding the env's public key (as neon_local builds it)."""
+    key = jwk.JWK.from_pem(env.auth_keys.priv.encode())
+    public = key.export_public(as_dict=True)
+    public["alg"] = "EdDSA"
+    public["use"] = "sig"
+    return {"keys": [public]}
+
+
+def compute_token(env: NeonEnv, compute_id: str) -> str:
+    """A token without a scope: it opens every route of this compute only."""
+    return jwt.encode({"compute_id": compute_id}, env.auth_keys.priv, algorithm="EdDSA")
 
 
 def launch_compute_ctl(
@@ -101,6 +123,7 @@ def wait_for_compute_status(
     compute_process: subprocess.Popen[str],
     http_port: int,
     expected_status: str,
+    token: str,
     timeout_seconds: int = 10,
 ) -> None:
     """
@@ -111,7 +134,11 @@ def wait_for_compute_status(
     while time.time() - start_time < timeout_seconds:
         try:
             # Try to connect to the HTTP endpoint
-            response = requests.get(f"http://localhost:{http_port}/status", timeout=0.5)
+            response = requests.get(
+                f"http://localhost:{http_port}/status",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=0.5,
+            )
             if response.status_code == 200:
                 status_json = response.json()
                 # Check if it's in expected status
@@ -138,13 +165,15 @@ def wait_for_compute_status(
 class EmptySpecHandler(BaseHTTPRequestHandler):
     """HTTP handler that returns an Empty compute spec response"""
 
+    jwks: dict[str, Any] | None = None
+
     def do_GET(self):
         if self.path.startswith("/compute/api/v2/computes/") and self.path.endswith("/spec"):
             # Return empty status which will put compute in Empty state
             response: dict[str, Any] = {
                 "status": "empty",
                 "spec": None,
-                "compute_ctl_config": {"jwks": {"keys": []}},
+                "compute_ctl_config": {"jwks": self.jwks},
             }
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -174,6 +203,10 @@ def test_compute_terminate_empty(neon_simple_env: NeonEnv, port_distributor: Por
     internal_http_port = port_distributor.get_port()
     pg_port = port_distributor.get_port()
 
+    compute_id = "test-empty-compute"
+    token = compute_token(env, compute_id)
+    EmptySpecHandler.jwks = compute_jwks(env)
+
     # Start a simple HTTP server that will serve the Empty spec
     server = HTTPServer(("127.0.0.1", control_plane_port), EmptySpecHandler)
     server_thread = threading.Thread(target=server.serve_forever)
@@ -185,7 +218,7 @@ def test_compute_terminate_empty(neon_simple_env: NeonEnv, port_distributor: Por
         # Start compute_ctl with ephemeral tenant ID
         compute_process = launch_compute_ctl(
             env,
-            "test-empty-compute",
+            compute_id,
             external_http_port,
             internal_http_port,
             pg_port,
@@ -193,10 +226,26 @@ def test_compute_terminate_empty(neon_simple_env: NeonEnv, port_distributor: Por
         )
 
         # Wait for compute_ctl to start and report "empty" status
-        wait_for_compute_status(compute_process, external_http_port, "empty")
+        wait_for_compute_status(compute_process, external_http_port, "empty", token)
+
+        # An empty compute's external server still refuses a call without a
+        # bearer, although compute_ctl runs with an INSTANCE_ID.
+        for method, route in [("GET", "/status"), ("POST", "/terminate")]:
+            response = requests.request(
+                method, f"http://localhost:{external_http_port}{route}", timeout=10
+            )
+            assert response.status_code == 401, (
+                f"{method} {route} without a token: {response.status_code} {response.text}"
+            )
+            challenge = response.headers.get("WWW-Authenticate", "")
+            assert challenge.startswith("Bearer"), f"{route}: WWW-Authenticate {challenge!r}"
+        assert compute_process.poll() is None, "compute_ctl exited on an unauthenticated call"
 
         # Now send terminate request
-        response = requests.post(f"http://localhost:{external_http_port}/terminate")
+        response = requests.post(
+            f"http://localhost:{external_http_port}/terminate",
+            headers={"Authorization": f"Bearer {token}"},
+        )
 
         # Verify that the termination request sends back a 200 OK response and is not abruptly terminated.
         assert response.status_code == 200, (
@@ -223,6 +272,7 @@ class SwitchableConfigHandler(BaseHTTPRequestHandler):
     timeline_id: TimelineId | None = None
     pageserver_port: int | None = None
     safekeeper_connstrs: list[str] | None = None
+    jwks: dict[str, Any] | None = None
 
     def do_GET(self):
         if self.path.startswith("/compute/api/v2/computes/") and self.path.endswith("/spec"):
@@ -232,7 +282,7 @@ class SwitchableConfigHandler(BaseHTTPRequestHandler):
                     "status": "empty",
                     "spec": None,
                     "compute_ctl_config": {
-                        "jwks": {"keys": []},
+                        "jwks": self.jwks,
                     },
                 }
             else:
@@ -258,7 +308,7 @@ class SwitchableConfigHandler(BaseHTTPRequestHandler):
                         "suspend_timeout_seconds": -1,
                     },
                     "compute_ctl_config": {
-                        "jwks": {"keys": []},
+                        "jwks": self.jwks,
                     },
                 }
             self.send_response(200)
@@ -305,6 +355,7 @@ def test_compute_empty_spec_during_refresh_configuration(
     else:
         SwitchableConfigHandler.safekeeper_connstrs = []
     SwitchableConfigHandler.return_empty_spec = False  # Start with normal spec
+    SwitchableConfigHandler.jwks = compute_jwks(env)
 
     # Start HTTP server with switchable spec handler
     server = HTTPServer(("127.0.0.1", control_plane_port), SwitchableConfigHandler)
@@ -327,7 +378,13 @@ def test_compute_empty_spec_during_refresh_configuration(
         )
 
         # Wait for compute_ctl to start and report "running" status
-        wait_for_compute_status(compute_process, external_http_port, "running", timeout_seconds=30)
+        wait_for_compute_status(
+            compute_process,
+            external_http_port,
+            "running",
+            compute_token(env, endpoint_name),
+            timeout_seconds=30,
+        )
 
         log.info("Compute is running. Now returning empty spec and trigger configuration refresh.")
 
