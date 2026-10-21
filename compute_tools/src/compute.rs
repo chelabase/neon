@@ -2864,6 +2864,11 @@ LIMIT 100",
     ) -> Result<ExtVersion> {
         use tokio_postgres::NoTls;
 
+        // The checks below read the extension's scripts, which a remote
+        // extension gets from the extension server on first use (as `CREATE`
+        // and `ALTER EXTENSION` would fetch them): fetch them first.
+        self.download_remote_extension(ext_name).await?;
+
         let mut conf = self.get_tokio_conn_conf(Some("compute_ctl:install_extension"));
         conf.dbname(db_name);
 
@@ -2999,6 +3004,33 @@ LIMIT 100",
         }
 
         Ok(ext_version)
+    }
+
+    /// Downloads extension `name`'s archive when the spec lists it as a remote
+    /// extension (`download_extension` skips one this compute_ctl already
+    /// fetched); any other name, or no remote extension storage, is a no-op.
+    async fn download_remote_extension(&self, name: &str) -> Result<()> {
+        if self.params.remote_ext_base_url.is_none() {
+            return Ok(());
+        }
+        let ext = {
+            let state = self.state.lock().unwrap();
+            let Some(remote) = state
+                .pspec
+                .as_ref()
+                .and_then(|pspec| pspec.spec.remote_extensions.as_ref())
+            else {
+                return Ok(());
+            };
+            remote.get_ext(name, false, &BUILD_TAG, &self.params.pgversion)
+        };
+        let Ok((real_name, path)) = ext else {
+            return Ok(());
+        };
+        self.download_extension(real_name, path)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to download remote extension {name}: {e}"))?;
+        Ok(())
     }
 
     /// Whether `versions` is non-empty and each of them is a trusted version of
