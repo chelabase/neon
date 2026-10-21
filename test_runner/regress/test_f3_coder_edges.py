@@ -5,6 +5,10 @@ F3 coder edges beyond the RED set (fork round 4, final fix round).
   follows the link) like a FIFO itself: no hang, one WARNING naming the path.
 - K6: COMMENT ON ROLE / SECURITY LABEL ON ROLE on a managed name in another case, after
   SET ROLE from a superuser, and on a role that doesn't exist.
+- K1(b): a restart of the compute's own data directory after a clean shutdown records no
+  discarded slot copy (only a basebackup start does).
+- The fixture: `Endpoint.clear_buffers()`, with and without a cursor, leaves none of a
+  table's pages in the LFC (its 0-then-restore of the limit is asynchronous).
 """
 
 from __future__ import annotations
@@ -27,12 +31,14 @@ from fixtures.token_files import (
     replace_file,
     start_with_storage_auth,
 )
+from fixtures.pg_version import PgVersion
+from fixtures.utils import USE_LFC, run_only_on_postgres
 from psycopg2.errors import InsufficientPrivilege, UndefinedObject
 from werkzeug.wrappers.response import Response
 
 if TYPE_CHECKING:
     from fixtures.httpserver import ListenAddress
-    from fixtures.neon_fixtures import NeonEnvBuilder, VanillaPostgres
+    from fixtures.neon_fixtures import NeonEnv, NeonEnvBuilder, PgBin, VanillaPostgres
     from pytest_httpserver import HTTPServer
     from werkzeug.wrappers.request import Request
 
@@ -40,6 +46,103 @@ MARKER = "chelabase.managed_role"
 MEMBER = "cb_m_0123456789abcdef0123456789abcdef"
 # The same name in capitals, quoted: another role, still managed by its name.
 UPPER_QUOTED = '"' + MEMBER.upper() + '"'
+
+
+@run_only_on_postgres([PgVersion.V17], "the slot.c change is in the v17 fork only")
+def test_a_restart_after_a_clean_shutdown_records_no_discarded_slot(
+    neon_simple_env: NeonEnv, pg_bin: PgBin
+):
+    """
+    K1(b), audit hardening: a walsender killed after the shutdown checkpoint can leave its
+    temporary slot's directory behind under DB_SHUTDOWNED. A restart of that same data
+    directory deletes the slot but must not remove a pageserver copy it never had: only a
+    basebackup start (DB_SHUTDOWNED with checkpoint location 0) records discarded names.
+    neon.signal is removed so Postgres starts as a plain restart of its own directory.
+    """
+    endpoint = neon_simple_env.endpoints.create_start("main")
+    slot = "left_tmp"
+    with endpoint.cursor() as cur:
+        cur.execute(
+            "SELECT pg_create_logical_replication_slot(%s, 'test_decoding', true)", (slot,)
+        )
+        cur.execute("SELECT pg_read_binary_file(%s)", (f"pg_replslot/{slot}/state",))
+        row = cur.fetchone()
+        assert row is not None
+        state = bytes(row[0])
+    endpoint.stop()
+
+    pgdata = endpoint.pg_data_dir_path()
+    slot_dir = pgdata / "pg_replslot" / slot
+    slot_dir.mkdir(mode=0o700)
+    (slot_dir / "state").write_bytes(state)
+    (pgdata / "neon.signal").unlink(missing_ok=True)
+
+    log_path = pgdata.parent / "restart.log"
+    # Without safekeepers: the walproposer refuses a start that isn't the safekeepers' latest
+    # basebackup LSN (it PANICs), and nothing here needs WAL to leave the compute.
+    pg_bin.run(
+        [
+            "pg_ctl",
+            "-D",
+            str(pgdata),
+            "-l",
+            str(log_path),
+            "-o",
+            "-c neon.safekeepers=",
+            "-w",
+            "-t",
+            "60",
+            "start",
+        ]
+    )
+    try:
+        assert endpoint.safe_psql("SELECT 1") == [(1,)]
+        assert not slot_dir.exists(), "setup: the left-behind slot wasn't restored and deleted"
+    finally:
+        pg_bin.run(["pg_ctl", "-D", str(pgdata), "-m", "fast", "-w", "stop"])
+
+    text = log_path.read_text(errors="replace")
+    assert "database system was shut down" in text, "setup: not a restart after a clean shutdown"
+    assert f'discarded replication slot "{slot}"' not in text, (
+        "a restart of the compute's own data directory removed a slot copy it never had"
+    )
+
+
+@pytest.mark.skipif(not USE_LFC, reason="needs the LFC")
+def test_clear_buffers_empties_the_lfc_of_a_table(neon_simple_env: NeonEnv):
+    """Each time right after a full read of the table, so the clear races the reload."""
+    # A 1 MB LFC holds a single chunk, which the catalogs share: make room for the table.
+    endpoint = neon_simple_env.endpoints.create_start(
+        "main",
+        config_lines=[
+            "autovacuum=off",
+            "neon.max_file_cache_size=64MB",
+            "neon.file_cache_size_limit=64MB",
+        ],
+    )
+    conn = endpoint.connect()
+    conn.autocommit = True
+    cur = conn.cursor()
+    cur.execute("CREATE EXTENSION IF NOT EXISTS neon")
+    cur.execute("CREATE EXTENSION IF NOT EXISTS neon_test_utils")
+    cur.execute(
+        "CREATE TABLE lfc_t AS SELECT g, repeat('x', 200) AS pad FROM generate_series(1, 2000) g"
+    )
+
+    def cached_pages() -> int:
+        cur.execute(
+            "SELECT count(*) FROM local_cache WHERE relfilenode = pg_relation_filenode('lfc_t')"
+        )
+        row = cur.fetchone()
+        assert row is not None
+        return int(row[0])
+
+    for with_cursor in [False, True] * 5:
+        cur.execute("SELECT clear_buffer_cache()")
+        cur.execute("SELECT count(*) FROM lfc_t")
+        assert cached_pages() > 0, "setup: the read didn't fill the LFC"
+        endpoint.clear_buffers(cursor=cur if with_cursor else None)
+        assert cached_pages() == 0, f"clear_buffers(cursor={with_cursor}) left pages in the LFC"
 
 
 def test_a_symlink_to_a_fifo_is_never_opened(neon_env_builder: NeonEnvBuilder):

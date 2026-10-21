@@ -43,16 +43,23 @@ neon_download_extension_file_http(const char *filename, bool is_library)
 	int			url_len;
 
 	/*
+	 * alloc_curl_handle() may throw, so it comes first, before anything is
+	 * held.  From here to the cleanup nothing may throw: the handle, the
+	 * escaped name (malloc'd) and the header list are freed on every path.
+	 */
+	handle = alloc_curl_handle();
+
+	/*
 	 * The name is the session's (CREATE EXTENSION's name, LOAD's library):
 	 * percent-encode it so it stays one path segment, and "?", "#", "%", "&"
 	 * or "/" in it never become a query string, a fragment, an escape or
-	 * another path.  curl_easy_escape's handle argument is unused, and it
-	 * keeps only [A-Za-z0-9._~-] as they are, so an ordinary name is
-	 * unchanged.  Nothing may throw while `escaped` (malloc'd) is held.
+	 * another path.  curl_easy_escape keeps only [A-Za-z0-9._~-] as they are,
+	 * so an ordinary name is unchanged.
 	 */
-	escaped = curl_easy_escape(NULL, filename, 0);
+	escaped = curl_easy_escape(handle, filename, 0);
 	if (escaped == NULL)
 	{
+		curl_easy_cleanup(handle);
 		elog(WARNING, "neon_download_extension_file_http failed: could not escape the file name");
 		return false;
 	}
@@ -71,6 +78,7 @@ neon_download_extension_file_http(const char *filename, bool is_library)
 	if (compute_ctl_url == NULL)
 	{
 		curl_free(escaped);
+		curl_easy_cleanup(handle);
 		elog(WARNING, "neon_download_extension_file_http failed: out of memory");
 		return false;
 	}
@@ -80,15 +88,8 @@ neon_download_extension_file_http(const char *filename, bool is_library)
 #undef EXTENSION_SERVER_URL_FORMAT
 	curl_free(escaped);
 
-	elog(LOG, "Sending request to compute_ctl: %s", compute_ctl_url);
-
-	handle = alloc_curl_handle();
 	headers = neon_compute_ctl_auth_headers();
 
-	/*
-	 * Nothing between here and the cleanup can throw, so the handle and the
-	 * header list are freed on every path.
-	 */
 	curl_easy_setopt(handle, CURLOPT_CUSTOMREQUEST, "POST");
 	if (extension_server_request_timeout > 0)
 		curl_easy_setopt(handle, CURLOPT_TIMEOUT, (long)extension_server_request_timeout /* seconds */ );
@@ -103,6 +104,8 @@ neon_download_extension_file_http(const char *filename, bool is_library)
 		res = curl_easy_getinfo(handle, CURLINFO_RESPONSE_CODE, &http_code);
 	curl_easy_cleanup(handle);
 	curl_slist_free_all(headers);
+
+	elog(LOG, "Requested from compute_ctl: %s", compute_ctl_url);
 
 	/*
 	 * Don't error here because postgres will try to find the file and will

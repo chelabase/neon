@@ -5189,16 +5189,29 @@ class Endpoint(PgProtocol, LogUtils):
         It clears LFC as well by setting neon.file_cache_size_limit to 0 and then returning it to the previous value,
         if LFC is enabled
         """
+        if cursor is None:
+            # The LFC shrinks only in a backend that processes the reload while the
+            # limit is 0 (see below): one session does all of it.
+            with closing(self.connect()) as conn:
+                conn.autocommit = True
+                self.clear_buffers(cursor=conn.cursor())
+            return
+
         if cursor is not None:
             cursor.execute("select clear_buffer_cache()")
             if not USE_LFC:
+                return
+            cursor.execute(
+                "SELECT setting FROM pg_settings WHERE name = 'neon.file_cache_size_limit'"
+            )
+            res = cursor.fetchone()
+            assert res, "Cannot get neon.file_cache_size_limit"
+            if res[0] == "0":
                 return
             cursor.execute("SHOW neon.file_cache_size_limit")
             res = cursor.fetchone()
             assert res, "Cannot get neon.file_cache_size_limit"
             file_cache_size_limit = res[0]
-            if file_cache_size_limit == 0:
-                return
             cursor.execute("ALTER SYSTEM SET neon.file_cache_size_limit=0")
             cursor.execute("SELECT pg_reload_conf()")
 
@@ -5216,19 +5229,6 @@ class Endpoint(PgProtocol, LogUtils):
             wait_until(lfc_limit_is_zero)
             cursor.execute(f"ALTER SYSTEM SET neon.file_cache_size_limit='{file_cache_size_limit}'")
             cursor.execute("SELECT pg_reload_conf()")
-        else:
-            self.safe_psql("select clear_buffer_cache()")
-            if not USE_LFC:
-                return
-            file_cache_size_limit = self.safe_psql_scalar(
-                "SHOW neon.file_cache_size_limit", log_query=False
-            )
-            if file_cache_size_limit == 0:
-                return
-            self.safe_psql("ALTER SYSTEM SET neon.file_cache_size_limit=0")
-            self.safe_psql("SELECT pg_reload_conf()")
-            self.safe_psql(f"ALTER SYSTEM SET neon.file_cache_size_limit='{file_cache_size_limit}'")
-            self.safe_psql("SELECT pg_reload_conf()")
 
     def log_config_value(self, param):
         """

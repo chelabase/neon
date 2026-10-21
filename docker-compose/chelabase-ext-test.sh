@@ -71,6 +71,15 @@ while [[ $# -gt 0 ]]; do
     --only)
         shift
         need_value --only "$@"
+        # The same names run-tests.sh takes (^[A-Za-z0-9._-]+$, never `.` or `..`),
+        # checked here so a bad list fails before any build.
+        [[ "$1" =~ ^[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*$ ]] ||
+            die_usage "--only takes comma-separated directory names ([A-Za-z0-9._-]), got '$1'"
+        IFS=, read -r -a only_entries <<<"$1"
+        for entry in "${only_entries[@]}"; do
+            [[ "$entry" != . && "$entry" != .. ]] ||
+                die_usage "--only can't name '$entry'"
+        done
         only="$1"
         ;;
     --keep-images)
@@ -112,9 +121,12 @@ cleanup() {
     local rc=$?
     # The harness's own `down` doesn't run when it is interrupted or fails early: take its
     # project down (best effort) before removing the images its containers use.
+    # --remove-orphans: a parallel run's compute2..N (docker-compose-parallel.yml) aren't
+    # in docker-compose.yml.
     if $harness_started; then
         REPOSITORY="$REPOSITORY" TAG="$TAG" docker compose \
-            -f "$ROOT/docker-compose/docker-compose.yml" --profile test-extensions down || true
+            -f "$ROOT/docker-compose/docker-compose.yml" --profile test-extensions \
+            down --remove-orphans || true
     fi
     if [[ -z "$keep_tag" ]]; then
         local images=("$compute_image" "$tests_image")

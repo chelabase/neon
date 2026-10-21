@@ -547,6 +547,38 @@ case_help_mentions_storage_retag_removal() {
     [[ "$flat" =~ $re ]] || die_case "--help doesn't say chelabase-local/neon:<tag> is removed: [$OUT]"
 }
 
+# F3 round 2: the cleanup's down also removes orphans (compute2..N of
+# docker-compose-parallel.yml, which docker-compose.yml doesn't name).
+case_cleanup_down_removes_orphans() {
+    need_wrapper
+    sandbox "down-orphans"
+    run_wrapper --only hll-src
+    eq "exit status" 0 "$RC"
+    local d
+    d="$(grep -E '^docker compose .*(^| )down( |$)' "$LOG" | head -1)"
+    [[ -n "$d" ]] || die_case "no docker compose down: $(cat "$LOG")"
+    has "the down" "$d" "--remove-orphans"
+}
+
+# F3 round 2: --only entries are checked up front like run-tests.sh's ONLY (plain names,
+# never `.` or `..`): exit 2 with usage, before any build or harness run.
+case_only_refuses_odd_names_before_building() {
+    need_wrapper
+    local entry
+    for entry in "." ".." "a b-src" 'a$b-src' "alpha-src,.." "..,alpha-src" "./alpha-src" \
+        "alpha-src/" "alpha-src,,beta-src" ","; do
+        sandbox "only-odd"
+        run_wrapper --only "$entry"
+        eq "exit status for --only [$entry]" 2 "$RC"
+        [[ "$ERR" == *[Uu]sage* ]] || die_case "no usage on stderr for --only [$entry]: [$ERR]"
+        [[ ! -s "$LOG" ]] || die_case "docker or the harness ran for --only [$entry]: $(cat "$LOG")"
+    done
+    sandbox "only-plain"
+    run_wrapper --only a.b_c-1,Z9
+    eq "exit status for plain names" 0 "$RC"
+    grep -q '^HARNESS .*ONLY=a.b_c-1,Z9 ' "$LOG" || die_case "plain names not passed: $(cat "$LOG")"
+}
+
 # ---------------------------------------------------------------------------------------------
 # Removals
 
@@ -909,7 +941,8 @@ for c in \
     case_ext_src_version_scripts_exist case_ext_src_timescaledb_version case_ext_src_pg_partman_version \
     case_ext_src_pg_cron_version case_harness_compute_config case_harness_compose_has_no_minio \
     case_run_tests_only_refuses_odd_names case_run_tests_only_takes_plain_names \
-    case_cleanup_compose_down case_help_mentions_storage_retag_removal; do
+    case_cleanup_compose_down case_help_mentions_storage_retag_removal \
+    case_cleanup_down_removes_orphans case_only_refuses_odd_names_before_building; do
     run_case "$c"
 done
 
