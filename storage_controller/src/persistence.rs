@@ -11,7 +11,7 @@ use diesel::pg::Pg;
 use diesel::prelude::*;
 use diesel::serialize::{IsNull, ToSql};
 use diesel_async::async_connection_wrapper::AsyncConnectionWrapper;
-use diesel_async::pooled_connection::bb8::{Pool, PooledConnection};
+use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::pooled_connection::{AsyncDieselConnectionManager, ManagerConfig};
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use diesel_migrations::{EmbeddedMigrations, embed_migrations};
@@ -185,27 +185,21 @@ fn retry_delay(n: usize, rng: &mut impl rand::Rng) -> Duration {
     rng.random_range(Duration::ZERO..=retry_delay_cap(n))
 }
 
-/// Run `run` on a connection from `acquire`, retrying with full-jitter exponential backoff
-/// when it fails with a serialization failure. These are expected: even though our
-/// transactions don't fight for the same rows, they occasionally collide on index pages
-/// (e.g. increment_generation for unrelated shards can collide).
+/// Run `attempt` (acquire a connection, run the transaction), retrying with full-jitter
+/// exponential backoff when it fails with a serialization failure. These are expected: even
+/// though our transactions don't fight for the same rows, they occasionally collide on index
+/// pages (e.g. increment_generation for unrelated shards can collide).
 ///
-/// The connection is dropped (returned to the pool) before each backoff sleep. The number of
-/// retries a call needed is observed once per call, whatever its outcome.
-async fn retry_on_serialization_failure<C, T>(
-    acquire: impl AsyncFn() -> DatabaseResult<C>,
-    run: impl AsyncFn(&mut C) -> DatabaseResult<T>,
-) -> DatabaseResult<T> {
+/// An attempt owns its connection, so the connection is back in the pool before each backoff
+/// sleep. The number of retries a call needed is observed once per call, whatever its outcome.
+async fn retry_on_serialization_failure<T, F, Fut>(mut attempt: F) -> DatabaseResult<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = DatabaseResult<T>>,
+{
     let mut retries = 0;
     let result = loop {
-        let outcome = {
-            let mut conn = match acquire().await {
-                Ok(conn) => conn,
-                Err(e) => break Err(e),
-            };
-            run(&mut conn).await
-            // `conn` is dropped here, before any sleep.
-        };
+        let outcome = attempt().await;
         match outcome {
             Err(
                 err @ DatabaseError::Query(diesel::result::Error::DatabaseError(
@@ -361,68 +355,14 @@ impl Persistence {
             + 'a,
         R: Send + 'b,
     {
-        // The retry driver is generic over `AsyncFn`s, and a future that borrows a closure
-        // across an await is only provably `Send` for the callers when the closure is
-        // `'static` (the compiler asks for every lifetime of the borrow), but `func` borrows
-        // from its caller. So the driver gets `'static` pieces only, and `func` runs here:
-        // each attempt of the driver hands its pooled connection (type-erased) to this
-        // function, which runs the serializable transaction and hands the connection back
-        // with the outcome. The value `func` produced waits in `value`.
-        trait Lease: Send {
-            fn conn(&mut self) -> &mut AsyncPgConnection;
-        }
-
-        impl Lease for PooledConnection<'static, AsyncPgConnection> {
-            fn conn(&mut self) -> &mut AsyncPgConnection {
-                self
-            }
-        }
-
-        struct LeasedConn(Option<Box<dyn Lease>>);
-
-        struct Request {
-            lease: Box<dyn Lease>,
-            reply: tokio::sync::oneshot::Sender<(Box<dyn Lease>, DatabaseResult<()>)>,
-        }
-
-        let (requests, mut incoming) = tokio::sync::mpsc::channel::<Request>(1);
-        let pool = self.connection_pool.clone();
-        let driver = retry_on_serialization_failure(
-            async move || Ok(LeasedConn(Some(Box::new(pool.get_owned().await?)))),
-            async move |leased: &mut LeasedConn| {
-                let gone = || DatabaseError::Logical("database call abandoned".to_string());
-                let lease = leased.0.take().ok_or_else(gone)?;
-                let (reply, outcome) = tokio::sync::oneshot::channel();
-                requests
-                    .send(Request { lease, reply })
-                    .await
-                    .map_err(|_| gone())?;
-                let (lease, result) = outcome.await.map_err(|_| gone())?;
-                leased.0 = Some(lease);
-                result
-            },
-        );
-        let mut driver = std::pin::pin!(driver);
-
-        let func = &func;
-        let mut value = None;
-        let result = loop {
-            tokio::select! {
-                result = &mut driver => break result,
-                Some(Request { mut lease, reply }) = incoming.recv() => {
-                    let outcome = lease
-                        .conn()
-                        .build_transaction()
-                        .serializable()
-                        .run(async |c| func(c).await)
-                        .await
-                        .map(|v| value = Some(v));
-                    // The driver is only dropped together with this future.
-                    let _ = reply.send((lease, outcome));
-                }
-            }
-        };
-        result.map(|()| value.take().expect("a successful attempt leaves its value"))
+        retry_on_serialization_failure(|| async {
+            let mut conn = self.connection_pool.get().await?;
+            conn.build_transaction()
+                .serializable()
+                .run(async |c| func(c).await)
+                .await
+        })
+        .await
     }
 
     /// When a node is first registered, persist it before using it for anything
