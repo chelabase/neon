@@ -137,7 +137,8 @@ def test_temp_slot_aux_files_every_stale_copy_is_removed_at_start(neon_simple_en
         assert endpoint.log_contains(
             f'Remove the stored state of discarded replication slot "{slot}"'
         ), f"no log line for {slot}"
-    assert endpoint.log_contains(
-        'Remove the stored state of discarded replication slot "kept"'
-    ) is None
+    assert (
+        endpoint.log_contains('Remove the stored state of discarded replication slot "kept"')
+        is None
+    )
     assert env.pageserver.log_contains(REMOVING_MISSING) is None

@@ -83,6 +83,8 @@ exceptions = [
     { allow = ["Zlib"], name = "const_format", version = "*" },
     # hashbrown 0.17's default hasher (via lru, via aws-sdk-s3)
     { allow = ["Zlib"], name = "foldhash", version = "*" },
+    # Mozilla's CA bundle data (permissive data licence; compatible with our Apache-2.0 distribution)
+    { allow = ["CDLA-Permissive-2.0"], name = "webpki-roots", version = "*" },
 ]
 
 [licenses.private]
