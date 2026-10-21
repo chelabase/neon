@@ -137,6 +137,11 @@ pub(crate) struct StorageControllerMetricGroup {
     pub(crate) storage_controller_database_query_latency:
         measured::HistogramVec<DatabaseQueryLatencyLabelGroupSet, 5>,
 
+    /// Number of retries (serialization failures) each database call needed, observed once
+    /// per call: 0 for the calls that succeeded at the first attempt.
+    #[metric(metadata = histogram::Thresholds::with_buckets([0.0, 1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 20.0]))]
+    pub(crate) storage_controller_database_query_retries: measured::Histogram<8>,
+
     pub(crate) storage_controller_leadership_status: measured::GaugeVec<LeadershipStatusGroupSet>,
 
     /// Indicator of stucked (long-running) reconciles, broken down by tenant, shard and sequence.
