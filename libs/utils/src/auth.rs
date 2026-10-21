@@ -146,8 +146,10 @@ impl JwtAuth {
         // The default 'required_spec_claims' is 'exp'. But we don't want to require
         // expiration.
         validation.required_spec_claims = [].into();
-        // An `exp` a token carries is still checked (with the default 60 s leeway).
+        // An `exp` or `nbf` a token carries is still checked (with the default 60 s
+        // leeway): a token isn't valid after `exp` nor before `nbf`.
         validation.validate_exp = true;
+        validation.validate_nbf = true;
         Self {
             decoding_keys,
             validation,

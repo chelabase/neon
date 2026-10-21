@@ -38,7 +38,7 @@ use pageserver_client::{BlockUnblock, mgmt_api};
 use routerify::Middleware;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
-use utils::auth::{Scope, SwappableJwtAuth};
+use utils::auth::{Claims, Scope, SwappableJwtAuth};
 use utils::id::{NodeId, TenantId, TimelineId};
 
 use crate::http;
@@ -397,6 +397,8 @@ async fn handle_tenant_secondary_download(
     service: Arc<Service>,
     req: Request<Body>,
 ) -> Result<Response<Body>, ApiError> {
+    check_permissions(&req, Scope::PageServerApi)?;
+
     let tenant_id: TenantId = parse_request_param(&req, "tenant_id")?;
     let wait = parse_query_param(&req, "wait_ms")?.map(Duration::from_millis);
     maybe_rate_limit(&req, tenant_id).await;
@@ -1815,6 +1817,23 @@ fn check_permissions(request: &Request<Body>, required_scope: Scope) -> Result<(
     })
 }
 
+/// Refuses, before routing, a token whose scope no route takes
+/// (`crate::auth::check_route_scope`), so a handler that forgets its own check still
+/// can't be reached with a tenant or compute token. Runs after `auth_middleware`, which
+/// puts the token's claims in the request.
+fn route_scope_middleware<B: hyper::body::HttpBody + Send + Sync + 'static>()
+-> Middleware<B, ApiError> {
+    Middleware::pre(|req| async move {
+        if let Some(claims) = req.context::<Claims>() {
+            crate::auth::check_route_scope(&claims).map_err(|e| {
+                warn!("Authorization error: {e}");
+                ApiError::Forbidden("JWT authentication error".to_string())
+            })?;
+        }
+        Ok(req)
+    })
+}
+
 #[derive(Clone, Debug)]
 struct RequestMeta {
     method: hyper::http::Method,
@@ -2189,13 +2208,15 @@ pub fn make_router(
         .middleware(prologue_metrics_middleware())
         .middleware(epilogue_metrics_middleware());
     if auth.is_some() {
-        router = router.middleware(auth_middleware(|request| {
-            if PUBLIC_ROUTES.contains(&request.uri().path()) {
-                None
-            } else {
-                get_state(request).auth.as_deref()
-            }
-        }));
+        router = router
+            .middleware(auth_middleware(|request| {
+                if PUBLIC_ROUTES.contains(&request.uri().path()) {
+                    None
+                } else {
+                    get_state(request).auth.as_deref()
+                }
+            }))
+            .middleware(route_scope_middleware());
     }
 
     router
@@ -2332,7 +2353,10 @@ pub fn make_router(
             request_span(r, handle_reconcile_all)
         })
         .put("/debug/v1/failpoints", |r| {
-            request_span(r, |r| failpoints_handler(r, CancellationToken::new()))
+            request_span(r, |r: Request<Body>| async move {
+                check_permissions(&r, Scope::Admin)?;
+                failpoints_handler(r, CancellationToken::new()).await
+            })
         })
         // Node operations
         .post("/control/v1/node", |r| {

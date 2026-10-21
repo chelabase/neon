@@ -24,6 +24,30 @@ pub fn check_metrics_permission(claims: &Claims) -> Result<(), AuthError> {
     }
 }
 
+/// A token whose scope no storage controller route takes is refused before routing
+/// (`http::route_scope_middleware`): tenant and compute tokens (`Tenant`,
+/// `TenantEndpoint`) and the safekeepers' `SafekeeperData`. Every other scope is left to
+/// the route's own check (and `Metrics` to the auth middleware, which keeps it on
+/// `/metrics`).
+pub fn check_route_scope(claims: &Claims) -> Result<(), AuthError> {
+    match claims.scope {
+        Scope::Admin
+        | Scope::PageServerApi
+        | Scope::GenerationsApi
+        | Scope::Infra
+        | Scope::Scrubber
+        | Scope::ControllerPeer
+        | Scope::Metrics => Ok(()),
+        Scope::Tenant | Scope::TenantEndpoint | Scope::SafekeeperData => Err(AuthError(
+            format!(
+                "no storage controller route takes scope '{:?}'",
+                claims.scope
+            )
+            .into(),
+        )),
+    }
+}
+
 /// `/profile/cpu` and `/profile/heap` take `Admin` only.
 pub fn check_profile_permission(claims: &Claims) -> Result<(), AuthError> {
     check_permission(claims, Scope::Admin)
@@ -138,6 +162,58 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The scope guard in front of every route refuses exactly the scopes no route
+    /// takes (tenant and compute tokens, `SafekeeperData`), whatever tenant they carry,
+    /// and never panics.
+    #[test]
+    fn route_scope_guard_refuses_scopes_no_route_takes() {
+        for scope in all_scopes() {
+            for token_tenant in [None, Some(TenantId::generate())] {
+                let token = claims(scope, token_tenant);
+                let result = catch_unwind(|| check_route_scope(&token))
+                    .unwrap_or_else(|_| panic!("check_route_scope panicked: {scope:?}"));
+                let refused = matches!(
+                    scope,
+                    Scope::Tenant | Scope::TenantEndpoint | Scope::SafekeeperData
+                );
+                assert_eq!(
+                    result.is_err(),
+                    refused,
+                    "scope {scope:?}, token tenant {token_tenant:?}: {result:?}"
+                );
+            }
+        }
+    }
+
+    /// The guard refuses no scope a route asks for: every `check_permissions(_, Scope::X)`
+    /// in the router's handlers names a scope the guard lets through.
+    #[test]
+    fn route_scope_guard_lets_through_every_scope_a_route_asks_for() {
+        let src = include_str!("http.rs");
+        let calls = src.matches("check_permissions(&").count();
+        let mut matched = 0;
+        for scope in all_scopes() {
+            let n = src
+                .matches(&format!("check_permissions(&req, Scope::{scope:?})"))
+                .count()
+                + src
+                    .matches(&format!("check_permissions(&r, Scope::{scope:?})"))
+                    .count();
+            if n > 0 {
+                assert!(
+                    check_route_scope(&claims(scope, None)).is_ok(),
+                    "a route asks for {scope:?}, which the guard refuses"
+                );
+            }
+            matched += n;
+        }
+        assert!(matched > 50, "only {matched} route checks found");
+        assert_eq!(
+            matched, calls,
+            "a check_permissions call the test can't read"
+        );
     }
 
     /// `/profile/cpu` and `/profile/heap` accept `{Admin}` (S8).

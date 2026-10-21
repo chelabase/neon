@@ -55,7 +55,7 @@ use tokio::time::Instant;
 use tokio_util::io::StreamReader;
 use tokio_util::sync::CancellationToken;
 use tracing::*;
-use utils::auth::SwappableJwtAuth;
+use utils::auth::{AuthError, Claims, SwappableJwtAuth};
 use utils::generation::Generation;
 use utils::id::{TenantId, TimelineId};
 use utils::lsn::Lsn;
@@ -3866,8 +3866,58 @@ async fn update_feature_flag_spec(
     json_response(StatusCode::OK, ())
 }
 
+/// How `api_handler` authorizes a request before its handler runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RouteAuth {
+    /// The route's path names its tenant (`:tenant_id` or `:tenant_shard_id`): that
+    /// tenant's token or `PageServerApi`. A path naming no tenant (or one that doesn't
+    /// parse) is a management route: `PageServerApi` only.
+    Path,
+    /// The route names its tenant only in the request body, so the handler checks that
+    /// tenant once it has read the body. Before that, a token that can't pass for any
+    /// tenant (its own one, for a tenant token) is refused.
+    TenantInBody,
+}
+
+/// The tenant a route's path names (its `:tenant_shard_id` or `:tenant_id` parameter),
+/// if it names one that parses.
+fn route_tenant(tenant_shard_id: Option<&str>, tenant_id: Option<&str>) -> Option<TenantId> {
+    match (tenant_shard_id, tenant_id) {
+        (Some(id), _) => TenantShardId::from_str(id).ok().map(|id| id.tenant_id),
+        (None, Some(id)) => TenantId::from_str(id).ok(),
+        (None, None) => None,
+    }
+}
+
+/// Whether `claims` may use a route authorized by `auth` whose path names
+/// `route_tenant` (see [`RouteAuth`]).
+fn route_permission(
+    claims: &Claims,
+    auth: RouteAuth,
+    route_tenant: Option<TenantId>,
+) -> Result<(), AuthError> {
+    match auth {
+        RouteAuth::Path => crate::auth::check_permission(claims, route_tenant),
+        RouteAuth::TenantInBody => crate::auth::check_permission(claims, claims.tenant_id),
+    }
+}
+
+/// Authorizes `request` for its route, before its handler reads the body or the query
+/// (see [`RouteAuth`]). Every route registered through `api_handler` or
+/// `testing_api_handler` gets this check, so a handler can't forget it; a handler may
+/// still check more (a tenant route that takes `PageServerApi` only checks `None`).
+fn authorize_route(request: &Request<Body>, auth: RouteAuth) -> Result<(), ApiError> {
+    let tenant = route_tenant(
+        request.param("tenant_shard_id").map(String::as_str),
+        request.param("tenant_id").map(String::as_str),
+    );
+    check_permission_with(request, |claims| route_permission(claims, auth, tenant))
+}
+
 /// Common functionality of all the HTTP API handlers.
 ///
+/// - Authorizes the request for its route before the handler runs (`authorize_route`,
+///   [`RouteAuth::Path`])
 /// - Adds a tracing span to each request (by `request_span`)
 /// - Logs the request depending on the request method (by `request_span`)
 /// - Logs the response if it was not successful (by `request_span`
@@ -3880,6 +3930,36 @@ where
     R: std::future::Future<Output = Result<Response<Body>, ApiError>> + Send + 'static,
     H: FnOnce(Request<Body>, CancellationToken) -> R + Send + Sync + 'static,
 {
+    api_handler_with(RouteAuth::Path, request, handler).await
+}
+
+/// `api_handler` for a route that names its tenant only in the request body
+/// ([`RouteAuth::TenantInBody`]): its handler must check the body's tenant.
+async fn api_handler_tenant_in_body<R, H>(
+    request: Request<Body>,
+    handler: H,
+) -> Result<Response<Body>, ApiError>
+where
+    R: std::future::Future<Output = Result<Response<Body>, ApiError>> + Send + 'static,
+    H: FnOnce(Request<Body>, CancellationToken) -> R + Send + Sync + 'static,
+{
+    api_handler_with(RouteAuth::TenantInBody, request, handler).await
+}
+
+async fn api_handler_with<R, H>(
+    auth: RouteAuth,
+    request: Request<Body>,
+    handler: H,
+) -> Result<Response<Body>, ApiError>
+where
+    R: std::future::Future<Output = Result<Response<Body>, ApiError>> + Send + 'static,
+    H: FnOnce(Request<Body>, CancellationToken) -> R + Send + Sync + 'static,
+{
+    if let Err(e) = authorize_route(&request, auth) {
+        // Logged and answered like a handler's own refusal, inside the request span.
+        return request_span(request, move |_| async move { Err(e) }).await;
+    }
+
     if request.uri() != &"/v1/failpoints".parse::<Uri>().unwrap() {
         fail::fail_point!("api-503", |_| Err(ApiError::ResourceUnavailable(
             "failpoint".into()
@@ -3976,6 +4056,8 @@ where
     if cfg!(feature = "testing") {
         api_handler(request, handler).await
     } else {
+        // Refused for the token first, as on a server with the testing APIs.
+        authorize_route(&request, RouteAuth::Path)?;
         std::future::ready(Err(ApiError::BadRequest(anyhow!(
             "Cannot {desc} because pageserver was compiled without testing APIs",
         ))))
@@ -4048,10 +4130,10 @@ pub fn make_router(
             api_handler(r, tenant_size_handler)
         })
         .patch("/v1/tenant/config", |r| {
-            api_handler(r, patch_tenant_config_handler)
+            api_handler_tenant_in_body(r, patch_tenant_config_handler)
         })
         .put("/v1/tenant/config", |r| {
-            api_handler(r, update_tenant_config_handler)
+            api_handler_tenant_in_body(r, update_tenant_config_handler)
         })
         .put("/v1/tenant/:tenant_shard_id/shard_split", |r| {
             api_handler(r, tenant_shard_split_handler)
@@ -4278,4 +4360,92 @@ pub fn make_router(
             api_handler(r, hadron_reset_alert_gauges)
         })
         .any(handler_404))
+}
+
+#[cfg(test)]
+mod route_auth_tests {
+    use std::panic::catch_unwind;
+
+    use utils::auth::Scope;
+
+    use super::*;
+
+    fn all_scopes() -> Vec<Scope> {
+        let all = vec![
+            Scope::Tenant,
+            Scope::TenantEndpoint,
+            Scope::PageServerApi,
+            Scope::SafekeeperData,
+            Scope::GenerationsApi,
+            Scope::Admin,
+            Scope::Infra,
+            Scope::Scrubber,
+            Scope::ControllerPeer,
+            Scope::Metrics,
+        ];
+        // Stops compiling when a scope is added, so the table below stays exhaustive.
+        for scope in &all {
+            match scope {
+                Scope::Tenant
+                | Scope::TenantEndpoint
+                | Scope::PageServerApi
+                | Scope::SafekeeperData
+                | Scope::GenerationsApi
+                | Scope::Admin
+                | Scope::Infra
+                | Scope::Scrubber
+                | Scope::ControllerPeer
+                | Scope::Metrics => {}
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn route_tenant_reads_the_shard_id_or_the_tenant_id() {
+        let tenant = TenantId::generate();
+        let shard = format!("{tenant}-0104");
+        let plain = tenant.to_string();
+        assert_eq!(route_tenant(Some(&plain), None), Some(tenant));
+        assert_eq!(route_tenant(Some(&shard), None), Some(tenant));
+        assert_eq!(route_tenant(None, Some(&plain)), Some(tenant));
+        assert_eq!(route_tenant(None, None), None);
+        // A parameter that doesn't parse names no tenant: the route is checked as a
+        // management route, which no tenant token passes.
+        assert_eq!(route_tenant(Some("garbage"), None), None);
+        assert_eq!(route_tenant(None, Some("garbage")), None);
+        assert_eq!(route_tenant(None, Some(&shard)), None);
+    }
+
+    /// Invariant: the check every `api_handler` route runs first is total and allows
+    /// exactly `PageServerApi` everywhere and a tenant token on its own tenant's routes
+    /// (or, for a tenant-in-body route, until its handler checks the body's tenant).
+    #[test]
+    fn route_permission_is_total_over_every_scope_route_and_tenant() {
+        let own = TenantId::generate();
+        let foreign = TenantId::generate();
+        for scope in all_scopes() {
+            for token_tenant in [None, Some(own)] {
+                for auth in [RouteAuth::Path, RouteAuth::TenantInBody] {
+                    for route in [None, Some(own), Some(foreign)] {
+                        let claims = Claims::new(token_tenant, scope);
+                        let case = format!(
+                            "scope {scope:?}, token tenant {token_tenant:?}, {auth:?}, route tenant {route:?}"
+                        );
+                        let result = catch_unwind(|| route_permission(&claims, auth, route))
+                            .unwrap_or_else(|_| panic!("route_permission panicked: {case}"));
+                        let allowed = match scope {
+                            Scope::PageServerApi => true,
+                            Scope::Tenant => match auth {
+                                RouteAuth::Path => token_tenant.is_some() && route == token_tenant,
+                                RouteAuth::TenantInBody => token_tenant.is_some(),
+                            },
+                            _ => false,
+                        };
+                        assert_eq!(result.is_ok(), allowed, "{case}: {result:?}");
+                    }
+                }
+            }
+        }
+    }
 }
