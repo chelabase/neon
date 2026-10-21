@@ -97,8 +97,10 @@ neon_download_extension_file_http(const char *filename, bool is_library)
 void
 pg_init_extension_server()
 {
-	/* Port to connect to compute_ctl on localhost */
-	/* to request extension files. */
+	/*
+	 * The port of compute_ctl's internal server on 127.0.0.1, for extension
+	 * downloads and refresh_configuration.
+	 */
 	DefineCustomIntVariable("neon.extension_server_port",
 							"connection string to the compute_ctl",
 							NULL,
