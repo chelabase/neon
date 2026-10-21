@@ -212,6 +212,12 @@ pub struct ComputeNode {
     /// as a bearer. Written to `params.internal_api_token_file` at start; never
     /// logged (`ComputeNode` has no `Debug`).
     internal_api_secret: String,
+
+    /// Held while the config files Postgres reads (`postgresql.conf`,
+    /// `pg_hba.conf`, `pg_ident.conf`, the TLS key and certificate) are
+    /// rewritten and while Postgres is reloaded for them (a reconfigure, the
+    /// TLS watcher): a reload never sees a half-written or rolled-back set.
+    config_files_lock: Mutex<()>,
 }
 
 // store some metrics about download size that might impact startup time
@@ -503,12 +509,21 @@ impl TryFrom<ComputeSpec> for ParsedSpec {
             .endpoint_storage_addr
             .clone()
             .or_else(|| spec.cluster.settings.find("neon.endpoint_storage_addr"));
-        let endpoint_storage_token = spec.endpoint_storage_token.clone().or_else(|| {
-            spec.cluster
-                .settings
-                .find("neon.endpoint_storage_token")
-                .map(EndpointStorageToken::from)
-        });
+        // The token as a cluster setting would land in `postgresql.conf` as a
+        // placeholder GUC every role can `SHOW`: refused (fail closed), without
+        // echoing it. The spec field is the only way to give it.
+        // GUC names are case-insensitive.
+        if spec.cluster.settings.as_ref().is_some_and(|settings| {
+            settings
+                .iter()
+                .any(|s| s.name.eq_ignore_ascii_case("neon.endpoint_storage_token"))
+        }) {
+            anyhow::bail!(
+                "the spec's cluster settings carry neon.endpoint_storage_token; give it as endpoint_storage_token instead"
+            );
+        }
+        let endpoint_storage_token: Option<EndpointStorageToken> =
+            spec.endpoint_storage_token.clone();
 
         let res = ParsedSpec {
             spec,
@@ -720,6 +735,7 @@ impl ComputeNode {
             extension_stats_task: Mutex::new(None),
             lfc_offload_task: Mutex::new(None),
             internal_api_secret: token_file::generate_internal_api_secret(),
+            config_files_lock: Mutex::new(()),
         })
     }
 
@@ -2230,6 +2246,14 @@ impl ComputeNode {
         }
     }
 
+    /// Takes [`Self::config_files_lock`] (a panic of an earlier holder doesn't
+    /// poison it: the files are complete or put back before it's released).
+    fn lock_config_files(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.config_files_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     // Wrapped this around `pg_ctl reload`, but right now we don't use
     // `pg_ctl` for start / stop.
     #[instrument(skip_all)]
@@ -2299,19 +2323,24 @@ impl ComputeNode {
         // Write the new config: postgresql.conf, the member-login block and the
         // ident lines (E-m3), all-or-nothing, so a failure leaves the running
         // config's files as they were; the reload below makes Postgres read them.
+        // Under the config-files lock, which the TLS watcher's reload takes too:
+        // no reload sees the files half-written or before a rollback.
         let pgdata_path = Path::new(&self.params.pgdata);
         let postgres_port = self.params.connstr.port();
-        config::rewrite_config_files(
-            pgdata_path,
-            &self.params,
-            &spec,
-            postgres_port,
-            self.params.internal_http_port,
-            tls_config,
-            self.params.lakebase_mode,
-        )?;
+        {
+            let _files = self.lock_config_files();
+            config::rewrite_config_files(
+                pgdata_path,
+                &self.params,
+                &spec,
+                postgres_port,
+                self.params.internal_http_port,
+                tls_config,
+                self.params.lakebase_mode,
+            )?;
 
-        self.pg_reload_conf()?;
+            self.pg_reload_conf()?;
+        }
 
         if !spec.skip_pg_catalog_updates {
             let max_concurrent_connections = spec.reconfigure_concurrency;
@@ -2429,6 +2458,9 @@ impl ComputeNode {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .poll(now, || {
+                            // The config-files lock: never in the middle of a
+                            // reconfigure's rewrite (or its rollback).
+                            let _files = this.lock_config_files();
                             reload_tls_files(&pgdata, &tls, || this.pg_reload_conf())
                         });
                     if poll == CertPoll::Reloaded {
@@ -2902,19 +2934,10 @@ LIMIT 100",
                 .into());
             };
             let steps: Vec<String> = path.split("--").skip(1).map(str::to_owned).collect();
-            let trusted_steps: i64 = db_client
-                .query_one(
-                    "SELECT count(*) FROM pg_catalog.pg_available_extension_versions
-                    WHERE name OPERATOR(pg_catalog.=) $1::pg_catalog.name
-                        AND version OPERATOR(pg_catalog.=) ANY($2::pg_catalog.text[])
-                        AND trusted",
-                    &[&unquoted_name, &steps],
-                )
-                .await
-                .context("Failed to look up the extension's update path")?
-                .get(0);
-            let distinct_steps = steps.iter().collect::<std::collections::HashSet<_>>().len();
-            if steps.is_empty() || trusted_steps != distinct_steps as i64 {
+            if !self
+                .all_versions_trusted(&db_client, unquoted_name, &steps)
+                .await?
+            {
                 return Err(RequestRefused(
                     "only trusted extensions can be installed: a version on the update path is not trusted"
                         .into(),
@@ -2928,6 +2951,44 @@ LIMIT 100",
                 .await
                 .with_context(|| format!("Failed to execute query: {query}"))?;
         } else {
+            // `CREATE EXTENSION ... VERSION v` without an install script of v's
+            // own runs another version's install script and then an update path
+            // to v, each script under its own version's control file: every
+            // version on that chain must be trusted (PG17's `find_install_path`,
+            // computed from the extension's script files).
+            let files: Vec<String> = db_client
+                .query(
+                    "SELECT f FROM pg_catalog.pg_ls_dir(
+                        (SELECT setting FROM pg_catalog.pg_config
+                            WHERE name OPERATOR(pg_catalog.=) 'SHAREDIR') || '/extension') AS f",
+                    &[],
+                )
+                .await
+                .context("Failed to list the extension scripts")?
+                .iter()
+                .map(|row| row.get(0))
+                .collect();
+            let graph = crate::extension_paths::ScriptGraph::from_file_names(
+                unquoted_name,
+                files.iter().map(String::as_str),
+            );
+            let Some(chain) = graph.create_chain(&ext_version) else {
+                return Err(RequestRefused(
+                    "no install script leads to that extension version".into(),
+                )
+                .into());
+            };
+            if !self
+                .all_versions_trusted(&db_client, unquoted_name, &chain)
+                .await?
+            {
+                return Err(RequestRefused(
+                    "only trusted extensions can be installed: a version on the install path is not trusted"
+                        .into(),
+                )
+                .into());
+            }
+
             let query = format!(
                 "CREATE EXTENSION IF NOT EXISTS {ext_name} WITH SCHEMA public VERSION {quoted_version}"
             );
@@ -2938,6 +2999,36 @@ LIMIT 100",
         }
 
         Ok(ext_version)
+    }
+
+    /// Whether `versions` is non-empty and each of them is a trusted version of
+    /// extension `name` (`pg_available_extension_versions.trusted`: the control
+    /// file its script runs under). A version without a row is not trusted.
+    async fn all_versions_trusted(
+        &self,
+        db_client: &tokio_postgres::Client,
+        name: &str,
+        versions: &[String],
+    ) -> Result<bool> {
+        if versions.is_empty() {
+            return Ok(false);
+        }
+        let trusted: i64 = db_client
+            .query_one(
+                "SELECT count(DISTINCT version) FROM pg_catalog.pg_available_extension_versions
+                WHERE name OPERATOR(pg_catalog.=) $1::pg_catalog.name
+                    AND version OPERATOR(pg_catalog.=) ANY($2::pg_catalog.text[])
+                    AND trusted",
+                &[&name, &versions],
+            )
+            .await
+            .context("Failed to look up the extension's versions")?
+            .get(0);
+        let distinct = versions
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        Ok(trusted == distinct as i64)
     }
 
     pub async fn prepare_preload_libraries(

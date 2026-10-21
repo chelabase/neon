@@ -854,6 +854,7 @@ fn build_auth_backend(
 
         #[cfg(any(test, feature = "testing"))]
         AuthBackendType::Postgres => {
+            refuse_unused_control_plane_token_file(args, "postgres")?;
             let mut url: ApiUrl = args.auth_endpoint.parse()?;
             if url.password().is_none() {
                 let password = env::var("PGPASSWORD")
@@ -934,6 +935,7 @@ fn build_auth_backend(
 
         #[cfg(any(test, feature = "testing"))]
         AuthBackendType::Local => {
+            refuse_unused_control_plane_token_file(args, "local")?;
             let postgres: SocketAddr = "127.0.0.1:7432".parse()?;
             let compute_ctl: ApiUrl = "http://127.0.0.1:3081/".parse()?;
             let auth_backend =
@@ -1008,6 +1010,21 @@ fn control_plane_token(args: &ProxyCliArgs) -> anyhow::Result<Arc<str>> {
         );
     }
     Ok(Arc::from(read_secret_file(file, FLAG)?))
+}
+
+/// `--control-plane-token-file` given to a backend that never calls the
+/// control plane is a mistake, not a no-op: a startup error naming the flag.
+#[cfg(any(test, feature = "testing"))]
+fn refuse_unused_control_plane_token_file(
+    args: &ProxyCliArgs,
+    backend: &str,
+) -> anyhow::Result<()> {
+    if args.control_plane_token_file.is_some() {
+        bail!(
+            "--control-plane-token-file is given, but the {backend} auth backend never calls the control plane"
+        );
+    }
+    Ok(())
 }
 
 /// Connection info for `--redis-auth-type=plain`. The URL is `redis://` or

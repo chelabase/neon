@@ -9,8 +9,8 @@
 //!   top in order; a realtime block cut short is still an error, nothing written.
 //! - `remove_stale_temp_files`: an entry `<name>.tmp.` (empty suffix) is kept;
 //!   a directory named like a stale temp file is an error (nothing guessed).
-//! - The endpoint storage token from the `neon.endpoint_storage_token` setting
-//!   is redacted in `ParsedSpec`'s `Debug` too.
+//! - A `neon.endpoint_storage_token` setting is refused whatever its case, and
+//!   with a null value, without echoing it.
 
 use std::ffi::OsString;
 use std::fs;
@@ -206,23 +206,62 @@ fn the_stale_temp_file_sweep_edges() {
 }
 
 #[test]
-fn the_endpoint_storage_token_from_the_settings_is_redacted() {
-    let mut json: Value = serde_json::from_str(SPEC).unwrap();
-    json["safekeeper_connstrings"] = json!(["127.0.0.1:1"]);
-    json["cluster"]["settings"]
-        .as_array_mut()
-        .unwrap()
-        .push(json!({
-            "name": "neon.endpoint_storage_token",
-            "value": "f1SettingsNeedle",
-            "vartype": "string"
-        }));
-    let spec: ComputeSpec = serde_json::from_value(json).unwrap();
-    let pspec = ParsedSpec::try_from(spec).unwrap();
-    assert_eq!(
-        pspec.endpoint_storage_token.as_ref().map(|t| t.as_str()),
-        Some("f1SettingsNeedle")
-    );
-    let text = format!("{:?}", pspec.endpoint_storage_token);
-    assert!(!text.contains("f1SettingsNeedle"), "{text}");
+fn the_endpoint_storage_token_setting_is_refused_in_any_case_or_without_a_value() {
+    for (name, value) in [
+        ("NEON.Endpoint_Storage_Token", json!("f1SettingsNeedle")),
+        ("neon.endpoint_storage_token", Value::Null),
+    ] {
+        let mut json: Value = serde_json::from_str(SPEC).unwrap();
+        json["safekeeper_connstrings"] = json!(["127.0.0.1:1"]);
+        json["cluster"]["settings"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "name": name, "value": value, "vartype": "string" }));
+        let spec: ComputeSpec = serde_json::from_value(json).unwrap();
+        let e = ParsedSpec::try_from(spec).unwrap_err();
+        let text = format!("{e:#} {e:?}");
+        assert!(!text.contains("f1SettingsNeedle"), "{name}: {text}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The config-files lock (F1 audit, coordinator ruling): structural, since a
+// reload needs a running Postgres. Both the reconfigure's rewrite and reload
+// and the TLS watcher's copy and reload run under `lock_config_files()`.
+// ---------------------------------------------------------------------------
+
+const COMPUTE_RS: &str = include_str!("../src/compute.rs");
+
+fn compute_fn(name: &str) -> &'static str {
+    let start = COMPUTE_RS
+        .find(&format!("fn {name}("))
+        .unwrap_or_else(|| panic!("fn {name} in compute.rs"));
+    let rest = &COMPUTE_RS[start + 3..];
+    let end = rest
+        .find("\n    pub fn ")
+        .into_iter()
+        .chain(rest.find("\n    fn "))
+        .chain(rest.find("\n    pub async fn "))
+        .min()
+        .unwrap_or(rest.len());
+    &COMPUTE_RS[start..start + 3 + end]
+}
+
+#[test]
+fn config_file_writes_and_reloads_share_one_lock() {
+    for (function, guarded) in [
+        ("reconfigure", "config::rewrite_config_files("),
+        ("watch_cert_for_changes", "reload_tls_files("),
+    ] {
+        let body = compute_fn(function);
+        let lock = body
+            .find("lock_config_files()")
+            .unwrap_or_else(|| panic!("{function} never takes the config-files lock"));
+        let call = body
+            .find(guarded)
+            .unwrap_or_else(|| panic!("{function} calls {guarded}"));
+        assert!(lock < call, "{function} takes the lock after {guarded}");
+    }
+    // Nothing else rewrites the three files while Postgres runs.
+    assert_eq!(COMPUTE_RS.matches("rewrite_config_files(").count(), 1);
 }
