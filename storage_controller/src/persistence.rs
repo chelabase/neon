@@ -11,7 +11,7 @@ use diesel::pg::Pg;
 use diesel::prelude::*;
 use diesel::serialize::{IsNull, ToSql};
 use diesel_async::async_connection_wrapper::AsyncConnectionWrapper;
-use diesel_async::pooled_connection::bb8::Pool;
+use diesel_async::pooled_connection::bb8::{Pool, PooledConnection};
 use diesel_async::pooled_connection::{AsyncDieselConnectionManager, ManagerConfig};
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use diesel_migrations::{EmbeddedMigrations, embed_migrations};
@@ -163,10 +163,75 @@ pub(crate) struct ShardGenerationState {
     pub(crate) generation_pageserver: Option<NodeId>,
 }
 
-// A generous allowance for how many times we may retry serializable transactions
-// before giving up.  This is not expected to be hit: it is a defensive measure in case we
-// somehow engineer a situation where duelling transactions might otherwise live-lock.
-const MAX_RETRIES: usize = 128;
+/// How many times we retry a serializable transaction that failed with a serialization
+/// failure before giving up. With the backoff below, the worst case is about 8 seconds.
+const MAX_RETRIES: usize = 20;
+
+/// First (and smallest) cap of the retry backoff.
+const RETRY_DELAY_BASE: Duration = Duration::from_millis(10);
+/// The backoff cap never grows beyond this.
+const RETRY_DELAY_MAX: Duration = Duration::from_millis(500);
+
+/// Upper bound of the delay before retry `n` (1-based): `min(500 ms, 10 ms * 2^(n-1))`.
+fn retry_delay_cap(n: usize) -> Duration {
+    // 10 ms << 6 = 640 ms already exceeds the maximum, so larger shifts need not be computed.
+    let shift = n.saturating_sub(1).min(6) as u32;
+    (RETRY_DELAY_BASE * (1u32 << shift)).min(RETRY_DELAY_MAX)
+}
+
+/// Delay before retry `n` (1-based): uniform in `[0, retry_delay_cap(n)]` (full jitter), so
+/// that transactions which collided do not collide again in lockstep.
+fn retry_delay(n: usize, rng: &mut impl rand::Rng) -> Duration {
+    rng.random_range(Duration::ZERO..=retry_delay_cap(n))
+}
+
+/// Run `run` on a connection from `acquire`, retrying with full-jitter exponential backoff
+/// when it fails with a serialization failure. These are expected: even though our
+/// transactions don't fight for the same rows, they occasionally collide on index pages
+/// (e.g. increment_generation for unrelated shards can collide).
+///
+/// The connection is dropped (returned to the pool) before each backoff sleep. The number of
+/// retries a call needed is observed once per call, whatever its outcome.
+async fn retry_on_serialization_failure<C, T>(
+    acquire: impl AsyncFn() -> DatabaseResult<C>,
+    run: impl AsyncFn(&mut C) -> DatabaseResult<T>,
+) -> DatabaseResult<T> {
+    let mut retries = 0;
+    let result = loop {
+        let outcome = {
+            let mut conn = match acquire().await {
+                Ok(conn) => conn,
+                Err(e) => break Err(e),
+            };
+            run(&mut conn).await
+            // `conn` is dropped here, before any sleep.
+        };
+        match outcome {
+            Err(
+                err @ DatabaseError::Query(diesel::result::Error::DatabaseError(
+                    diesel::result::DatabaseErrorKind::SerializationFailure,
+                    _,
+                )),
+            ) => {
+                if retries >= MAX_RETRIES {
+                    tracing::error!("Exceeded max retries on SerializationFailure errors: {err:?}");
+                    break Err(err);
+                }
+                retries += 1;
+                tracing::debug!("Retrying transaction on serialization failure {err:?}");
+                // The thread-local generator is not `Send`: keep it out of the await.
+                let delay = retry_delay(retries, &mut rand::rng());
+                tokio::time::sleep(delay).await;
+            }
+            other => break other,
+        }
+    };
+    METRICS_REGISTRY
+        .metrics_group
+        .storage_controller_database_query_retries
+        .observe(retries as f64);
+    result
+}
 
 impl Persistence {
     // The default postgres connection limit is 100.  We use up to 99, to leave one free for a human admin under
@@ -242,39 +307,12 @@ impl Persistence {
         let mut async_wrapper: AsyncConnectionWrapper<AsyncPgConnection> =
             AsyncConnectionWrapper::from(conn);
         tokio::task::spawn_blocking(move || {
-            let mut retry_count = 0;
-            loop {
-                let result = HarnessWithOutput::write_to_stdout(&mut async_wrapper)
-                    .run_pending_migrations(MIGRATIONS)
-                    .map(|_| ())
-                    .map_err(|e| DatabaseError::Migration(e.to_string()));
-                match result {
-                    Ok(r) => break Ok(r),
-                    Err(
-                        err @ DatabaseError::Query(diesel::result::Error::DatabaseError(
-                            diesel::result::DatabaseErrorKind::SerializationFailure,
-                            _,
-                        )),
-                    ) => {
-                        retry_count += 1;
-                        if retry_count > MAX_RETRIES {
-                            tracing::error!(
-                                "Exceeded max retries on SerializationFailure errors: {err:?}"
-                            );
-                            break Err(err);
-                        } else {
-                            // Retry on serialization errors: these are expected, because even though our
-                            // transactions don't fight for the same rows, they will occasionally collide
-                            // on index pages (e.g. increment_generation for unrelated shards can collide)
-                            tracing::debug!(
-                                "Retrying transaction on serialization failure {err:?}"
-                            );
-                            continue;
-                        }
-                    }
-                    Err(e) => break Err(e),
-                }
-            }
+            // Migrations run once at startup on a dedicated connection; their errors are all
+            // `Migration`, so there is nothing to retry.
+            HarnessWithOutput::write_to_stdout(&mut async_wrapper)
+                .run_pending_migrations(MIGRATIONS)
+                .map(|_| ())
+                .map_err(|e| DatabaseError::Migration(e.to_string()))
         })
         .await
         .map_err(|e| DatabaseError::Migration(e.to_string()))??;
@@ -323,39 +361,68 @@ impl Persistence {
             + 'a,
         R: Send + 'b,
     {
-        let mut retry_count = 0;
-        loop {
-            let mut conn = self.connection_pool.get().await?;
-            match conn
-                .build_transaction()
-                .serializable()
-                .run(async |c| func(c).await)
-                .await
-            {
-                Ok(r) => break Ok(r),
-                Err(
-                    err @ DatabaseError::Query(diesel::result::Error::DatabaseError(
-                        diesel::result::DatabaseErrorKind::SerializationFailure,
-                        _,
-                    )),
-                ) => {
-                    retry_count += 1;
-                    if retry_count > MAX_RETRIES {
-                        tracing::error!(
-                            "Exceeded max retries on SerializationFailure errors: {err:?}"
-                        );
-                        break Err(err);
-                    } else {
-                        // Retry on serialization errors: these are expected, because even though our
-                        // transactions don't fight for the same rows, they will occasionally collide
-                        // on index pages (e.g. increment_generation for unrelated shards can collide)
-                        tracing::debug!("Retrying transaction on serialization failure {err:?}");
-                        continue;
-                    }
-                }
-                Err(e) => break Err(e),
+        // The retry driver is generic over `AsyncFn`s, and a future that borrows a closure
+        // across an await is only provably `Send` for the callers when the closure is
+        // `'static` (the compiler asks for every lifetime of the borrow), but `func` borrows
+        // from its caller. So the driver gets `'static` pieces only, and `func` runs here:
+        // each attempt of the driver hands its pooled connection (type-erased) to this
+        // function, which runs the serializable transaction and hands the connection back
+        // with the outcome. The value `func` produced waits in `value`.
+        trait Lease: Send {
+            fn conn(&mut self) -> &mut AsyncPgConnection;
+        }
+
+        impl Lease for PooledConnection<'static, AsyncPgConnection> {
+            fn conn(&mut self) -> &mut AsyncPgConnection {
+                self
             }
         }
+
+        struct LeasedConn(Option<Box<dyn Lease>>);
+
+        struct Request {
+            lease: Box<dyn Lease>,
+            reply: tokio::sync::oneshot::Sender<(Box<dyn Lease>, DatabaseResult<()>)>,
+        }
+
+        let (requests, mut incoming) = tokio::sync::mpsc::channel::<Request>(1);
+        let pool = self.connection_pool.clone();
+        let driver = retry_on_serialization_failure(
+            async move || Ok(LeasedConn(Some(Box::new(pool.get_owned().await?)))),
+            async move |leased: &mut LeasedConn| {
+                let gone = || DatabaseError::Logical("database call abandoned".to_string());
+                let lease = leased.0.take().ok_or_else(gone)?;
+                let (reply, outcome) = tokio::sync::oneshot::channel();
+                requests
+                    .send(Request { lease, reply })
+                    .await
+                    .map_err(|_| gone())?;
+                let (lease, result) = outcome.await.map_err(|_| gone())?;
+                leased.0 = Some(lease);
+                result
+            },
+        );
+        let mut driver = std::pin::pin!(driver);
+
+        let func = &func;
+        let mut value = None;
+        let result = loop {
+            tokio::select! {
+                result = &mut driver => break result,
+                Some(Request { mut lease, reply }) = incoming.recv() => {
+                    let outcome = lease
+                        .conn()
+                        .build_transaction()
+                        .serializable()
+                        .run(async |c| func(c).await)
+                        .await
+                        .map(|v| value = Some(v));
+                    // The driver is only dropped together with this future.
+                    let _ = reply.send((lease, outcome));
+                }
+            }
+        };
+        result.map(|()| value.take().expect("a successful attempt leaves its value"))
     }
 
     /// When a node is first registered, persist it before using it for anything
@@ -3122,5 +3189,75 @@ mod backoff_tests {
                 "migration_run still mentions {needle}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod backoff_edge_tests {
+    //! K9 coder's own edge cases, beyond the RED set.
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use diesel::result::{DatabaseErrorKind, Error as DieselError};
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+
+    use super::*;
+
+    fn serialization_failure() -> DatabaseError {
+        DatabaseError::Query(DieselError::DatabaseError(
+            DatabaseErrorKind::SerializationFailure,
+            Box::new("could not serialize access".to_string()),
+        ))
+    }
+
+    #[test]
+    fn retry_zero_is_treated_like_the_first_retry() {
+        assert_eq!(retry_delay_cap(0), Duration::from_millis(10));
+        let mut rng = StdRng::seed_from_u64(7);
+        assert!(retry_delay(0, &mut rng) <= Duration::from_millis(10));
+        assert!(retry_delay(usize::MAX, &mut rng) <= Duration::from_millis(500));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_serialization_failure_followed_by_another_error_stops_there() {
+        let attempts = AtomicUsize::new(0);
+        let res: DatabaseResult<u32> = retry_on_serialization_failure(
+            async || Ok(()),
+            async |_: &mut ()| {
+                if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                    Err(serialization_failure())
+                } else {
+                    Err(DatabaseError::Logical("boom".to_string()))
+                }
+            },
+        )
+        .await;
+        assert!(matches!(res, Err(DatabaseError::Logical(_))));
+        assert_eq!(AtomicUsize::load(&attempts, Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_attempt_acquires_a_fresh_connection() {
+        let acquires = AtomicUsize::new(0);
+        let attempts = AtomicUsize::new(0);
+        let res: DatabaseResult<usize> = retry_on_serialization_failure(
+            async || Ok(acquires.fetch_add(1, Ordering::SeqCst)),
+            async |conn: &mut usize| {
+                if attempts.fetch_add(1, Ordering::SeqCst) < 3 {
+                    Err(serialization_failure())
+                } else {
+                    Ok(*conn)
+                }
+            },
+        )
+        .await;
+        assert_eq!(
+            res.unwrap(),
+            3,
+            "the successful attempt used the 4th connection"
+        );
+        assert_eq!(AtomicUsize::load(&acquires, Ordering::SeqCst), 4);
     }
 }
