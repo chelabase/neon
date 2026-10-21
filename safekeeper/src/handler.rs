@@ -507,6 +507,10 @@ impl SafekeeperPostgresHandler {
 }
 
 #[cfg(test)]
+#[path = "handler_auth_tests.rs"]
+mod auth_tests;
+
+#[cfg(test)]
 mod tests {
     use super::SafekeeperPostgresCommand;
 

@@ -4452,6 +4452,10 @@ pub(crate) fn effective_request_lsn_for_test(
 }
 
 #[cfg(test)]
+#[path = "page_service_auth_tests.rs"]
+mod auth_tests;
+
+#[cfg(test)]
 mod tests {
     use utils::shard::ShardCount;
 
