@@ -131,7 +131,7 @@
                     "vartype": "string"
                 },
                 {
-                    "name": "cron.database",
+                    "name": "cron.database_name",
                     "value": "postgres",
                     "vartype": "string"
                 }

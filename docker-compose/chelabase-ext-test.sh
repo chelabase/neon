@@ -2,7 +2,7 @@
 #
 # Extension-test harness wrapper.
 #
-# Builds the compute image (EXTENSIONS=all) and the `extension-tests` image from this checkout,
+# Builds the compute image (EXTENSIONS=all by default; --extensions minimal for the minimal compute) and the `extension-tests` image from this checkout,
 # tags what docker-compose/docker-compose.yml expects, and runs docker_compose_test.sh on them
 # for Postgres 17. `publish-dev.sh` builds only EXTENSIONS=minimal, so it cannot feed this harness.
 #
@@ -20,14 +20,16 @@ DEBIAN_VERSION=bookworm
 
 usage() {
     cat <<'EOF'
-usage: chelabase-ext-test.sh [--storage-image <ref>] [--only <dir,...>] [--keep-images <tag>] [--help]
+usage: chelabase-ext-test.sh [--extensions minimal|all] [--storage-image <ref>] [--only <dir,...>] [--keep-images <tag>] [--help]
 
+  --extensions minimal|all  extensions of the compute and the tests image (default all); minimal builds
+                         the slim extension-tests-minimal image (timescaledb, pg_partman, pg_cron)
   --storage-image <ref>  tag <ref> as chelabase-local/neon:<tag> for the harness's storage services
   --only <dir,...>       run only these docker-compose/ext-src directories (contrib suite skipped)
   --keep-images <tag>    use <tag> instead of ext-test and keep every image afterwards
   --help                 print this text
 
-Builds the compute (EXTENSIONS=all) and extension-tests images from this checkout, runs
+Builds the compute (EXTENSIONS=all, or minimal) and extension-tests images from this checkout, runs
 docker_compose_test.sh for Postgres 17 on them, then removes the images (unless --keep-images).
 The exit status is the harness's.
 EOF
@@ -39,6 +41,7 @@ die_usage() {
     exit 2
 }
 
+extensions="all"
 storage_image=""
 only=""
 keep_tag=""
@@ -72,6 +75,14 @@ while [[ $# -gt 0 ]]; do
         shift
         need_value --keep-images "$@"
         keep_tag="$1"
+        ;;
+    --extensions)
+        shift
+        need_value --extensions "$@"
+        case "$1" in
+        minimal | all) extensions="$1" ;;
+        *) die_usage "--extensions must be 'minimal' or 'all', got '$1'" ;;
+        esac
         ;;
     -*)
         die_usage "unknown flag '$1'"
@@ -109,7 +120,7 @@ build() {
     docker build \
         --file "$ROOT/compute/compute-node.Dockerfile" \
         --build-arg "PG_VERSION=$PG_VERSION" \
-        --build-arg "EXTENSIONS=all" \
+        --build-arg "EXTENSIONS=$extensions" \
         --build-arg "DEBIAN_VERSION=$DEBIAN_VERSION" \
         --build-arg "BUILD_TAG=$TAG" \
         "$@" \
@@ -117,7 +128,9 @@ build() {
 }
 
 build --tag "$compute_image" || exit 1
-build --target extension-tests --tag "$tests_image" || exit 1
+tests_target=extension-tests
+[[ "$extensions" == minimal ]] && tests_target=extension-tests-minimal
+build --target "$tests_target" --tag "$tests_image" || exit 1
 
 if [[ -n "$storage_image" ]]; then
     docker tag "$storage_image" "$storage_tag" || exit 1

@@ -111,7 +111,7 @@ for pg_version in ${TEST_VERSION_ONLY-14 15 16 17}; do
         # directories and skips the contrib suite.
         ONLY_ARGS=()
         [[ -n "${ONLY:-}" ]] && ONLY_ARGS=(-e "ONLY=${ONLY}")
-        docker compose exec -e USE_PGXS=1 -e SKIP=pg_jsonschema-src,rdkit-src,timescaledb-src "${ONLY_ARGS[@]}" \
+        docker compose exec -e USE_PGXS=1 -e SKIP=pg_jsonschema-src,rdkit-src "${ONLY_ARGS[@]}" \
         -e RUN_FIRST=hll-src,postgis-src,pgtap-src -e PARALLEL_COMPUTES="${PARALLEL_COMPUTES}" \
         neon-test-extensions /run-tests.sh /ext-src | tee testout.txt && EXT_SUCCESS=1 || EXT_SUCCESS=0
         if [[ -n "${ONLY:-}" ]]; then

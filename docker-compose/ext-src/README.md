@@ -25,6 +25,7 @@ This directory includes the following extensions:
 - `pg_hint_plan-src` - Execution plan hints
 - `pg_ivm-src` - Incremental view maintenance
 - `pg_jsonschema-src` - JSON Schema validation
+- `pg_partman-src` - Partition management, tested with a smoke test
 - `pg_repack-src` - Reorganize tables with minimal locks
 - `pg_roaringbitmap-src` - Roaring bitmap implementation
 - `pg_semver-src` - Semantic version data type
@@ -37,6 +38,7 @@ This directory includes the following extensions:
 - `postgresql-unit-src` - SI units for PostgreSQL
 - `prefix-src` - Prefix matching for strings
 - `rum-src` - RUM access method for text search
+- `timescaledb-src` - Time-series database (hypertables), tested with a smoke test
 
 ## Usage
 

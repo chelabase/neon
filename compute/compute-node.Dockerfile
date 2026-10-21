@@ -772,8 +772,8 @@ RUN case "${PG_VERSION:?}" in \
         export TIMESCALEDB_CHECKSUM=584a351c7775f0e067eaa0e7277ea88cab9077cc4c455cbbf09a5d9723dce95d \
         ;; \
       "v17") \
-        export TIMESCALEDB_VERSION=2.17.1 \
-        export TIMESCALEDB_CHECKSUM=6277cf43f5695e23dae1c5cfeba00474d730b66ed53665a84b787a6bb1a57e28 \
+        export TIMESCALEDB_VERSION=2.31.0 \
+        export TIMESCALEDB_CHECKSUM=7a0135283240abb64c87713e3280d70461954028d6426374b7e4e59f7dca6a56 \
         ;; \
     esac && \
     wget https://github.com/timescale/timescaledb/archive/refs/tags/${TIMESCALEDB_VERSION}.tar.gz -O timescaledb.tar.gz && \
@@ -847,8 +847,8 @@ ARG PG_VERSION
 # We set it in shared_preload_libraries and computes will fail to start if library is not found.
 WORKDIR /ext-src
 COPY compute/patches/pg_cron.patch .
-RUN wget https://github.com/citusdata/pg_cron/archive/refs/tags/v1.6.4.tar.gz -O pg_cron.tar.gz && \
-    echo "52d1850ee7beb85a4cb7185731ef4e5a90d1de216709d8988324b0d02e76af61 pg_cron.tar.gz" | sha256sum --check && \
+RUN wget https://github.com/citusdata/pg_cron/archive/refs/tags/v1.6.8.tar.gz -O pg_cron.tar.gz && \
+    echo "c19ab9bb35406c60fb51ecda993737c083850abe424acb6c1030439d00a1f8e4 pg_cron.tar.gz" | sha256sum --check && \
     mkdir pg_cron-src && cd pg_cron-src && tar xzf ../pg_cron.tar.gz --strip-components=1 -C . && \
     patch < /ext-src/pg_cron.patch
 
@@ -1324,11 +1324,9 @@ RUN make -j $(getconf _NPROCESSORS_ONLN) && \
 FROM build-deps AS pg_partman-src
 ARG PG_VERSION
 
-# should support v17 https://github.com/pgpartman/pg_partman/discussions/693
-# last release 5.1.0  Apr 2, 2024
 WORKDIR /ext-src
-RUN wget https://github.com/pgpartman/pg_partman/archive/refs/tags/v5.1.0.tar.gz -O pg_partman.tar.gz && \
-    echo "3e3a27d7ff827295d5c55ef72f07a49062d6204b3cb0b9a048645d6db9f3cb9f pg_partman.tar.gz" | sha256sum --check && \
+RUN wget https://github.com/pgpartman/pg_partman/archive/refs/tags/v5.5.0.tar.gz -O pg_partman.tar.gz && \
+    echo "a3f100ae871677f0012579f58542c174900297f664a4ad2be0256e7ee5e33502 pg_partman.tar.gz" | sha256sum --check && \
     mkdir pg_partman-src && cd pg_partman-src && tar xzf ../pg_partman.tar.gz --strip-components=1 -C .
 
 FROM pg-build AS pg_partman-build
@@ -1730,6 +1728,34 @@ RUN cd /ext-src/pg_repack-src && patch -p1 </ext-src/pg_repack.patch && rm -f /e
 COPY --chmod=755 docker-compose/run-tests.sh /run-tests.sh
 RUN echo /usr/local/pgsql/lib > /etc/ld.so.conf.d/00-neon.conf && /sbin/ldconfig
 RUN apt-get update && apt-get install -y libtap-parser-sourcehandler-pgtap-perl jq parallel \
+   && apt clean && rm -rf /ext-src/*.tar.gz /ext-src/*.patch /var/lib/apt/lists/*
+ENV PATH=/usr/local/pgsql/bin:$PATH
+ENV PGHOST=compute1
+ENV PGPORT=55433
+ENV PGUSER=cloud_admin
+ENV PGDATABASE=postgres
+ENV PG_VERSION=${PG_VERSION:?}
+
+#########################################################################################
+#
+# Layer extension-tests-minimal
+# The tests image for EXTENSIONS=minimal: only timescaledb, pg_partman and pg_cron.
+#
+#########################################################################################
+
+FROM pg-build AS extension-tests-minimal
+ARG PG_VERSION
+
+COPY docker-compose/ext-src/timescaledb-src/ /ext-src/timescaledb-src/
+COPY docker-compose/ext-src/pg_partman-src/ /ext-src/pg_partman-src/
+COPY docker-compose/ext-src/pg_cron-src/ /ext-src/pg_cron-src/
+COPY --from=timescaledb-src /ext-src/ /ext-src/
+COPY --from=pg_partman-src /ext-src/ /ext-src/
+COPY --from=pg_cron-src /ext-src/ /ext-src/
+
+COPY --chmod=755 docker-compose/run-tests.sh /run-tests.sh
+RUN echo /usr/local/pgsql/lib > /etc/ld.so.conf.d/00-neon.conf && /sbin/ldconfig
+RUN apt-get update && apt-get install -y jq parallel \
    && apt clean && rm -rf /ext-src/*.tar.gz /ext-src/*.patch /var/lib/apt/lists/*
 ENV PATH=/usr/local/pgsql/bin:$PATH
 ENV PGHOST=compute1
