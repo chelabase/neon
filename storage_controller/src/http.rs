@@ -1825,10 +1825,8 @@ fn route_scope_middleware<B: hyper::body::HttpBody + Send + Sync + 'static>()
 -> Middleware<B, ApiError> {
     Middleware::pre(|req| async move {
         if let Some(claims) = req.context::<Claims>() {
-            crate::auth::check_route_scope(&claims).map_err(|e| {
-                warn!("Authorization error: {e}");
-                ApiError::Forbidden("JWT authentication error".to_string())
-            })?;
+            crate::auth::check_route_scope(&claims)
+                .map_err(|e| ApiError::Forbidden(format!("JWT authentication error: {e}")))?;
         }
         Ok(req)
     })

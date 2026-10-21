@@ -90,7 +90,7 @@ def test_route_check_keeps_own_tenant_global_and_public_access(
             ".*JWT scope '.+' is ineligible for Pageserver auth.*",
         ]
     )
-    env.storage_controller.allowed_errors.extend([".*Forbidden.*", ".*Authorization error.*"])
+    env.storage_controller.allowed_errors.extend([".*Forbidden.*"])
 
     keys = env.auth_keys
     tenant, timeline = env.initial_tenant, env.initial_timeline

@@ -646,7 +646,7 @@ pub const METRICS_PATH: &str = "/metrics";
 /// whether or not the handler checks its own permission.
 fn check_metrics_scope_path(claims: &Claims, path: &str) -> Result<(), ApiError> {
     if claims.scope == Scope::Metrics && path != METRICS_PATH {
-        warn!("metrics token refused on {path}");
+        // Logged with the request by the error handler, as every refusal.
         return Err(ApiError::Forbidden(
             "a metrics token only reads /metrics".to_string(),
         ));
