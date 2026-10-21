@@ -192,9 +192,7 @@ def test_a_subtransaction_streamed_while_it_ran_keeps_its_relation(vanilla_pg: V
         with w.cursor() as c:
             c.execute("INSERT INTO big VALUES (1, 'x')")
             c.execute("SAVEPOINT p")
-            c.execute(
-                f"INSERT INTO other SELECT g, {PAD_SQL} FROM generate_series(1, 900) g"
-            )
+            c.execute(f"INSERT INTO other SELECT g, {PAD_SQL} FROM generate_series(1, 900) g")
         # another commit flushes the WAL, the open transaction's changes included; the
         # walsender decodes them and streams them past 64kB while they still run
         vanilla_pg.safe_psql("INSERT INTO marker VALUES (1)")
