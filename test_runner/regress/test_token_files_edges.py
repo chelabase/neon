@@ -26,6 +26,8 @@ from fixtures.token_files import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from fixtures.neon_fixtures import NeonEnvBuilder
 
 
@@ -65,10 +67,17 @@ def test_storage_token_file_edge_shapes(neon_env_builder: NeonEnvBuilder):
         path.unlink()
         path.mkdir(mode=0o700)
 
-    for what, breaks, undo in [
-        ("a FIFO", fifo, path.unlink),
-        ("a directory", directory, path.rmdir),
-    ]:
+    def remove_fifo() -> None:
+        path.unlink()
+
+    def remove_directory() -> None:
+        path.rmdir()
+
+    cases: list[tuple[str, Callable[[], None], Callable[[], None]]] = [
+        ("a FIFO", fifo, remove_fifo),
+        ("a directory", directory, remove_directory),
+    ]
+    for what, breaks, undo in cases:
         endpoint.clear_buffers(cursor=admin)
         offset = log_size(endpoint)
         breaks()
