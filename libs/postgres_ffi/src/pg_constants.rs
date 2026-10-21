@@ -228,6 +228,11 @@ pub const XLP_FIRST_IS_CONTRECORD: u16 = 0x0001;
 pub const XLP_LONG_HEADER: u16 = 0x0002;
 
 /* From replication/slot.h */
+/// Offset of `slotdata.persistency` (`ReplicationSlotPersistency`, a 4-byte enum) in
+/// `ReplicationSlotOnDisk`: the 16-byte header, `name` (64) and `database` (4).
+pub const REPL_SLOT_ON_DISK_OFFSETOF_PERSISTENCY: usize = 4 * 4 + 64 + 4;
+/// `RS_PERSISTENT` of `ReplicationSlotPersistency` (`RS_EPHEMERAL` = 1, `RS_TEMPORARY` = 2).
+pub const RS_PERSISTENT: u32 = 0;
 pub const REPL_SLOT_ON_DISK_OFFSETOF_RESTART_LSN: usize = 4*4  /* offset of `slotdata` in ReplicationSlotOnDisk  */
    + 64 /* NameData */  + 4*4;
 

@@ -488,12 +488,18 @@ where
                 if self.replica {
                     continue;
                 }
-                let offs = pg_constants::REPL_SLOT_ON_DISK_OFFSETOF_RESTART_LSN;
-                let restart_lsn = Lsn(u64::from_le_bytes(
-                    content[offs..offs + 8].try_into().unwrap(),
-                ));
-                info!("Replication slot {} restart LSN={}", path, restart_lsn);
-                min_restart_lsn = Lsn::min(min_restart_lsn, restart_lsn);
+                // Every entry is shipped (the compute deletes a non-persistent slot it finds
+                // and removes its stale copy at start), but only a persistent slot holds WAL.
+                match persistent_slot_restart_lsn(&content) {
+                    Some(restart_lsn) => {
+                        info!("Replication slot {} restart LSN={}", path, restart_lsn);
+                        min_restart_lsn = Lsn::min(min_restart_lsn, restart_lsn);
+                    }
+                    None => info!(
+                        "Replication slot {} is not counted towards restart.lsn",
+                        path
+                    ),
+                }
             } else if path == "pg_logical/replorigin_checkpoint" {
                 // replorigin_checkoint is written only on compute shutdown, so it contains
                 // deteriorated values. So we generate our own version of this file for the particular LSN
@@ -865,6 +871,30 @@ fn new_tar_header_dir(path: &str) -> anyhow::Result<Header> {
     Ok(header)
 }
 
+/// The `restart_lsn` of a `pg_replslot/<slot>/state` aux file (`ReplicationSlotOnDisk`), only
+/// for a persistent slot: a temporary or ephemeral slot holds no WAL across a restart (the
+/// compute deletes it at start), and an unknown persistency is not trusted. A state too short
+/// to hold `restart_lsn` is skipped with a warning.
+fn persistent_slot_restart_lsn(content: &[u8]) -> Option<Lsn> {
+    let persistency_at = pg_constants::REPL_SLOT_ON_DISK_OFFSETOF_PERSISTENCY;
+    let restart_lsn_at = pg_constants::REPL_SLOT_ON_DISK_OFFSETOF_RESTART_LSN;
+    let (Some(persistency), Some(restart_lsn)) = (
+        content.get(persistency_at..persistency_at + 4),
+        content.get(restart_lsn_at..restart_lsn_at + 8),
+    ) else {
+        warn!(
+            "skipping a {}-byte replication slot state: too short to hold restart_lsn",
+            content.len()
+        );
+        return None;
+    };
+    let persistency = u32::from_le_bytes(persistency.try_into().ok()?);
+    if persistency != pg_constants::RS_PERSISTENT {
+        return None;
+    }
+    Some(Lsn(u64::from_le_bytes(restart_lsn.try_into().ok()?)))
+}
+
 #[cfg(test)]
 mod slot_state_tests {
     //! U16: only a persistent, long-enough `pg_replslot/*/state` counts towards `restart.lsn`.
@@ -942,5 +972,60 @@ mod slot_state_tests {
                 "a {len}-byte state"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod slot_state_edge_tests {
+    //! Edges beyond `slot_state_tests`: the pinned offsets agree with `ReplicationSlotOnDisk`,
+    //! and a non-persistent state is never counted, whatever its length.
+
+    use postgres_ffi::pg_constants;
+
+    use super::persistent_slot_restart_lsn;
+
+    #[test]
+    fn the_offsets_follow_the_on_disk_layout() {
+        // Header (magic, checksum, version, length), name (NameData), database (Oid).
+        assert_eq!(pg_constants::REPL_SLOT_ON_DISK_OFFSETOF_PERSISTENCY, 84);
+        // persistency, xmin, catalog_xmin: three 4-byte fields before restart_lsn.
+        assert_eq!(
+            pg_constants::REPL_SLOT_ON_DISK_OFFSETOF_PERSISTENCY + 3 * 4,
+            pg_constants::REPL_SLOT_ON_DISK_OFFSETOF_RESTART_LSN
+        );
+        assert_eq!(pg_constants::RS_PERSISTENT, 0);
+    }
+
+    #[test]
+    fn a_non_persistent_state_never_counts_at_any_length() {
+        for persistency in [1u32, 2] {
+            for len in 0..=256 {
+                let mut buf = vec![0u8; len];
+                let at = pg_constants::REPL_SLOT_ON_DISK_OFFSETOF_PERSISTENCY;
+                if len >= at + 4 {
+                    buf[at..at + 4].copy_from_slice(&persistency.to_le_bytes());
+                }
+                // A buffer too short for the persistency field is too short for
+                // restart_lsn too, so it is skipped either way.
+                assert_eq!(
+                    persistent_slot_restart_lsn(&buf),
+                    None,
+                    "persistency {persistency}, {len} bytes"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_persistent_state_longer_than_v17s_reads_only_its_fields() {
+        let mut buf = vec![0xFFu8; 4096];
+        let at = pg_constants::REPL_SLOT_ON_DISK_OFFSETOF_PERSISTENCY;
+        buf[at..at + 4].copy_from_slice(&0u32.to_le_bytes());
+        let lsn_at = pg_constants::REPL_SLOT_ON_DISK_OFFSETOF_RESTART_LSN;
+        buf[lsn_at..lsn_at + 8].copy_from_slice(&0x16B_3740u64.to_le_bytes());
+        assert_eq!(
+            persistent_slot_restart_lsn(&buf),
+            Some(utils::lsn::Lsn(0x16B_3740))
+        );
     }
 }
