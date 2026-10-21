@@ -141,8 +141,9 @@ pub fn rewrite_config_files(
             .context("copy the TLS key and certificate into pgdata")?;
     }
     write_file_atomically(&pgdata_path.join("postgresql.conf"), &conf)?;
-    hba.write()?;
-    ident.write()?;
+    // pg_ident.conf first, put back when pg_hba.conf can't be written: new hba
+    // lines never map through an old ident map.
+    spec::write_ident_then_hba(&ident, &hba)?;
     Ok(())
 }
 

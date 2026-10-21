@@ -70,7 +70,7 @@ fn a_bad_control_plane_token_file_fails_closed() {
     let file = dir.path().join("proxy-api.token");
     let needle = "CpTokenNeedle";
     for (why, content) in [
-        ("empty", "".to_string()),
+        ("empty", String::new()),
         ("a newline only", "\n".to_string()),
         ("two trailing newlines", format!("{CP_TOKEN}\n\n")),
         ("CRLF", format!("{CP_TOKEN}\r\n")),

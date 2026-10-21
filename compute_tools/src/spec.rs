@@ -403,10 +403,11 @@ fn write_conf_file(path: &Path, current: &str, text: &str) -> Result<bool> {
     Ok(true)
 }
 
-fn read_conf_file(path: &Path) -> Result<String> {
+/// The file's content and whether it exists (a missing file reads as empty).
+fn read_conf_file(path: &Path) -> Result<(String, bool)> {
     match fs::read_to_string(path) {
-        Ok(text) => Ok(text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Ok(text) => Ok((text, true)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((String::new(), false)),
         Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
     }
 }
@@ -467,11 +468,41 @@ pub fn update_pg_ident(
     Ok(())
 }
 
+/// [`update_pg_ident`] and [`update_pg_hba`] together: both files are computed
+/// and checked first, then `pg_ident.conf` is written before `pg_hba.conf`
+/// (and put back when `pg_hba.conf` can't be written, see
+/// [`write_ident_then_hba`]).
+pub fn update_pg_hba_and_ident(
+    pgdata_path: &Path,
+    databricks_pg_hba: Option<&String>,
+    databricks_pg_ident: Option<&String>,
+    member_logins: Option<&MemberLogins>,
+    realtime_logins: Option<&MemberLogins>,
+    tls: bool,
+) -> Result<()> {
+    let hba = plan_pg_hba(
+        pgdata_path,
+        databricks_pg_hba,
+        member_logins,
+        realtime_logins,
+        tls,
+    )?;
+    let ident = plan_pg_ident(
+        pgdata_path,
+        databricks_pg_ident,
+        member_logins,
+        realtime_logins,
+    )?;
+    write_ident_then_hba(&ident, &hba)
+}
+
 /// A configuration file's new content, computed and checked but not written yet,
 /// so several files can be rewritten all-or-nothing.
 pub(crate) struct ConfRewrite {
     path: std::path::PathBuf,
     current: String,
+    /// Whether the file existed when `current` was read.
+    existed: bool,
     updated: String,
 }
 
@@ -485,6 +516,41 @@ impl ConfRewrite {
         }
         Ok(wrote)
     }
+
+    /// Puts the file's earlier content back after [`Self::write`] wrote (a file
+    /// that didn't exist is removed again).
+    fn restore(&self) -> Result<()> {
+        if self.existed {
+            write_conf_file(&self.path, &self.updated, &self.current)?;
+        } else {
+            match fs::remove_file(&self.path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(e).with_context(|| format!("remove {}", self.path.display()));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Writes `pg_ident.conf`, then `pg_hba.conf`; when the `pg_hba.conf` write
+/// fails, `pg_ident.conf` is put back as it was. So a failed write never leaves
+/// new hba lines mapping through an old ident map (nor, rolled back, the other
+/// way round): either both files are new or both are as they were (short of
+/// the rollback itself failing, which is logged and the hba error returned).
+pub(crate) fn write_ident_then_hba(ident: &ConfRewrite, hba: &ConfRewrite) -> Result<()> {
+    let ident_wrote = ident.write()?;
+    if let Err(e) = hba.write() {
+        if ident_wrote && let Err(restore) = ident.restore() {
+            tracing::error!(
+                "pg_hba.conf couldn't be written and pg_ident.conf couldn't be put back: {restore:#}"
+            );
+        }
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// `text` with `line` (compared without its line end) added at the end unless a
@@ -523,7 +589,7 @@ pub(crate) fn plan_pg_hba(
     // lines: loopback and the Unix socket don't admit those roles either.
     let member_block = member_hba_block(member_logins, cert_tls)?;
     let realtime_block = realtime_hba_block(realtime_logins, cert_tls)?;
-    let current = read_conf_file(&pghba_path)?;
+    let (current, existed) = read_conf_file(&pghba_path)?;
     let updated = replace_marked_block(
         &current,
         MEMBER_HBA_HEAD,
@@ -532,15 +598,25 @@ pub(crate) fn plan_pg_hba(
         "pg_hba.conf",
         0,
     )?;
-    let after_member = after_marked_block(&updated, MEMBER_HBA_HEAD, MEMBER_HBA_TAIL);
+    // The realtime block goes right after the member block wherever it is now:
+    // a block moved by hand (above the member block, below the `trust` lines or
+    // the catch-all) is moved back, and lines that sat between the two blocks
+    // follow it, so nothing (a hand-written `trust` line) admits
+    // `chelabase_realtime` before its own lines. A block cut short is an error.
     let updated = replace_marked_block(
         &updated,
         REALTIME_HBA_HEAD,
         REALTIME_HBA_TAIL,
-        &realtime_block,
+        "",
         "pg_hba.conf",
-        after_member,
+        0,
     )?;
+    let after_member = after_marked_block(&updated, MEMBER_HBA_HEAD, MEMBER_HBA_TAIL);
+    let updated = format!(
+        "{}{realtime_block}{}",
+        &updated[..after_member],
+        &updated[after_member..]
+    );
 
     // Update pg_hba to contains databricks specfic settings before adding neon settings
     // PG uses the first record that matches to perform authentication, so we need to have
@@ -558,6 +634,7 @@ pub(crate) fn plan_pg_hba(
     Ok(ConfRewrite {
         path: pghba_path,
         current,
+        existed,
         updated,
     })
 }
@@ -591,7 +668,7 @@ pub(crate) fn plan_pg_ident(
         "{REALTIME_IDENT_HEAD}\n{}{REALTIME_IDENT_TAIL}\n",
         realtime_ident_lines(realtime_logins)?
     );
-    let current = read_conf_file(&pgident_path)?;
+    let (current, existed) = read_conf_file(&pgident_path)?;
     // A file written before a block's markers existed: its unmarked lines of
     // that map go, the block replaces them (so no CN stays mapped outside it).
     let base = without_unmarked_map(
@@ -636,6 +713,7 @@ pub(crate) fn plan_pg_ident(
     Ok(ConfRewrite {
         path: pgident_path,
         current,
+        existed,
         updated,
     })
 }

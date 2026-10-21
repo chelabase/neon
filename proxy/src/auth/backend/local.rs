@@ -35,6 +35,7 @@ impl LocalBackend {
             compute_ctl: ComputeCtlApi {
                 api: http::Endpoint::new(compute_ctl, http::new_client()),
                 token_file: compute_ctl_token_file,
+                invalid_warned: crate::compute_ctl::WarnLimiter::default(),
             },
             node_info: NodeInfo {
                 conn_info: ConnectInfo {

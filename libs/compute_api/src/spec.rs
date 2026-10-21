@@ -194,7 +194,7 @@ pub struct ComputeSpec {
     /// Address of endpoint storage service
     pub endpoint_storage_addr: Option<String>,
     /// JWT for authorizing requests to endpoint storage service
-    pub endpoint_storage_token: Option<String>,
+    pub endpoint_storage_token: Option<EndpointStorageToken>,
 
     #[serde(default)]
     /// Download LFC state from endpoint storage and pass it to Postgres on compute startup
@@ -259,6 +259,35 @@ impl From<String> for StorageAuthToken {
 impl std::fmt::Debug for StorageAuthToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("StorageAuthToken(<redacted>)")
+    }
+}
+
+/// The JWT of a compute's endpoint storage requests ([`ComputeSpec::endpoint_storage_token`]).
+/// Like [`StorageAuthToken`], its `Debug` never prints the value and the wire
+/// format is a plain string; the value is only reached through [`Self::as_str`].
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct EndpointStorageToken(String);
+
+impl EndpointStorageToken {
+    pub fn new(token: String) -> Self {
+        Self(token)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for EndpointStorageToken {
+    fn from(token: String) -> Self {
+        Self(token)
+    }
+}
+
+impl std::fmt::Debug for EndpointStorageToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EndpointStorageToken(<redacted>)")
     }
 }
 

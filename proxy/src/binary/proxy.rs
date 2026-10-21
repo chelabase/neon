@@ -118,6 +118,11 @@ struct ProxyCliArgs {
         env = "NEON_PROXY_TO_CONTROLPLANE_TOKEN"
     )]
     control_plane_token: Arc<str>,
+    /// file holding the JWT used to connect to control plane (one line), read once at
+    /// startup; keeps the token off the command line and out of the environment.
+    /// Excludes a non-empty `--control-plane-token`.
+    #[clap(long, value_name = "PATH")]
+    control_plane_token_file: Option<Utf8PathBuf>,
     /// if this is not local proxy, this toggles whether we accept jwt or passwords for http
     #[clap(long, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set)]
     is_auth_broker: bool,
@@ -790,6 +795,8 @@ fn build_auth_backend(
 ) -> anyhow::Result<Either<&'static auth::Backend<'static, ()>, &'static ConsoleRedirectBackend>> {
     match &args.auth_backend {
         AuthBackendType::ControlPlane => {
+            // First: a bad token file fails the startup before anything is spawned.
+            let control_plane_token = control_plane_token(args)?;
             let wake_compute_cache_config: CacheOptions = args.wake_compute_cache.parse()?;
             let project_info_cache_config: ProjectInfoCacheOptions =
                 args.project_info_cache.parse()?;
@@ -832,7 +839,7 @@ fn build_auth_backend(
 
             let api = control_plane::client::cplane_proxy_v1::NeonControlPlaneClient::new(
                 endpoint,
-                args.control_plane_token.clone(),
+                control_plane_token,
                 caches,
                 locks,
                 wake_compute_endpoint_rate_limiter,
@@ -868,6 +875,8 @@ fn build_auth_backend(
         }
 
         AuthBackendType::ConsoleRedirect => {
+            // First: a bad token file fails the startup before anything is spawned.
+            let control_plane_token = control_plane_token(args)?;
             let wake_compute_cache_config: CacheOptions = args.wake_compute_cache.parse()?;
             let project_info_cache_config: ProjectInfoCacheOptions =
                 args.project_info_cache.parse()?;
@@ -911,7 +920,7 @@ fn build_auth_backend(
             // but they are required by the NeonControlPlaneClient
             let api = control_plane::client::cplane_proxy_v1::NeonControlPlaneClient::new(
                 endpoint,
-                args.control_plane_token.clone(),
+                control_plane_token,
                 caches,
                 locks,
                 wake_compute_endpoint_rate_limiter,
@@ -939,11 +948,75 @@ fn build_auth_backend(
     }
 }
 
-/// Connection info for `--redis-auth-type=plain`. With a password file, the
-/// URL must carry no password: the file's content (one trailing newline
-/// trimmed) is set through the `url` crate, which percent-encodes it. Fails
-/// closed on an empty or unreadable file or a URL that already has a password.
-/// No error ever contains the URL or a password.
+/// The longest secret file [`read_secret_file`] reads.
+const MAX_SECRET_FILE_LEN: u64 = 64 * 1024;
+
+/// The secret in the file `path` given by `flag`: its content with one
+/// trailing `\n` trimmed, read once at startup. The open is `O_NONBLOCK` and
+/// only a regular file is read, so a FIFO at the path never blocks the
+/// startup. An unreadable, missing, non-regular, oversized, non-UTF-8 or empty
+/// file, or a control character (`char::is_control`, a second newline or a
+/// `\r` included) in the secret, is an error naming `flag` and the path, never
+/// the content.
+fn read_secret_file(path: &Utf8Path, flag: &str) -> anyhow::Result<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("cannot read {flag} {path}: {e}"))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| anyhow::anyhow!("cannot read {flag} {path}: {e}"))?;
+    if !meta.file_type().is_file() {
+        bail!("{flag} {path} is not a regular file");
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_SECRET_FILE_LEN + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| anyhow::anyhow!("cannot read {flag} {path}: {e}"))?;
+    if bytes.len() as u64 > MAX_SECRET_FILE_LEN {
+        bail!("{flag} {path} is larger than {MAX_SECRET_FILE_LEN} bytes");
+    }
+    let content =
+        String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("{flag} {path} is not UTF-8"))?;
+    let secret = content.strip_suffix('\n').unwrap_or(&content);
+    if secret.is_empty() {
+        bail!("{flag} {path} is empty");
+    }
+    if secret.chars().any(char::is_control) {
+        bail!("{flag} {path} holds a control character (one line, one optional trailing newline)");
+    }
+    Ok(secret.to_owned())
+}
+
+/// The JWT the proxy sends to the control plane: the content of
+/// `--control-plane-token-file` when it's given (see [`read_secret_file`]; a
+/// non-empty `--control-plane-token` or `NEON_PROXY_TO_CONTROLPLANE_TOKEN`
+/// together with it is an error), else `--control-plane-token` as before. No
+/// error ever contains a token.
+fn control_plane_token(args: &ProxyCliArgs) -> anyhow::Result<Arc<str>> {
+    const FLAG: &str = "--control-plane-token-file";
+    let Some(file) = &args.control_plane_token_file else {
+        return Ok(args.control_plane_token.clone());
+    };
+    if !args.control_plane_token.is_empty() {
+        bail!(
+            "{FLAG} excludes --control-plane-token (and NEON_PROXY_TO_CONTROLPLANE_TOKEN): give the token one way only"
+        );
+    }
+    Ok(Arc::from(read_secret_file(file, FLAG)?))
+}
+
+/// Connection info for `--redis-auth-type=plain`. The URL is `redis://` or
+/// `rediss://`. With a password file, the URL must carry no password: the
+/// file's content (one trailing newline trimmed, see [`read_secret_file`]) is
+/// set through the `url` crate, which percent-encodes it. Fails closed on an
+/// empty, unreadable or non-regular file, a control character in the password
+/// or a URL that already has a password. No error ever contains the URL or a
+/// password.
 fn plain_redis_connection_info(
     url: &str,
     password_file: Option<&Utf8Path>,
@@ -952,6 +1025,11 @@ fn plain_redis_connection_info(
 
     const INVALID: &str = "--redis-plain is not a valid redis URL";
     let mut url = url::Url::parse(url).map_err(|_| anyhow::anyhow!(INVALID))?;
+    // A Unix socket, a sentinel or another scheme the redis crate may know is
+    // not what this flag configures. (`Url` lowercases the scheme.)
+    if !matches!(url.scheme(), "redis" | "rediss") {
+        bail!("--redis-plain must be a redis:// or rediss:// URL");
+    }
 
     if let Some(file) = password_file {
         if url.password().is_some() {
@@ -959,12 +1037,7 @@ fn plain_redis_connection_info(
                 "--redis-plain must not contain a password when --redis-plain-password-file is given"
             );
         }
-        let content = std::fs::read_to_string(file)
-            .map_err(|e| anyhow::anyhow!("cannot read --redis-plain-password-file {file}: {e}"))?;
-        let password = content.strip_suffix('\n').unwrap_or(&content);
-        if password.is_empty() {
-            bail!("--redis-plain-password-file {file} is empty");
-        }
+        let password = read_secret_file(file, "--redis-plain-password-file")?;
         // `set_password` percent-encodes reserved characters but leaves `%`
         // alone, and the redis crate decodes the userinfo: escape `%` first so
         // the password round-trips verbatim.
@@ -980,6 +1053,13 @@ fn plain_redis_connection_info(
 async fn configure_redis(
     args: &ProxyCliArgs,
 ) -> anyhow::Result<Option<ConnectionWithCredentialsProvider>> {
+    // A password file another auth type would ignore is a mistake, not a no-op.
+    if args.redis_plain_password_file.is_some() && args.redis_auth_type != "plain" {
+        bail!(
+            "--redis-plain-password-file is given, but --redis-auth-type is {:?}: it needs --redis-auth-type=plain",
+            args.redis_auth_type
+        );
+    }
     // TODO: untangle the config args
     let redis_client = match &*args.redis_auth_type {
         "plain" => match &args.redis_plain {
@@ -1031,6 +1111,9 @@ mod secret_tests;
 
 #[cfg(test)]
 mod cp_token_tests;
+
+#[cfg(test)]
+mod f1_edge_tests;
 
 #[cfg(test)]
 mod tests {

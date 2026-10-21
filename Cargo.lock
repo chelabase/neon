@@ -5696,6 +5696,7 @@ dependencies = [
  "jose-jwk",
  "json",
  "lasso",
+ "libc",
  "measured",
  "metrics",
  "moka",

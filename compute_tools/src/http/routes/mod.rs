@@ -36,7 +36,17 @@ impl From<&ComputeState> for ComputeStatusResponse {
             status: state.status,
             last_active: state.last_active,
             error: state.error.clone(),
-            capabilities: COMPUTE_CAPABILITIES.iter().map(|c| c.to_string()).collect(),
+            // SP6: `storage_token_refresh` only while this compute holds a storage
+            // token; one without (or with no spec yet) refuses `POST /storage_token`.
+            capabilities: if state
+                .pspec
+                .as_ref()
+                .is_some_and(|pspec| pspec.storage_auth_token.is_some())
+            {
+                COMPUTE_CAPABILITIES.iter().map(|c| c.to_string()).collect()
+            } else {
+                Vec::new()
+            },
         }
     }
 }

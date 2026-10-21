@@ -6,7 +6,7 @@
 //!   JWKS is a 401, not a panic; a `metrics` token signed by a key without
 //!   `kid` opens `/metrics`.
 //! - pg_hba/pg_ident: a realtime block moved above the member block by hand is
-//!   replaced where it is; a CRLF realtime block is replaced; stray unmarked
+//!   replaced right after it (final fix round); a CRLF realtime block is replaced; stray unmarked
 //!   `chelabase_realtime` ident lines go when the realtime map is first
 //!   written (no CN stays mapped outside the block) and are kept once the
 //!   block exists; an empty `client_cns` in the hba block alone is accepted
@@ -305,7 +305,7 @@ fn pgdata(name: &str) -> PathBuf {
 }
 
 #[test]
-fn a_realtime_block_above_the_member_block_is_replaced_where_it_is() {
+fn a_realtime_block_above_the_member_block_is_replaced_after_it() {
     let dir = pgdata("k4_edges_moved");
     let hba = dir.join("pg_hba.conf");
     let ml = logins(&["10.213.4.10/32"], &["chelabase-orchestrator"]);
@@ -321,10 +321,12 @@ fn a_realtime_block_above_the_member_block_is_replaced_where_it_is() {
     )
     .unwrap();
     update_pg_hba(&dir, None, Some(&ml), Some(&r2), true).unwrap();
+    // Final fix round: the realtime block always goes back right after the
+    // member block (it used to be replaced where it was).
     assert_eq!(
         fs::read_to_string(&hba).unwrap(),
         format!(
-            "{}{member}{MD5}",
+            "{member}{}{MD5}",
             realtime_hba_block(Some(&r2), true).unwrap()
         )
     );

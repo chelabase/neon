@@ -103,28 +103,55 @@ but a non-rogue client never accesses another timeline even by an accident:
 timeline IDs are random and hard to guess.
 
 #### Incoming connections
-All incoming connections are from PostgreSQL clients.
-Their authentication is just plain PostgreSQL authentication and out of scope for this document.
+PostgreSQL clients connect to Postgres itself; their authentication is plain
+PostgreSQL authentication (`pg_hba.conf`, written by `compute_ctl`) and out of
+scope for this document.
 
-There is no administrative API except those provided by PostgreSQL.
+`compute_ctl` runs two HTTP servers:
+- the external one (control plane, metrics scraper) takes a JWT signed by a key
+  of the JWKS in `compute_ctl`'s config, whose claims name this compute (or
+  carry the admin scope);
+- the internal one listens on loopback only and takes, as a bearer, a secret
+  `compute_ctl` draws at every start and writes to its own token file
+  (`compute_ctl_internal.token`, see below). Postgres reads that file through
+  the `neon.compute_ctl_token_file` GUC.
+
+#### Token files
+`compute_ctl` hands secrets to the processes on the compute through files,
+never through the environment, a GUC value or a log line. Each file sits
+outside pgdata (in its parent directory by default; `--internal-api-token-file`
+and `--storage-auth-token-file` override the paths), holds one line
+`<token>\n`, has mode 0600 and is replaced atomically (written to
+`<file>.tmp.<pid>`, synced, renamed over the file). Temporary files a crashed
+start left behind are removed at the next start. `postgresql.conf` names the
+paths, never the tokens, in two postmaster-only GUCs:
+- `neon.storage_auth_token_file`: the tenant storage token (empty when the
+  compute runs without storage auth);
+- `neon.compute_ctl_token_file`: the internal server's secret.
+
+The neon extension re-reads a file whenever it changes, so the control plane
+can refresh the storage token of a running compute (`POST /storage_token` on the
+external server; `/status` lists the `storage_token_refresh` capability only
+while the compute holds a storage token). A missing, empty or invalid file gives
+no token (fail closed).
 
 #### Outgoing connections
 Compute connects to Pageserver for getting pages. The connection string is
 configured by the `neon.pageserver_connstring` PostgreSQL GUC,
-e.g. `postgresql://no_user@localhost:15028`. If the `$NEON_AUTH_TOKEN`
-environment variable is set, it is used as the password for the connection. (The
+e.g. `postgresql://no_user@localhost:15028`. The password of the connection is
+the tenant storage token, read from `neon.storage_auth_token_file`. (The
 pageserver uses JWT tokens for authentication, so the password is really a
 token.)
 
 Compute connects to Safekeepers to write and commit data. The list of safekeeper
-addresses is given in the `neon.safekeepers` GUC. The connections to the
-safekeepers take the password from the `$NEON_AUTH_TOKEN` environment
-variable, if set.
+addresses is given in the `neon.safekeepers` GUC. Those connections take the same
+password from `neon.storage_auth_token_file`.
 
 The `compute_ctl` binary that runs before the PostgreSQL server, and launches
 PostgreSQL, also makes a connection to the pageserver. It uses it to fetch the
-initial "base backup" dump, to initialize the PostgreSQL data directory. It also
-uses `$NEON_AUTH_TOKEN` as the password for the connection.
+initial "base backup" dump, to initialize the PostgreSQL data directory. It
+uses the storage token it holds from its spec (the one it writes to the file)
+as the password for the connection.
 
 ### Pageserver
 #### Overview

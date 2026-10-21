@@ -27,7 +27,8 @@
 #
 # Steps (each in its own `docker run --rm` of the build-tools image, as the
 # image's `nonroot` user, mirroring pr.yml's jobs and commands):
-#   lint        self-tests, actionlint, cargo fmt, clippy, cargo deny (advisories,
+#   lint        self-tests, actionlint, cargo fmt, clippy, the proxy with its default
+#               features (cargo check), cargo deny (advisories,
 #               bans, licenses, sources; all blocking, as in pr.yml), cargo hakari
 #               (workspace_hack up to date), ruff, mypy
 #   build       Postgres <pg> + extensions + Rust binaries (`make ... all`)
@@ -321,6 +322,13 @@ lint_clippy() {
     cargo clippy --features testing $args
 }
 
+# lint_proxy_default_features: the image builds compile the proxy with its default
+# features, but every other step builds with `--features testing`, which can hide a
+# default-feature compile error. Checks the proxy exactly as the images build it.
+lint_proxy_default_features() {
+    cargo check --locked -p proxy
+}
+
 lint_actionlint() {
     local v=1.7.12 sha=8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
     curl -sSfL -o /tmp/actionlint.tar.gz \
@@ -351,6 +359,7 @@ step_lint() {
     check "cargo fmt" cargo fmt --all -- --check
     check "postgres headers" make -j"$(nproc)" postgres-headers
     check "cargo clippy" lint_clippy
+    check "proxy with default features" lint_proxy_default_features
     check "cargo deny (advisories, bans, licenses, sources)" cargo deny check --hide-inclusion-graph
     check "cargo hakari (workspace_hack)" lint_hakari
     check "python deps" ./scripts/pysync

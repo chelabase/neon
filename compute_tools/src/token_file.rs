@@ -122,6 +122,46 @@ fn write_new_file(tmp: &Path, token: &str) -> Result<()> {
     Ok(())
 }
 
+/// Removes every temporary file a crashed writer of `path` left behind: each
+/// entry of `path`'s directory named `<file name of path>.tmp.<anything>`,
+/// whatever pid wrote it. A symlink is removed itself, never its target; a
+/// directory of that name is an error. A missing directory is `Ok`. compute_ctl
+/// calls it at start for both token files, before it writes either.
+pub fn remove_stale_temp_files(path: &Path) -> Result<()> {
+    let file_name = path
+        .file_name()
+        .with_context(|| format!("token file path {} has no file name", path.display()))?;
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let mut prefix = file_name.as_encoded_bytes().to_vec();
+    prefix.extend_from_slice(b".tmp.");
+
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("list {}", dir.display())),
+    };
+    for entry in entries {
+        let entry = entry.with_context(|| format!("list {}", dir.display()))?;
+        let name = entry.file_name();
+        let name = name.as_encoded_bytes();
+        if name.len() <= prefix.len() || !name.starts_with(&prefix) {
+            continue;
+        }
+        // `remove_file` unlinks the entry itself: a symlink goes, its target stays.
+        match fs::remove_file(entry.path()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("remove stale {}", entry.path().display()));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Removes a token file left by an earlier start (a missing file is fine).
 pub fn remove_token_file(path: &Path) -> Result<()> {
     match fs::remove_file(path) {

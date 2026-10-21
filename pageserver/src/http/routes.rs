@@ -1903,7 +1903,7 @@ async fn update_tenant_config_handler(
 ) -> Result<Response<Body>, ApiError> {
     let request_data: TenantConfigRequest = json_request(&mut request).await?;
     let tenant_id = request_data.tenant_id;
-    check_permission(&request, Some(tenant_id))?;
+    check_permission(&request, None)?;
 
     let new_tenant_conf = request_data.config;
 
@@ -1946,7 +1946,7 @@ async fn patch_tenant_config_handler(
 ) -> Result<Response<Body>, ApiError> {
     let request_data: TenantConfigPatchRequest = json_request(&mut request).await?;
     let tenant_id = request_data.tenant_id;
-    check_permission(&request, Some(tenant_id))?;
+    check_permission(&request, None)?;
 
     let state = get_state(&request);
 
@@ -3873,10 +3873,10 @@ enum RouteAuth {
     /// tenant's token or `PageServerApi`. A path naming no tenant (or one that doesn't
     /// parse) is a management route: `PageServerApi` only.
     Path,
-    /// The route names its tenant only in the request body, so the handler checks that
-    /// tenant once it has read the body. Before that, a token that can't pass for any
-    /// tenant (its own one, for a tenant token) is refused.
-    TenantInBody,
+    /// A control-plane route (shard split, location config, secondary mode, tenant
+    /// delete, the tenant config routes…): `PageServerApi` only, whatever tenant the
+    /// path or the body names. No tenant token passes, not even for its own tenant.
+    Global,
 }
 
 /// The tenant a route's path names (its `:tenant_shard_id` or `:tenant_id` parameter),
@@ -3898,7 +3898,7 @@ fn route_permission(
 ) -> Result<(), AuthError> {
     match auth {
         RouteAuth::Path => crate::auth::check_permission(claims, route_tenant),
-        RouteAuth::TenantInBody => crate::auth::check_permission(claims, claims.tenant_id),
+        RouteAuth::Global => crate::auth::check_permission(claims, None),
     }
 }
 
@@ -3933,9 +3933,9 @@ where
     api_handler_with(RouteAuth::Path, request, handler).await
 }
 
-/// `api_handler` for a route that names its tenant only in the request body
-/// ([`RouteAuth::TenantInBody`]): its handler must check the body's tenant.
-async fn api_handler_tenant_in_body<R, H>(
+/// `api_handler` for a control-plane route that takes `PageServerApi` only
+/// ([`RouteAuth::Global`]), whatever tenant it names.
+async fn api_handler_global<R, H>(
     request: Request<Body>,
     handler: H,
 ) -> Result<Response<Body>, ApiError>
@@ -3943,7 +3943,7 @@ where
     R: std::future::Future<Output = Result<Response<Body>, ApiError>> + Send + 'static,
     H: FnOnce(Request<Body>, CancellationToken) -> R + Send + Sync + 'static,
 {
-    api_handler_with(RouteAuth::TenantInBody, request, handler).await
+    api_handler_with(RouteAuth::Global, request, handler).await
 }
 
 async fn api_handler_with<R, H>(
@@ -4053,11 +4053,37 @@ where
     R: std::future::Future<Output = Result<Response<Body>, ApiError>> + Send + 'static,
     H: FnOnce(Request<Body>, CancellationToken) -> R + Send + Sync + 'static,
 {
+    testing_api_handler_with(RouteAuth::Path, desc, request, handler).await
+}
+
+/// `testing_api_handler` for a control-plane route ([`RouteAuth::Global`]).
+async fn testing_api_handler_global<R, H>(
+    desc: &str,
+    request: Request<Body>,
+    handler: H,
+) -> Result<Response<Body>, ApiError>
+where
+    R: std::future::Future<Output = Result<Response<Body>, ApiError>> + Send + 'static,
+    H: FnOnce(Request<Body>, CancellationToken) -> R + Send + Sync + 'static,
+{
+    testing_api_handler_with(RouteAuth::Global, desc, request, handler).await
+}
+
+async fn testing_api_handler_with<R, H>(
+    auth: RouteAuth,
+    desc: &str,
+    request: Request<Body>,
+    handler: H,
+) -> Result<Response<Body>, ApiError>
+where
+    R: std::future::Future<Output = Result<Response<Body>, ApiError>> + Send + 'static,
+    H: FnOnce(Request<Body>, CancellationToken) -> R + Send + Sync + 'static,
+{
     if cfg!(feature = "testing") {
-        api_handler(request, handler).await
+        api_handler_with(auth, request, handler).await
     } else {
         // Refused for the token first, as on a server with the testing APIs.
-        authorize_route(&request, RouteAuth::Path)?;
+        authorize_route(&request, auth)?;
         std::future::ready(Err(ApiError::BadRequest(anyhow!(
             "Cannot {desc} because pageserver was compiled without testing APIs",
         ))))
@@ -4124,31 +4150,31 @@ pub fn make_router(
             api_handler(r, tenant_status)
         })
         .delete("/v1/tenant/:tenant_shard_id", |r| {
-            api_handler(r, tenant_delete_handler)
+            api_handler_global(r, tenant_delete_handler)
         })
         .get("/v1/tenant/:tenant_shard_id/synthetic_size", |r| {
             api_handler(r, tenant_size_handler)
         })
         .patch("/v1/tenant/config", |r| {
-            api_handler_tenant_in_body(r, patch_tenant_config_handler)
+            api_handler_global(r, patch_tenant_config_handler)
         })
         .put("/v1/tenant/config", |r| {
-            api_handler_tenant_in_body(r, update_tenant_config_handler)
+            api_handler_global(r, update_tenant_config_handler)
         })
         .put("/v1/tenant/:tenant_shard_id/shard_split", |r| {
-            api_handler(r, tenant_shard_split_handler)
+            api_handler_global(r, tenant_shard_split_handler)
         })
         .get("/v1/tenant/:tenant_shard_id/config", |r| {
             api_handler(r, get_tenant_config_handler)
         })
         .put("/v1/tenant/:tenant_shard_id/location_config", |r| {
-            api_handler(r, put_tenant_location_config_handler)
+            api_handler_global(r, put_tenant_location_config_handler)
         })
         .get("/v1/location_config", |r| {
             api_handler(r, list_location_config_handler)
         })
         .get("/v1/location_config/:tenant_shard_id", |r| {
-            api_handler(r, get_location_config_handler)
+            api_handler_global(r, get_location_config_handler)
         })
         .put(
             "/v1/tenant/:tenant_shard_id/time_travel_remote_storage",
@@ -4273,10 +4299,10 @@ pub fn make_router(
             |r| api_handler(r, timeline_page_trace_handler),
         )
         .post("/v1/tenant/:tenant_shard_id/heatmap_upload", |r| {
-            api_handler(r, secondary_upload_handler)
+            api_handler_global(r, secondary_upload_handler)
         })
         .get("/v1/tenant/:tenant_id/scan_remote_storage", |r| {
-            api_handler(r, tenant_scan_remote_handler)
+            api_handler_global(r, tenant_scan_remote_handler)
         })
         .put("/v1/disk_usage_eviction/run", |r| {
             api_handler(r, disk_usage_eviction_run)
@@ -4285,16 +4311,16 @@ pub fn make_router(
             api_handler(r, deletion_queue_flush)
         })
         .get("/v1/tenant/:tenant_shard_id/secondary/status", |r| {
-            api_handler(r, secondary_status_handler)
+            api_handler_global(r, secondary_status_handler)
         })
         .post("/v1/tenant/:tenant_shard_id/secondary/download", |r| {
-            api_handler(r, secondary_download_handler)
+            api_handler_global(r, secondary_download_handler)
         })
         .post("/v1/tenant/:tenant_shard_id/wait_lsn", |r| {
-            api_handler(r, wait_lsn_handler)
+            api_handler_global(r, wait_lsn_handler)
         })
         .put("/v1/tenant/:tenant_shard_id/break", |r| {
-            testing_api_handler("set tenant state to broken", r, handle_tenant_break)
+            testing_api_handler_global("set tenant state to broken", r, handle_tenant_break)
         })
         .get("/v1/panic", |r| api_handler(r, always_panic_handler))
         .post("/v1/tracing/event", |r| {

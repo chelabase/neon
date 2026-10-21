@@ -6,8 +6,8 @@ use compute_api::responses::{
     LfcPrewarmState, PromoteState, TlsConfig,
 };
 use compute_api::spec::{
-    ComputeAudit, ComputeFeature, ComputeMode, ComputeSpec, ExtVersion, GenericOption,
-    PageserverConnectionInfo, PageserverProtocol, PgIdent, Role, StorageAuthToken,
+    ComputeAudit, ComputeFeature, ComputeMode, ComputeSpec, EndpointStorageToken, ExtVersion,
+    GenericOption, PageserverConnectionInfo, PageserverProtocol, PgIdent, Role, StorageAuthToken,
 };
 use futures::StreamExt;
 use futures::future::join_all;
@@ -315,7 +315,7 @@ pub struct ParsedSpec {
     pub storage_auth_token: Option<StorageAuthToken>,
     /// k8s dns name and port
     pub endpoint_storage_addr: Option<String>,
-    pub endpoint_storage_token: Option<String>,
+    pub endpoint_storage_token: Option<EndpointStorageToken>,
 }
 
 /// Why `POST /storage_token` changed nothing.
@@ -503,10 +503,12 @@ impl TryFrom<ComputeSpec> for ParsedSpec {
             .endpoint_storage_addr
             .clone()
             .or_else(|| spec.cluster.settings.find("neon.endpoint_storage_addr"));
-        let endpoint_storage_token = spec
-            .endpoint_storage_token
-            .clone()
-            .or_else(|| spec.cluster.settings.find("neon.endpoint_storage_token"));
+        let endpoint_storage_token = spec.endpoint_storage_token.clone().or_else(|| {
+            spec.cluster
+                .settings
+                .find("neon.endpoint_storage_token")
+                .map(EndpointStorageToken::from)
+        });
 
         let res = ParsedSpec {
             spec,
@@ -836,6 +838,15 @@ impl ComputeNode {
 
         // The internal API's secret goes to its file before anything can call
         // the internal server or Postgres starts (D2): every caller reads it there.
+        // First, the temporary files a crashed earlier start left next to either
+        // token file (whatever its pid) go, before either file is written.
+        for path in [
+            &this.params.internal_api_token_file,
+            &this.params.storage_auth_token_file,
+        ] {
+            token_file::remove_stale_temp_files(path)
+                .context("remove stale token temporary files")?;
+        }
         this.write_internal_api_token_file()?;
 
         // Launch the external HTTP server first, so that we can serve control plane
@@ -1795,29 +1806,24 @@ impl ComputeNode {
             )?;
 
             // Update pg_hba.conf received with basebackup including additional databricks settings.
-            update_pg_hba(
+            update_pg_hba_and_ident(
                 pgdata_path,
                 Some(&settings.databricks_pg_hba),
+                Some(&settings.databricks_pg_ident),
                 member_logins,
                 realtime_logins,
                 tls_config.is_some(),
             )?;
-            update_pg_ident(
-                pgdata_path,
-                Some(&settings.databricks_pg_ident),
-                member_logins,
-                realtime_logins,
-            )?;
         } else {
             // Update pg_hba.conf received with basebackup.
-            update_pg_hba(
+            update_pg_hba_and_ident(
                 pgdata_path,
+                None,
                 None,
                 member_logins,
                 realtime_logins,
                 tls_config.is_some(),
             )?;
-            update_pg_ident(pgdata_path, None, member_logins, realtime_logins)?;
         }
 
         if let Some(databricks_settings) = spec.databricks_settings.as_ref() {
@@ -2868,6 +2874,7 @@ LIMIT 100",
             .map(|row| row.get(0));
 
         // sanitize the inputs as postgres idents.
+        let unquoted_name: &str = ext_name;
         let ext_name: String = ext_name.pg_quote();
         let quoted_version: String = ext_version.pg_quote();
 
@@ -2875,6 +2882,46 @@ LIMIT 100",
             if installed_version == ext_version {
                 return Ok(installed_version);
             }
+            // `ALTER EXTENSION ... UPDATE` runs the script of every version on its
+            // update path after the installed one, each under that version's own
+            // control file: every one of them must be trusted, not just the target.
+            let path: Option<Option<String>> = db_client
+                .query_opt(
+                    "SELECT path FROM pg_catalog.pg_extension_update_paths($1::pg_catalog.name)
+                    WHERE source OPERATOR(pg_catalog.=) $2::pg_catalog.text
+                        AND target OPERATOR(pg_catalog.=) $3::pg_catalog.text",
+                    &[&unquoted_name, &installed_version, &ext_version],
+                )
+                .await
+                .context("Failed to look up the extension's update path")?
+                .map(|row| row.get(0));
+            let Some(Some(path)) = path else {
+                return Err(RequestRefused(
+                    "no update path to that extension version is available".into(),
+                )
+                .into());
+            };
+            let steps: Vec<String> = path.split("--").skip(1).map(str::to_owned).collect();
+            let trusted_steps: i64 = db_client
+                .query_one(
+                    "SELECT count(*) FROM pg_catalog.pg_available_extension_versions
+                    WHERE name OPERATOR(pg_catalog.=) $1::pg_catalog.name
+                        AND version OPERATOR(pg_catalog.=) ANY($2::pg_catalog.text[])
+                        AND trusted",
+                    &[&unquoted_name, &steps],
+                )
+                .await
+                .context("Failed to look up the extension's update path")?
+                .get(0);
+            let distinct_steps = steps.iter().collect::<std::collections::HashSet<_>>().len();
+            if steps.is_empty() || trusted_steps != distinct_steps as i64 {
+                return Err(RequestRefused(
+                    "only trusted extensions can be installed: a version on the update path is not trusted"
+                        .into(),
+                )
+                .into());
+            }
+
             let query = format!("ALTER EXTENSION {ext_name} UPDATE TO {quoted_version}");
             db_client
                 .simple_query(&query)
