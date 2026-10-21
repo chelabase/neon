@@ -23,11 +23,18 @@ pub struct LocalBackend {
 }
 
 impl LocalBackend {
-    pub fn new(postgres_addr: SocketAddr, compute_ctl: ApiUrl) -> Self {
+    /// `compute_ctl_token_file` is read before every compute_ctl call; a
+    /// missing or invalid file is no error here (the call goes out unauthenticated).
+    pub fn new(
+        postgres_addr: SocketAddr,
+        compute_ctl: ApiUrl,
+        compute_ctl_token_file: Option<camino::Utf8PathBuf>,
+    ) -> Self {
         LocalBackend {
             initialize: Semaphore::new(1),
             compute_ctl: ComputeCtlApi {
                 api: http::Endpoint::new(compute_ctl, http::new_client()),
+                token_file: compute_ctl_token_file,
             },
             node_info: NodeInfo {
                 conn_info: ConnectInfo {

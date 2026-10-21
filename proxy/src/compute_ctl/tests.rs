@@ -88,8 +88,8 @@ impl FakeComputeCtl {
                         "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                         body.len()
                     );
-                    let _ = sock.write_all(resp.as_bytes()).await;
-                    let _ = sock.shutdown().await;
+                    drop(sock.write_all(resp.as_bytes()).await);
+                    drop(sock.shutdown().await);
                 });
             }
         });

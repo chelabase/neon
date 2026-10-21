@@ -257,9 +257,8 @@ async fn configure_redis_fails_closed() {
         ),
         ("file without a url", plain_args(None, Some(&good))),
     ] {
-        let e = match configure_redis(&args).await {
-            Ok(_) => panic!("{why}: expected a startup error"),
-            Err(e) => e,
+        let Err(e) = configure_redis(&args).await else {
+            panic!("{why}: expected a startup error")
         };
         assert_clean(&e, &[PW, "inurl"]);
     }
