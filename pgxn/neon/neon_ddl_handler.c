@@ -1838,9 +1838,10 @@ DbRoleSettingHasEntry(Oid dboid, Oid roleid, bool (*match) (const char *entry))
 }
 
 /*
- * The one marker predicate, shared with compute_ctl's /grants refusal and
- * Chelabase's is_marked_sql: an entry starting "chelabase.managed_role=",
- * exactly, whatever its value.
+ * The one marker predicate (SP22), the same as compute_ctl's /grants refusal
+ * and Chelabase's is_marked_sql: an entry starting "chelabase.managed_role=",
+ * exactly (case-sensitive: with the extension loaded, Postgres stores the
+ * GUC's own spelling), whatever its value.
  */
 static bool
 IsManagedRoleMarkerEntry(const char *entry)
@@ -1858,9 +1859,9 @@ RoleMarkedManaged(Oid roleid)
 /*
  * Member roles (cb_m_*, in any case) and chelabase_realtime are managed by
  * Chelabase as a superuser: no other role may create, alter, rename, drop,
- * grant or revoke them, or change their settings or memberships. So is any
- * role marked with chelabase.managed_role (a personal login), whatever its
- * name.
+ * grant or revoke them, or change their settings or memberships. This checks
+ * the name only; a role marked with chelabase.managed_role (a personal
+ * login), whatever its name, is caught by RefuseManagedRoleName's lookup.
  */
 static bool
 IsChelabaseManagedRole(const char *name)
@@ -1977,7 +1978,8 @@ CheckManagedRoleStatement(Node *parseTree)
 	/*
 	 * Other statements need no check, and get no catalog lookup: superuser()
 	 * may have to read pg_authid, which a ROLLBACK in an aborted transaction
-	 * can't.
+	 * can't. Keep this list in step with the switch below: a case missing
+	 * here is never checked.
 	 */
 	switch (nodeTag(parseTree))
 	{
