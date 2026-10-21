@@ -39,6 +39,7 @@
 #include "neon_perf_counters.h"
 #include "neon_utils.h"
 #include "pagestore_client.h"
+#include "token_file.h"
 #include "walproposer.h"
 
 #ifdef __linux__
@@ -72,7 +73,6 @@ char	   *neon_branch_id;
 char	   *neon_endpoint_id;
 int32		max_cluster_size;
 char	   *pageserver_connstring;
-char	   *neon_auth_token;
 
 int			readahead_buffer_size = 128;
 int			flush_every_n_requests = 8;
@@ -454,6 +454,7 @@ pageserver_connect(shardno_t shard_no, int elevel)
 	{
 		const char *keywords[5];
 		const char *values[5];
+		const char *storage_token;
 		char pid_str[16] = { 0 };
 		char endpoint_str[36] = { 0 };
 		int			n_pgsql_params;
@@ -500,14 +501,13 @@ pageserver_connect(shardno_t shard_no, int elevel)
 
 		/*
 		 * Connect using the connection string we got from the
-		 * neon.pageserver_connstring GUC. If the NEON_AUTH_TOKEN environment
-		 * variable was set, use that as the password.
-		 *
-		 * The connection options are parsed in the order they're given, so when
-		 * we set the password before the connection string, the connection string
-		 * can override the password from the env variable. Seems useful, although
-		 * we don't currently use that capability anywhere.
+		 * neon.pageserver_connstring GUC, with the storage token read from
+		 * neon.storage_auth_token_file as the password. The file is looked
+		 * at (one stat()) on every connect, so a reconnect, mid-statement
+		 * included, presents the token compute_ctl wrote last. No usable
+		 * file means no password: the pageserver refuses the connection.
 		 */
+		storage_token = neon_storage_auth_token();
 		n_pgsql_params = 0;
 
 		/*
@@ -528,10 +528,11 @@ pageserver_connect(shardno_t shard_no, int elevel)
 		values[n_pgsql_params] = connstr;
 		n_pgsql_params++;
 
-		if (neon_auth_token)
+		if (storage_token)
 		{
+			/* lifetime: PQconnectStartParams strdups internally */
 			keywords[n_pgsql_params] = "password";
-			values[n_pgsql_params] = neon_auth_token;
+			values[n_pgsql_params] = storage_token;
 			n_pgsql_params++;
 		}
 
@@ -1060,6 +1061,7 @@ hadron_request_configuration_refresh() {
 	static CURL	   *handle = NULL;
 	CURLcode	res;
 	char	   *compute_ctl_url;
+	struct curl_slist *headers;
 	bool cancel_query = false;
 
 	if (!lakebase_mode)
@@ -1074,15 +1076,25 @@ hadron_request_configuration_refresh() {
 		curl_easy_setopt(handle, CURLOPT_POSTFIELDS, "");
 	}
 
-	// Set the URL
-	compute_ctl_url = psprintf("http://localhost:%d/refresh_configuration", hadron_extension_server_port);
+	// Set the URL: compute_ctl's internal server listens on loopback only.
+	compute_ctl_url = psprintf("http://127.0.0.1:%d/refresh_configuration", hadron_extension_server_port);
 
 
 	elog(LOG, "Sending refresh configuration request to compute_ctl: %s", compute_ctl_url);
 
 	curl_easy_setopt(handle, CURLOPT_URL, compute_ctl_url);
 
+	/*
+	 * The bearer is the internal API secret, read from its file before every
+	 * call (a compute_ctl restart writes a new one). Nothing between setting
+	 * and clearing the header list can throw.
+	 */
+	headers = neon_compute_ctl_auth_headers();
+	curl_easy_setopt(handle, CURLOPT_HTTPHEADER, headers);
 	res = curl_easy_perform(handle);
+	curl_easy_setopt(handle, CURLOPT_HTTPHEADER, NULL);
+	curl_slist_free_all(headers);
+
 	if (res != CURLE_OK )
 	{
 		elog(WARNING, "refresh_configuration request failed: %s\n", curl_easy_strerror(res));
@@ -1090,7 +1102,7 @@ hadron_request_configuration_refresh() {
 	else
 	{
 		long http_code = 0;
-		curl_easy_getinfo(handle, CURLINFO_RESPONSE_CODE, &http_code);
+		res = curl_easy_getinfo(handle, CURLINFO_RESPONSE_CODE, &http_code);
 		if ( res != CURLE_OK )
 		{
 			elog(WARNING, "compute_ctl refresh_configuration request getinfo failed: %s\n", curl_easy_strerror(res));
@@ -1634,14 +1646,6 @@ pg_init_libpagestore(void)
 
 	neon_log(PageStoreTrace, "libpagestore already loaded");
 	page_server = &api;
-
-	/*
-	 * Retrieve the auth token to use when connecting to pageserver and
-	 * safekeepers
-	 */
-	neon_auth_token = getenv("NEON_AUTH_TOKEN");
-	if (neon_auth_token)
-		neon_log(LOG, "using storage auth token from NEON_AUTH_TOKEN environment variable");
 
 	if (pageserver_connstring[0])
 	{

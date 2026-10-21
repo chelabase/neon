@@ -141,6 +141,13 @@ disable_core_dump()
 
 #ifndef WALPROPOSER_LIB
 
+/* The default write callback of alloc_curl_handle()'s handles. */
+static size_t
+discard_curl_body(char *ptr, size_t size, size_t nmemb, void *userdata)
+{
+	return size * nmemb;
+}
+
 /*
  * On macOS with a libcurl that has IPv6 support, curl_global_init() calls
  * SCDynamicStoreCopyProxies(), which makes the program multithreaded. An ideal
@@ -178,6 +185,12 @@ alloc_curl_handle(void)
 	{
 		elog(ERROR, "Failed to initialize curl handle");
 	}
+
+	/*
+	 * curl's default writes a response body to stdout, which is the
+	 * postmaster's log; a caller that wants the body sets its own callback.
+	 */
+	curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, discard_curl_body);
 
 	return handle;
 }

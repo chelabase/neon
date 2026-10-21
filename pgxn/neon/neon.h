@@ -13,7 +13,6 @@
 #include "utils/wait_event.h"
 
 /* GUCs */
-extern char *neon_auth_token;
 extern char *neon_timeline;
 extern char *neon_tenant;
 extern char *wal_acceptors_list;
