@@ -1959,7 +1959,7 @@ enum ForwardOutcome {
 /// Potentially forward the request to the current storage controler leader.
 /// More specifically we forward when:
 /// 1. Request is not one of:
-///    ["/control/v1/step_down", "/status", "/ready", "/metrics", "/profile/cpu", "/profile/heap"]
+///    ["/control/v1/step_down", "/status", "/live", "/ready", "/metrics", "/profile/cpu", "/profile/heap"]
 /// 2. Current instance is in [`LeadershipStatus::SteppedDown`] state
 /// 3. There is a leader in the database to forward to
 /// 4. Leader from step (3) is not the current instance
