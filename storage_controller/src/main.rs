@@ -642,3 +642,6 @@ async fn async_main() -> anyhow::Result<()> {
 
     std::process::exit(0);
 }
+
+#[cfg(test)]
+mod main_secret_file_tests;

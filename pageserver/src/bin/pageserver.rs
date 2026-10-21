@@ -959,3 +959,7 @@ fn cli() -> Command {
 fn verify_cli() {
     cli().debug_assert();
 }
+
+#[cfg(test)]
+#[path = "pageserver/auth_token_file_tests.rs"]
+mod auth_token_file_tests;
