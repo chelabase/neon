@@ -40,6 +40,9 @@ use crate::url::ApiUrl;
 project_git_version!(GIT_VERSION);
 project_build_tag!(BUILD_TAG);
 
+#[cfg(test)]
+mod token_tests;
+
 /// Neon proxy/router
 #[derive(Parser)]
 #[command(version = GIT_VERSION, about)]
@@ -73,6 +76,10 @@ struct LocalProxyCliArgs {
     /// Address of the internal compute-ctl api service
     #[clap(long, default_value = "http://127.0.0.1:3081/")]
     compute_ctl: ApiUrl,
+    /// File holding the bearer secret of compute_ctl's internal API. Read
+    /// before every call; a missing or invalid file means no `Authorization` header.
+    #[clap(long, default_value = "/var/db/postgres/compute_ctl_internal.token")]
+    compute_ctl_token_file: Utf8PathBuf,
     /// Path of the local proxy config file
     #[clap(long, default_value = "./local_proxy.json")]
     config_path: Utf8PathBuf,
@@ -313,9 +320,12 @@ fn build_config(args: &LocalProxyCliArgs) -> anyhow::Result<&'static ProxyConfig
 
 /// auth::Backend is created at proxy startup, and lives forever.
 fn build_auth_backend(args: &LocalProxyCliArgs) -> &'static auth::Backend<'static, ()> {
-    let auth_backend = crate::auth::Backend::Local(crate::auth::backend::MaybeOwned::Owned(
-        LocalBackend::new(args.postgres, args.compute_ctl.clone()),
-    ));
+    let auth_backend =
+        crate::auth::Backend::Local(crate::auth::backend::MaybeOwned::Owned(LocalBackend::new(
+            args.postgres,
+            args.compute_ctl.clone(),
+            Some(args.compute_ctl_token_file.clone()),
+        )));
 
     Box::leak(Box::new(auth_backend))
 }

@@ -9,8 +9,7 @@ use std::time::Duration;
 use anyhow::Context;
 use anyhow::{bail, ensure};
 use arc_swap::ArcSwapOption;
-#[cfg(any(test, feature = "testing"))]
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use futures::future::Either;
 use itertools::{Itertools, Position};
 use rand::Rng;
@@ -176,6 +175,13 @@ struct ProxyCliArgs {
     /// redis url for plain authentication
     #[clap(long, alias("redis-notifications"))]
     redis_plain: Option<String>,
+    /// file holding the password for `--redis-plain` (the URL then carries none)
+    #[clap(long)]
+    redis_plain_password_file: Option<Utf8PathBuf>,
+    /// file holding the bearer secret of compute_ctl's internal API (testing `local` backend)
+    #[clap(long)]
+    #[cfg(any(test, feature = "testing"))]
+    compute_ctl_token_file: Option<Utf8PathBuf>,
     /// what from the available authentications type to use for redis. Supported are "irsa" and "plain".
     #[clap(long, default_value = "irsa")]
     redis_auth_type: String,
@@ -921,15 +927,54 @@ fn build_auth_backend(
         AuthBackendType::Local => {
             let postgres: SocketAddr = "127.0.0.1:7432".parse()?;
             let compute_ctl: ApiUrl = "http://127.0.0.1:3081/".parse()?;
-            let auth_backend = crate::auth::Backend::Local(
-                crate::auth::backend::MaybeOwned::Owned(LocalBackend::new(postgres, compute_ctl)),
-            );
+            let auth_backend =
+                crate::auth::Backend::Local(crate::auth::backend::MaybeOwned::Owned(
+                    LocalBackend::new(postgres, compute_ctl, args.compute_ctl_token_file.clone()),
+                ));
 
             let config = Box::leak(Box::new(auth_backend));
 
             Ok(Either::Left(config))
         }
     }
+}
+
+/// Connection info for `--redis-auth-type=plain`. With a password file, the
+/// URL must carry no password: the file's content (one trailing newline
+/// trimmed) is set through the `url` crate, which percent-encodes it. Fails
+/// closed on an empty or unreadable file or a URL that already has a password.
+/// No error ever contains the URL or a password.
+fn plain_redis_connection_info(
+    url: &str,
+    password_file: Option<&Utf8Path>,
+) -> anyhow::Result<redis::ConnectionInfo> {
+    use redis::IntoConnectionInfo;
+
+    const INVALID: &str = "--redis-plain is not a valid redis URL";
+    let mut url = url::Url::parse(url).map_err(|_| anyhow::anyhow!(INVALID))?;
+
+    if let Some(file) = password_file {
+        if url.password().is_some() {
+            bail!(
+                "--redis-plain must not contain a password when --redis-plain-password-file is given"
+            );
+        }
+        let content = std::fs::read_to_string(file)
+            .map_err(|e| anyhow::anyhow!("cannot read --redis-plain-password-file {file}: {e}"))?;
+        let password = content.strip_suffix('\n').unwrap_or(&content);
+        if password.is_empty() {
+            bail!("--redis-plain-password-file {file} is empty");
+        }
+        // `set_password` percent-encodes reserved characters but leaves `%`
+        // alone, and the redis crate decodes the userinfo: escape `%` first so
+        // the password round-trips verbatim.
+        url.set_password(Some(&password.replace('%', "%25")))
+            .map_err(|()| anyhow::anyhow!("{INVALID}: it cannot carry a password"))?;
+    }
+
+    url.as_str()
+        .into_connection_info()
+        .map_err(|_| anyhow::anyhow!(INVALID))
 }
 
 async fn configure_redis(
@@ -939,10 +984,14 @@ async fn configure_redis(
     let redis_client = match &*args.redis_auth_type {
         "plain" => match &args.redis_plain {
             None => {
-                bail!("plain auth requires redis_plain to be set");
+                bail!(
+                    "plain auth requires redis_plain to be set (also with --redis-plain-password-file)"
+                );
             }
             Some(url) => {
-                Some(ConnectionWithCredentialsProvider::new_with_static_credentials(url.clone()))
+                let info =
+                    plain_redis_connection_info(url, args.redis_plain_password_file.as_deref())?;
+                Some(ConnectionWithCredentialsProvider::new_with_static_credentials(info))
             }
         },
         "irsa" => match (&args.redis_host, args.redis_port) {
@@ -976,6 +1025,9 @@ async fn configure_redis(
 
     Ok(redis_client)
 }
+
+#[cfg(test)]
+mod secret_tests;
 
 #[cfg(test)]
 mod tests {
