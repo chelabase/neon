@@ -4,18 +4,21 @@
 //! changes nothing), and neither the secret nor a presented header is ever
 //! logged or echoed.
 //!
-//! The check is an extractor rather than a router layer because the secret
-//! lives in the router's state (`ComputeNode`), which a layer can't reach:
-//! every internal handler takes [`InternalAuth`] as its first argument, so it
-//! runs before any other extractor (path, query, body) and the handler itself.
+//! The check runs twice, through one code path ([`check`]): every internal
+//! handler takes [`InternalAuth`] as its first argument, so it runs before any
+//! other extractor (path, query, body) and the handler itself; and the served
+//! internal router carries [`require`] as a route layer
+//! (`Server::with_internal_auth`), so a route added without the extractor is
+//! still refused.
 
 use std::sync::Arc;
 
-use axum::extract::FromRequestParts;
-use axum::response::{IntoResponse, Response};
+use axum::extract::{FromRequestParts, Request, State};
+use axum::middleware::Next;
+use axum::response::Response;
 use http::header::{AUTHORIZATION, WWW_AUTHENTICATE};
 use http::request::Parts;
-use http::{HeaderValue, StatusCode};
+use http::{HeaderMap, HeaderValue, StatusCode};
 
 use crate::compute::ComputeNode;
 use crate::http::JsonResponse;
@@ -46,6 +49,18 @@ fn presents(header: &[u8], secret: &str) -> bool {
     secrets_match(&header[SCHEME.len()..], secret.as_bytes())
 }
 
+/// The one bearer check: exactly one `Authorization` header, and it is
+/// `Bearer <secret>`. A refusal is always [`unauthorized`].
+fn check(headers: &HeaderMap, compute: &ComputeNode) -> Option<InternalAuth> {
+    let mut values = headers.get_all(AUTHORIZATION).iter();
+    match (values.next(), values.next()) {
+        (Some(value), None) if presents(value.as_bytes(), compute.internal_api_secret()) => {
+            Some(InternalAuth)
+        }
+        _ => None,
+    }
+}
+
 impl FromRequestParts<Arc<ComputeNode>> for InternalAuth {
     type Rejection = Response;
 
@@ -53,13 +68,20 @@ impl FromRequestParts<Arc<ComputeNode>> for InternalAuth {
         parts: &mut Parts,
         compute: &Arc<ComputeNode>,
     ) -> Result<Self, Self::Rejection> {
-        let mut values = parts.headers.get_all(AUTHORIZATION).iter();
-        match (values.next(), values.next()) {
-            (Some(value), None) if presents(value.as_bytes(), compute.internal_api_secret()) => {
-                Ok(InternalAuth)
-            }
-            _ => Err(unauthorized().into_response()),
-        }
+        check(&parts.headers, compute).ok_or_else(unauthorized)
+    }
+}
+
+/// The route-layer form of the check (`middleware::from_fn_with_state`): the
+/// request reaches the route only with the bearer.
+pub(in crate::http) async fn require(
+    State(compute): State<Arc<ComputeNode>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    match check(request.headers(), &compute) {
+        Some(InternalAuth) => next.run(request).await,
+        None => unauthorized(),
     }
 }
 

@@ -762,9 +762,7 @@ impl ComputeNode {
             (true, false) => Some(
                 "the spec has no storage_auth_token, but this compute authenticates to storage; restart the compute to turn storage auth off",
             ),
-            (false, true) => Some(
-                "compute started without storage auth; restart to enable it",
-            ),
+            (false, true) => Some("compute started without storage auth; restart to enable it"),
             _ => None,
         }
     }
@@ -785,7 +783,10 @@ impl ComputeNode {
     /// basebackup, sync and LSN-lease calls read it), under the state lock, in
     /// `running` or `configuration_pending` only. Nothing else changes: no
     /// status change, no reload (the neon extension `stat`s the file).
-    pub fn refresh_storage_token(&self, token: StorageAuthToken) -> Result<(), StorageTokenRefusal> {
+    pub fn refresh_storage_token(
+        &self,
+        token: StorageAuthToken,
+    ) -> Result<(), StorageTokenRefusal> {
         if !token_file::is_valid_token(token.as_str()) {
             return Err(StorageTokenRefusal::InvalidToken);
         }
@@ -845,14 +846,14 @@ impl ComputeNode {
             compute_id: this.params.compute_id.clone(),
             instance_id: this.params.instance_id.clone(),
         }
-        .launch(&this);
+        .launch(&this)?;
 
         // The internal HTTP server could be launched later, but there isn't much
         // sense in waiting.
         crate::http::server::Server::Internal {
             port: this.params.internal_http_port,
         }
-        .launch(&this);
+        .launch(&this)?;
 
         // If we got a spec from the CLI already, use that. Otherwise wait for the
         // control plane to pass it to us with a /configure HTTP request
@@ -2840,16 +2841,12 @@ LIMIT 100",
             .map(|row| row.get(0));
         match trusted {
             None => {
-                return Err(RequestRefused(
-                    "no such extension version is available".into(),
-                )
-                .into());
+                return Err(RequestRefused("no such extension version is available".into()).into());
             }
             Some(false) => {
-                return Err(RequestRefused(
-                    "only trusted extensions can be installed".into(),
-                )
-                .into());
+                return Err(
+                    RequestRefused("only trusted extensions can be installed".into()).into(),
+                );
             }
             Some(true) => {}
         }

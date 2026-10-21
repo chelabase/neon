@@ -3,6 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use axum::Router;
 use axum::middleware::{self};
 use axum::response::IntoResponse;
@@ -19,7 +20,7 @@ use tracing::{Span, error, info, warn};
 use super::middleware::request_id::maybe_add_request_id_header;
 use super::{
     headers::X_REQUEST_ID,
-    middleware::authorize::Authorize,
+    middleware::{authorize::Authorize, internal_auth},
     routes::{
         check_writability, configure, database_schema, dbs_and_roles, extension_server, extensions,
         grants, hadron_liveness_probe, insights, lfc, metrics, metrics_json, promote,
@@ -32,7 +33,8 @@ use crate::compute::ComputeNode;
 /// binds to the loopback interface (127.0.0.1, and ::1 where the host has it)
 /// and handles communication from clients on the compute; every one of its
 /// routes needs the per-start secret as a bearer (D2: each handler takes
-/// `InternalAuth` first). The external server is what receives communication
+/// `InternalAuth` first, and the served router carries the same check as a
+/// route layer, [`Server::with_internal_auth`]). The external server is what receives communication
 /// from the control plane, the metrics scraper, etc. We make the distinction
 /// because certain routes in `compute_ctl` only need to be exposed to local
 /// processes like Postgres via the neon extension and local_proxy.
@@ -115,10 +117,7 @@ impl From<&Server> for Router<Arc<ComputeNode>> {
                     .route("/insights", get(insights::get_insights))
                     .route("/metrics.json", get(metrics_json::get_metrics))
                     .route("/status", get(status::get_status))
-                    .route(
-                        "/storage_token",
-                        post(storage_token::refresh_storage_token),
-                    )
+                    .route("/storage_token", post(storage_token::refresh_storage_token))
                     .route("/terminate", post(terminate::terminate))
                     .route(
                         "/hadron_liveness_probe",
@@ -202,32 +201,68 @@ impl Server {
         }
     }
 
-    /// Binds every listen address. The first one is required: if it can't be
-    /// bound, the compute cannot operate correctly. The internal server's
-    /// `::1` is best effort: a failure is logged once and skipped.
-    async fn listeners(&self) -> Vec<TcpListener> {
+    /// Binds every listen address, synchronously: on `Ok`, every listener is
+    /// bound and accepts connections. Any bind error fails the start, naming
+    /// the address, except the internal server's `::1` on a host without an
+    /// IPv6 loopback (`EADDRNOTAVAIL`, `EAFNOSUPPORT`). Anything else there (a
+    /// local process squatting `[::1]:<port>` included) would hand the bearer
+    /// of every caller dialling `localhost` to someone else. On an error the
+    /// listeners already bound are dropped (released).
+    fn bind(&self) -> anyhow::Result<Vec<std::net::TcpListener>> {
         let mut listeners = Vec::new();
-        for (i, addr) in self.listen_addrs().into_iter().enumerate() {
-            match TcpListener::bind(&addr).await {
-                Ok(listener) => listeners.push(listener),
-                Err(e) if i == 0 => panic!(
-                    "failed to bind the compute_ctl {self} HTTP server to {addr}: {e}"
-                ),
-                Err(e) => warn!(
-                    "compute_ctl {self} HTTP server not listening at {addr} (no IPv6 loopback?): {e}"
-                ),
+        for addr in self.listen_addrs() {
+            match std::net::TcpListener::bind(addr) {
+                Ok(listener) => {
+                    listener.set_nonblocking(true).with_context(|| {
+                        format!("compute_ctl {self} HTTP server: setting {addr} non-blocking")
+                    })?;
+                    listeners.push(listener);
+                }
+                Err(e)
+                    if matches!(self, Server::Internal { .. })
+                        && addr.is_ipv6()
+                        && no_ipv6_loopback(&e) =>
+                {
+                    warn!(
+                        "compute_ctl {self} HTTP server not listening at {addr} (no IPv6 loopback): {e}"
+                    );
+                }
+                Err(e) => {
+                    return Err(anyhow::Error::new(e).context(format!(
+                        "failed to bind the compute_ctl {self} HTTP server to {addr}"
+                    )));
+                }
             }
         }
-        listeners
+        Ok(listeners)
     }
 
-    async fn serve(self, compute: Arc<ComputeNode>) {
-        let router = Router::from(&self)
+    /// The internal router's route layer: the same bearer check as the
+    /// [`InternalAuth`](super::middleware::internal_auth::InternalAuth)
+    /// extractor (one code path), so a route added without the extractor still
+    /// needs the bearer. `serve` applies it to the internal router.
+    pub fn with_internal_auth(
+        router: Router<Arc<ComputeNode>>,
+        compute: &Arc<ComputeNode>,
+    ) -> Router<Arc<ComputeNode>> {
+        router.route_layer(middleware::from_fn_with_state(
+            Arc::clone(compute),
+            internal_auth::require,
+        ))
+    }
+
+    async fn serve(self, listeners: Vec<TcpListener>, compute: Arc<ComputeNode>) {
+        let router = Router::from(&self);
+        let router = match self {
+            Server::Internal { .. } => Server::with_internal_auth(router, &compute),
+            Server::External { .. } => router,
+        };
+        let router = router
             .with_state(compute)
             .into_make_service_with_connect_info::<SocketAddr>();
 
         let mut servers = tokio::task::JoinSet::new();
-        for listener in self.listeners().await {
+        for listener in listeners {
             if let Ok(local_addr) = listener.local_addr() {
                 info!(
                     "compute_ctl {} HTTP server listening at {}",
@@ -244,11 +279,32 @@ impl Server {
         while servers.join_next().await.is_some() {}
     }
 
-    pub fn launch(self, compute: &Arc<ComputeNode>) {
-        let state = Arc::clone(compute);
-
+    /// Binds every listener (see [`Server::listen_addrs`]) and only then spawns
+    /// the serving tasks on the current Tokio runtime. On `Ok` a connection is
+    /// accepted right away; a bind error is returned and nothing stays bound,
+    /// so the caller (`ComputeNode::run`) fails compute_ctl's start.
+    pub fn launch(self, compute: &Arc<ComputeNode>) -> anyhow::Result<()> {
         info!("Launching the {} server", self);
 
-        tokio::spawn(self.serve(state));
+        let listeners = self
+            .bind()?
+            .into_iter()
+            .map(|listener| {
+                let addr = listener.local_addr().ok();
+                TcpListener::from_std(listener).with_context(|| {
+                    format!("compute_ctl {self} HTTP server: registering the listener at {addr:?}")
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        tokio::spawn(self.serve(listeners, Arc::clone(compute)));
+        Ok(())
     }
+}
+
+/// Whether binding an IPv6 address failed because the host has no IPv6
+/// loopback (or no IPv6 at all).
+fn no_ipv6_loopback(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::AddrNotAvailable
+        || e.raw_os_error() == Some(nix::errno::Errno::EAFNOSUPPORT as i32)
 }

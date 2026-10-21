@@ -125,8 +125,8 @@ fn configurator_main_loop(compute: &Arc<ComputeNode>) {
                         // RT4-7, SP6: a refreshed spec can't turn storage auth off
                         // or on (or carry an unwritable token); keep the current
                         // spec and retry later, as for a failed fetch.
-                        if let Some(reason) = ComputeNode::storage_token_refusal(&pspec)
-                            .or_else(|| {
+                        if let Some(reason) =
+                            ComputeNode::storage_token_refusal(&pspec).or_else(|| {
                                 ComputeNode::storage_auth_change_refusal(
                                     state.pspec.as_ref(),
                                     &pspec,

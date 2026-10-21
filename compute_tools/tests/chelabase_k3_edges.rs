@@ -320,7 +320,7 @@ async fn the_launched_internal_server_is_loopback_only() {
         None,
         ComputeStatus::Empty,
     );
-    Server::Internal { port }.launch(&compute);
+    Server::Internal { port }.launch(&compute).unwrap();
 
     let loopback = SocketAddr::from(([127, 0, 0, 1], port));
     let deadline = Instant::now() + Duration::from_secs(10);

@@ -491,7 +491,10 @@ fn render_postgres_conf(
         escape_conf_value(&params.internal_api_token_file.to_string_lossy())
     )?;
     let storage_token_file = if spec_has_storage_token(spec) {
-        params.storage_auth_token_file.to_string_lossy().into_owned()
+        params
+            .storage_auth_token_file
+            .to_string_lossy()
+            .into_owned()
     } else {
         String::new()
     };
