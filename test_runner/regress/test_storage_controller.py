@@ -5006,3 +5006,41 @@ def test_re_attach_with_stuck_secondary(neon_env_builder: NeonEnvBuilder):
     env.storage_controller.pageserver_api().timeline_create(
         pg_version=PgVersion.NOT_SET, tenant_id=tenant_id, new_timeline_id=TimelineId.generate()
     )
+
+
+def test_serialization_failures_back_off(neon_env_builder: NeonEnvBuilder):
+    """
+    A burst of concurrent writes to the storage controller's database collides on
+    serializable transactions. Every request must still succeed (retries back off
+    with jitter instead of spinning), and the number of retries each database call
+    needed is observed in `storage_controller_database_query_retries`.
+    """
+    neon_env_builder.num_pageservers = 1
+    env = neon_env_builder.init_start()
+
+    burst = 96
+    workers = 32
+
+    def create(_: int) -> str | None:
+        try:
+            env.storage_controller.tenant_create(TenantId.generate(), shard_count=1)
+            return None
+        except Exception as e:
+            return str(e)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        failures = [f for f in executor.map(create, range(burst)) if f is not None]
+
+    assert not failures, f"{len(failures)} of {burst} requests failed, first: {failures[0]}"
+
+    count = env.storage_controller.get_metric_value(
+        "storage_controller_database_query_retries_count"
+    )
+    total = env.storage_controller.get_metric_value("storage_controller_database_query_retries_sum")
+    assert count is not None, "retry histogram is not exported"
+    assert total is not None
+    # One observation per database call, retried or not: at least one per tenant created.
+    assert count >= burst
+    assert total >= 0
+    # A call that exhausts its 20 retries fails; the sum bounds how hard the burst hit.
+    assert total <= 20 * count
