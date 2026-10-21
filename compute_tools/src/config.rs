@@ -98,12 +98,13 @@ fn write_file_atomically(path: &Path, data: &[u8]) -> Result<()> {
 }
 
 /// What [`ComputeNode::reconfigure`](crate::compute::ComputeNode::reconfigure)
-/// writes before it reloads, all-or-nothing: `postgresql.conf`, the pg_hba
+/// writes before it reloads: `postgresql.conf`, the pg_hba
 /// member and realtime blocks and the pg_ident member and realtime lines
 /// (databricks settings from the spec). Every new content is computed and
 /// checked first (and with TLS on, the key and certificate are copied once,
-/// without retrying); on any failure nothing is written and the error is
-/// returned.
+/// without retrying); a failure there writes nothing. Then `postgresql.conf`
+/// is written, then `pg_ident.conf` and `pg_hba.conf` together (see
+/// `spec::write_ident_then_hba`); the error of a failed write is returned.
 pub fn rewrite_config_files(
     pgdata_path: &Path,
     params: &ComputeNodeParams,
