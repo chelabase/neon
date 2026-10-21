@@ -287,4 +287,55 @@ MC4CAQAwBQYDK2VwBCIEID/Drmc1AA6U/znNRWpF3zEGegOATQxfkdWxitcOMsIH
 
         assert_eq!(decoded.claims, claims);
     }
+
+    /// The wire names of every scope; `metrics` is the read-only scope of `/metrics`.
+    const SCOPE_NAMES: [&str; 10] = [
+        "tenant",
+        "tenantendpoint",
+        "pageserverapi",
+        "safekeeperdata",
+        "generations_api",
+        "admin",
+        "infra",
+        "scrubber",
+        "controller_peer",
+        "metrics",
+    ];
+
+    // The scope is spelled by its wire name here: the name is the interface Chelabase
+    // and the fixtures mint against.
+    #[test]
+    fn metrics_scope_round_trips_as_metrics() {
+        let metrics: Scope = serde_json::from_str("\"metrics\"")
+            .expect("`metrics` deserializes as a storage auth scope");
+        assert_eq!(serde_json::to_string(&metrics).unwrap(), "\"metrics\"");
+        for name in SCOPE_NAMES {
+            let scope: Scope = serde_json::from_str(&format!("\"{name}\""))
+                .unwrap_or_else(|e| panic!("scope `{name}` doesn't deserialize: {e}"));
+            assert_eq!(
+                serde_json::to_string(&scope).unwrap(),
+                format!("\"{name}\"")
+            );
+            assert_eq!(scope == metrics, name == "metrics", "scope `{name}`");
+        }
+    }
+
+    /// A metrics token carries `scope` and `iat` and no `tenant_id` or `exp` (U2); it
+    /// decodes, with no tenant.
+    #[test]
+    fn metrics_token_decodes_without_tenant_or_exp() {
+        let pem = pem::parse(TEST_PRIV_KEY_ED25519).unwrap();
+        let token = encode_from_key_file(
+            &serde_json::json!({"scope": "metrics", "iat": 1_760_000_000u64}),
+            &pem,
+        )
+        .unwrap();
+        let auth = JwtAuth::new(vec![
+            DecodingKey::from_ed_pem(TEST_PUB_KEY_ED25519.as_bytes()).unwrap(),
+        ]);
+        let claims: Claims = auth.decode(&token).expect("a metrics token decodes").claims;
+        assert_eq!(claims.tenant_id, None);
+        assert_eq!(claims.endpoint_id, None);
+        assert_eq!(serde_json::to_string(&claims.scope).unwrap(), "\"metrics\"");
+    }
 }
