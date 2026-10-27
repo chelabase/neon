@@ -924,10 +924,21 @@ mod tests {
         .unwrap();
         let end_pos = end_watch.get();
 
+        assert!(next_record_lsns.len() > 7);
+        let start_lsns = vec![
+            next_record_lsns[5],
+            next_record_lsns[1],
+            next_record_lsns[3],
+        ];
+
+        // The WAL stream must start where the reader's decoder starts: the first
+        // sender's position. A stream opened at an earlier LSN feeds the decoder bytes
+        // from the wrong offset whenever the reader reads a chunk before it handles the
+        // fan-out resets, and decoding then fails (a zero page header at 0/14AA000).
         let streaming_wal_reader = StreamingWalReader::new(
             resident_tli,
             None,
-            start_lsn,
+            start_lsns[0],
             end_pos,
             end_watch,
             MAX_SEND_SIZE,
@@ -958,12 +969,6 @@ mod tests {
             }
         }
 
-        assert!(next_record_lsns.len() > 7);
-        let start_lsns = vec![
-            next_record_lsns[5],
-            next_record_lsns[1],
-            next_record_lsns[3],
-        ];
         let mut senders = start_lsns
             .into_iter()
             .map(|lsn| Sender::new(lsn, shard_0))
