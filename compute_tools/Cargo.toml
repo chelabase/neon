@@ -79,7 +79,7 @@ compute_api.workspace = true
 utils.workspace = true
 workspace_hack.workspace = true
 remote_storage = { version = "0.1", path = "../libs/remote_storage/" }
-zstd = "0.13"
+zstd = "0.14.3"
 bytes = "1.0"
 rust-ini = "0.20.0"
 rlimit = "0.10.1"

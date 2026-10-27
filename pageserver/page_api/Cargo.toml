@@ -18,8 +18,9 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tonic.workspace = true
+tonic-prost.workspace = true
 utils.workspace = true
 workspace_hack.workspace = true
 
 [build-dependencies]
-tonic-build.workspace = true
+tonic-prost-build.workspace = true

@@ -26,6 +26,7 @@ once_cell.workspace = true
 parking_lot.workspace = true
 prost.workspace = true
 tonic.workspace = true
+tonic-prost.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 tokio-rustls.workspace = true
 tracing.workspace = true
@@ -36,7 +37,7 @@ rustls.workspace = true
 workspace_hack.workspace = true
 
 [build-dependencies]
-tonic-build.workspace = true
+tonic-prost-build.workspace = true
 
 [[bench]]
 name = "rps"
