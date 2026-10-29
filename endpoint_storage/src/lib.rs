@@ -28,7 +28,20 @@ impl JwtAuth {
     pub fn new(key: &[u8]) -> Result<Self> {
         Ok(Self {
             decoding_key: DecodingKey::from_ed_pem(key)?,
-            validation: Validation::new(VALIDATION_ALGO),
+            // `Validation::new(VALIDATION_ALGO)`, every field spelled out so a library
+            // upgrade can't change one silently: `exp` is required and checked.
+            validation: Validation {
+                algorithms: vec![VALIDATION_ALGO],
+                required_spec_claims: ["exp".to_owned()].into(),
+                validate_exp: true,
+                leeway: 60,
+                reject_tokens_expiring_in_less_than: 0,
+                validate_nbf: false,
+                validate_aud: true,
+                aud: None,
+                iss: None,
+                sub: None,
+            },
         })
     }
 

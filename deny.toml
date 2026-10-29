@@ -24,10 +24,6 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "warn"
 
 [[advisories.ignore]]
-id = "RUSTSEC-2023-0071"
-reason = "the marvin attack only affects private key decryption, not public key signature verification"
-
-[[advisories.ignore]]
 id = "RUSTSEC-2024-0436"
 reason = "The paste crate is a build-only dependency with no runtime components. It is unlikely to have any security impact."
 
@@ -124,6 +120,12 @@ name = "async-executor"
 
 [[bans.deny]]
 name = "smol"
+
+[[bans.features]]
+# jsonwebtoken 11 picks its crypto backend by feature. With both `aws_lc_rs` and
+# `rust_crypto` on, `CryptoProvider::get_default()` panics on every verify.
+crate = "jsonwebtoken"
+deny = ["rust_crypto"]
 
 [[bans.deny]]
 # We want to use rustls instead of the platform's native tls implementation.

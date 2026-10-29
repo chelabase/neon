@@ -22,7 +22,6 @@ use ed25519_dalek::{Signature, Signer, SigningKey};
 use futures::future::poll_fn;
 use futures::{Future, FutureExt};
 use indexmap::IndexMap;
-use jose_jwk::jose_b64::base64ct::{Base64UrlUnpadded, Encoding};
 use parking_lot::RwLock;
 use postgres_client::tls::NoTlsStream;
 use serde_json::value::RawValue;
@@ -318,8 +317,8 @@ fn resign_jwt(sk: &SigningKey, payload: &[u8], jti: u64) -> Result<String, HttpC
 
 fn sign_jwt(sk: &SigningKey, payload: &[u8]) -> String {
     let header_len = 20;
-    let payload_len = Base64UrlUnpadded::encoded_len(payload);
-    let signature_len = Base64UrlUnpadded::encoded_len(&[0; 64]);
+    let payload_len = base64::encoded_len(payload.len(), false).expect("payload fits in memory");
+    let signature_len = base64::encoded_len(64, false).expect("64 bytes encode");
     let total_len = header_len + payload_len + signature_len + 2;
 
     let mut jwt = String::with_capacity(total_len);
@@ -371,12 +370,7 @@ mod tests {
         // Note - jwt.io doesn't support EdDSA :(
         // https://github.com/jsonwebtoken/jsonwebtoken.github.io/issues/509
 
-        // let jwk = jose_jwk::Key::Okp(jose_jwk::Okp {
-        //     crv: jose_jwk::OkpCurves::Ed25519,
-        //     x: jose_jwk::jose_b64::serde::Bytes::from(key.verifying_key().to_bytes().to_vec()),
-        //     d: None,
-        // });
-        // println!("{}", serde_json::to_string(&jwk).unwrap());
+        // println!("{}", BASE64_URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes()));
 
         assert_eq!(
             jwt,

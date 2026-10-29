@@ -37,27 +37,37 @@ pub(in crate::http) struct Authorize {
 
 impl Authorize {
     pub fn new(compute_id: String, jwks: JwkSet) -> Self {
-        let mut validation = Validation::new(Algorithm::EdDSA);
-
         // BEGIN HADRON
         let use_rsa = jwks.keys.iter().any(|jwk| {
             jwk.common
                 .key_algorithm
                 .is_some_and(|alg| alg == jsonwebtoken::jwk::KeyAlgorithm::RS256)
         });
-        if use_rsa {
-            validation = Validation::new(Algorithm::RS256);
-        }
+        let algorithm = if use_rsa {
+            Algorithm::RS256
+        } else {
+            Algorithm::EdDSA
+        };
         // END HADRON
 
-        validation.validate_exp = true;
-        // Unused by the control plane
-        validation.validate_nbf = false;
-        // Unused by the control plane
-        validation.validate_aud = false;
-        validation.set_audience(&[COMPUTE_AUDIENCE]);
-        // Nothing is currently required
-        validation.set_required_spec_claims(&[] as &[&str; 0]);
+        // Every field is spelled out (no `..Default::default()`), so a library upgrade
+        // can't change one silently and a new field fails to compile here.
+        let validation = Validation {
+            algorithms: vec![algorithm],
+            validate_exp: true,
+            leeway: 60,
+            reject_tokens_expiring_in_less_than: 0,
+            // Unused by the control plane
+            validate_nbf: false,
+            // Unused by the control plane; `authorize_claims` checks an admin token's
+            // audience itself.
+            validate_aud: false,
+            aud: Some([COMPUTE_AUDIENCE.to_owned()].into()),
+            iss: None,
+            sub: None,
+            // Nothing is currently required
+            required_spec_claims: [].into(),
+        };
 
         Self {
             compute_id,
