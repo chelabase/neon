@@ -10,6 +10,7 @@ use arc_swap::ArcSwap;
 use camino::Utf8Path;
 use jsonwebtoken::{
     Algorithm, DecodingKey, EncodingKey, Header, TokenData, Validation, decode, encode,
+    errors::ErrorKind,
 };
 use pem::Pem;
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
@@ -141,15 +142,25 @@ pub struct JwtAuth {
 
 impl JwtAuth {
     pub fn new(decoding_keys: Vec<DecodingKey>) -> Self {
-        let mut validation = Validation::default();
-        validation.algorithms = vec![STORAGE_TOKEN_ALGORITHM];
-        // The default 'required_spec_claims' is 'exp'. But we don't want to require
-        // expiration.
-        validation.required_spec_claims = [].into();
-        // An `exp` or `nbf` a token carries is still checked (with the default 60 s
-        // leeway): a token isn't valid after `exp` nor before `nbf`.
-        validation.validate_exp = true;
-        validation.validate_nbf = true;
+        // Every field is spelled out (no `..Default::default()`), so a library upgrade
+        // can't change one silently and a new field fails to compile here.
+        let validation = Validation {
+            algorithms: vec![STORAGE_TOKEN_ALGORITHM],
+            // The default 'required_spec_claims' is 'exp'. But we don't want to require
+            // expiration.
+            required_spec_claims: [].into(),
+            // An `exp` or `nbf` a token carries is still checked (with a 60 s leeway): a
+            // token isn't valid after `exp` nor before `nbf`.
+            validate_exp: true,
+            validate_nbf: true,
+            leeway: 60,
+            reject_tokens_expiring_in_less_than: 0,
+            // No audience is expected, so a token that carries `aud` is refused.
+            validate_aud: true,
+            aud: None,
+            iss: None,
+            sub: None,
+        };
         Self {
             decoding_keys,
             validation,
@@ -203,7 +214,12 @@ impl JwtAuth {
         let mut res = None;
         for decoding_key in &self.decoding_keys {
             let attempt = decode::<serde_json::Value>(token, decoding_key, &self.validation);
-            let verified = attempt.is_ok();
+            // jsonwebtoken (since 10.3) refuses a malformed `exp`/`nbf` itself, after the
+            // signature check: this key verified the token, as an `Ok` would say.
+            let verified = match &attempt {
+                Ok(_) => true,
+                Err(e) => matches!(e.kind(), ErrorKind::InvalidClaimFormat(_)),
+            };
             res = Some(attempt);
             if verified {
                 break;
@@ -211,7 +227,15 @@ impl JwtAuth {
         }
         let data = match res {
             Some(Ok(data)) => data,
-            Some(Err(e)) => return Err(AuthError(Cow::Owned(e.to_string()))),
+            Some(Err(e)) => {
+                // The error this function gave before for such a claim (see below).
+                if let ErrorKind::InvalidClaimFormat(name) = e.kind() {
+                    return Err(AuthError(Cow::Owned(format!(
+                        "JWT claim `{name}` is not a NumericDate"
+                    ))));
+                }
+                return Err(AuthError(Cow::Owned(e.to_string())));
+            }
             None => return Err(AuthError(Cow::Borrowed("no JWT decoding keys configured"))),
         };
         for name in ["exp", "nbf"] {

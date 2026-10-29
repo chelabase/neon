@@ -18,6 +18,8 @@ license.workspace = true
 ahash = { version = "0.8" }
 anstream = { version = "0.6" }
 anyhow = { version = "1", features = ["backtrace"] }
+aws-lc-rs = { version = "1", features = ["prebuilt-nasm"] }
+aws-lc-sys = { version = "0.46", default-features = false, features = ["prebuilt-nasm"] }
 axum = { version = "0.8", features = ["ws"] }
 axum-core = { version = "0.5", default-features = false, features = ["tracing"] }
 base64 = { version = "0.21" }
@@ -31,13 +33,10 @@ const-oid = { version = "0.9", default-features = false, features = ["db", "std"
 crc32fast = { version = "1" }
 crossbeam-epoch = { version = "0.9" }
 crossbeam-utils = { version = "0.8" }
-crypto-bigint = { version = "0.5", features = ["generic-array", "zeroize"] }
 der = { version = "0.7", default-features = false, features = ["derive", "flagset", "oid", "pem", "std"] }
 deranged = { version = "0.5", features = ["serde"] }
 digest = { version = "0.10", features = ["mac", "oid", "std"] }
-ecdsa = { version = "0.16", features = ["pem", "signing", "std", "verifying"] }
 either = { version = "1" }
-elliptic-curve = { version = "0.13", default-features = false, features = ["digest", "hazmat", "jwk", "pem", "std"] }
 env_filter = { version = "0.1", default-features = false, features = ["regex"] }
 env_logger = { version = "0.11" }
 fail = { version = "0.5", default-features = false, features = ["failpoints"] }
@@ -69,7 +68,6 @@ num-bigint = { version = "0.4" }
 num-integer = { version = "0.1", features = ["i128"] }
 num-traits = { version = "0.2", features = ["i128", "libm"] }
 once_cell = { version = "1" }
-p256 = { version = "0.13", features = ["jwk"] }
 portable-atomic = { version = "1", features = ["require-cas"] }
 prost-582f2526e08bb6a0 = { package = "prost", version = "0.14" }
 prost-594e8ee84c453af0 = { package = "prost", version = "0.13", features = ["no-recursion-limit"] }
@@ -83,7 +81,6 @@ rustls = { version = "0.23", default-features = false, features = ["logging", "p
 rustls-pki-types = { version = "1", features = ["std"] }
 rustls-webpki = { version = "0.103", default-features = false, features = ["aws-lc-rs", "ring", "std"] }
 scopeguard = { version = "1" }
-sec1 = { version = "0.7", features = ["pem", "serde", "std", "subtle"] }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", default-features = false, features = ["alloc", "rc", "result", "std"] }
 serde_json = { version = "1", features = ["alloc", "raw_value"] }
@@ -92,7 +89,7 @@ signature = { version = "2", default-features = false, features = ["digest", "ra
 smallvec = { version = "1", default-features = false, features = ["const_new", "write"] }
 spki = { version = "0.7", default-features = false, features = ["pem", "std"] }
 stable_deref_trait = { version = "1" }
-subtle = { version = "2" }
+subtle = { version = "2", features = ["const-generics"] }
 thiserror = { version = "2" }
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats", "use_std"] }
 tikv-jemalloc-sys = { version = "0.6", features = ["profiling", "stats", "unprefixed_malloc_on_supported_platforms"] }
@@ -146,7 +143,7 @@ serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", default-features = false, features = ["alloc", "rc", "result", "std"] }
 serde_json = { version = "1", features = ["alloc", "raw_value"] }
 sha2 = { version = "0.10", features = ["asm", "oid"] }
-subtle = { version = "2" }
+subtle = { version = "2", features = ["const-generics"] }
 syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["extra-traits", "full", "visit-mut"] }
 syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 time-macros = { version = "0.2", default-features = false, features = ["formatting", "parsing", "serde"] }

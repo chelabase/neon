@@ -78,7 +78,7 @@ aws-sdk-kms = { version = "1.123", default-features = false, features=["default-
 aws-smithy-async = { version = "1.3", default-features = false, features=["rt-tokio"] }
 aws-smithy-types = "1.8"
 aws-credential-types = "1.3"
-aws-sigv4 = { version = "1.6", features = ["sign-http"] }
+aws-sigv4 = { version = "1.6.4", features = ["sign-http"] }
 aws-types = "1.6"
 axum = { version = "0.8.1", features = ["ws"] }
 axum-extra = { version = "0.10.0", features = ["typed-header", "query"] }
@@ -132,7 +132,7 @@ ipnet = "2.10.0"
 itertools = "0.10"
 itoa = "1.0.11"
 jemalloc_pprof = { version = "0.7", features = ["symbolize", "flamegraph"] }
-jsonwebtoken = "9"
+jsonwebtoken = { version = "11.1", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 lasso = "0.7"
 libc = "0.2"
 lock_api = "0.4.13"
