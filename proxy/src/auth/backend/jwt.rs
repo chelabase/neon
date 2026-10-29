@@ -365,6 +365,9 @@ impl JwkCacheEntryLock {
 
         let header = BASE64_URL_SAFE_NO_PAD.decode(header)?;
         let header = serde_json::from_slice::<JwtHeader<'_>>(&header)?;
+        if header.critical {
+            return Err(JwtError::CriticalHeaderNotSupported);
+        }
 
         let payloadb = BASE64_URL_SAFE_NO_PAD.decode(payload)?;
         let payload = serde_json::from_slice::<JwtPayload<'_>>(&payloadb)?;
@@ -575,17 +578,24 @@ fn verify_rsa_signature(
     jwk: &Jwk,
     alg: Algorithm,
 ) -> Result<(), JwtError> {
-    let key = DecodingKey::from_jwk(jwk).map_err(JwtError::InvalidRsaKey)?;
-    if let AlgorithmParameters::RSA(rsa) = &jwk.algorithm {
-        let n = BASE64_URL_SAFE_NO_PAD.decode(&rsa.n)?;
-        let n = &n[n.iter().take_while(|&&b| b == 0).count()..];
-        let bits = n
-            .first()
-            .map_or(0, |top| n.len() * 8 - top.leading_zeros() as usize);
-        if bits > MAX_RSA_BITS {
-            return Err(JwtError::RsaKeyTooLarge(bits));
-        }
+    fn strip_zeros(v: &[u8]) -> &[u8] {
+        &v[v.iter().take_while(|&&b| b == 0).count()..]
     }
+
+    let AlgorithmParameters::RSA(rsa) = &jwk.algorithm else {
+        unreachable!("only called for RSA keys");
+    };
+    let n = BASE64_URL_SAFE_NO_PAD.decode(&rsa.n)?;
+    let e = BASE64_URL_SAFE_NO_PAD.decode(&rsa.e)?;
+    // Leading zero bytes are dropped, as `rsa` 0.9 did (aws-lc refuses them).
+    let (n, e) = (strip_zeros(&n), strip_zeros(&e));
+    let bits = n
+        .first()
+        .map_or(0, |top| n.len() * 8 - top.leading_zeros() as usize);
+    if bits > MAX_RSA_BITS {
+        return Err(JwtError::RsaKeyTooLarge(bits));
+    }
+    let key = DecodingKey::from_rsa_raw_components(n, e);
 
     match alg {
         Algorithm::RS256 => verify(data, signature, &key, Algorithm::RS256),
@@ -602,6 +612,20 @@ struct JwtHeader<'a> {
     /// key id, must be provided for our usecase
     #[serde(rename = "kid", borrow)]
     key_id: Option<Cow<'a, str>>,
+    /// Whether the header has a `crit` member, whatever its value. Proxy understands no
+    /// JWS extension, so such a token is refused (RFC 7515 4.1.11).
+    #[serde(
+        rename = "crit",
+        default,
+        deserialize_with = "present",
+        skip_serializing
+    )]
+    critical: bool,
+}
+
+/// `true` for a member that is there, whatever it holds (`null` included).
+fn present<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    serde::de::IgnoredAny::deserialize(d).map(|_| true)
 }
 
 /// <https://datatracker.ietf.org/doc/html/rfc7519#section-4.1>
@@ -778,9 +802,6 @@ pub(crate) enum JwtError {
     #[error("invalid P256 key")]
     InvalidP256Key(jsonwebtoken::errors::Error),
 
-    #[error("invalid RSA key")]
-    InvalidRsaKey(jsonwebtoken::errors::Error),
-
     #[error("RSA key too large ({0} bits)")]
     RsaKeyTooLarge(usize),
 
@@ -795,6 +816,9 @@ pub(crate) enum JwtError {
 
     #[error("signature algorithm not supported")]
     SignatureAlgorithmNotSupported,
+
+    #[error("JWT header extensions (crit) are not supported")]
+    CriticalHeaderNotSupported,
 
     #[error("signature error: {0}")]
     Signature(#[from] signature::Error),
@@ -1567,13 +1591,29 @@ X0n5X2/pBLJzxZc62ccvZYVnctBiFs6HbSnxpuMQCfkt/BcR/ttIepBQQIW86wHL
         /// gave. Fail, listing them, on every case jose-jwk accepted ("ok") that is now
         /// refused, or that it refused and is now accepted.
         pub(super) async fn run(cases: Vec<(&str, Value, String, &str)>) {
+            run_with_changes(cases, &[]).await;
+        }
+
+        /// [`run`], except that each case named in `changes` must now give that outcome
+        /// ("ok" or "refused") instead of jose-jwk's. These are the cases whose outcome
+        /// changed on purpose; the jose-jwk column keeps what jose-jwk gave.
+        pub(super) async fn run_with_changes(
+            cases: Vec<(&str, Value, String, &str)>,
+            changes: &[(&str, &str)],
+        ) {
             let mut wrong = vec![];
             for (name, jwks, token, before) in cases {
                 let res = check(&jwks, &token).await;
                 let got = class(&res);
-                println!("{name}: {got} (jose-jwk: {before}) ({res:?})");
-                if (got == "ok") != (before == "ok") {
-                    wrong.push(format!("{name}: jose-jwk {before}, now {got} ({res:?})"));
+                let want = changes
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .map_or(before, |(_, now)| *now);
+                println!("{name}: {got} (jose-jwk: {before}, want: {want}) ({res:?})");
+                if (got == "ok") != (want == "ok") {
+                    wrong.push(format!(
+                        "{name}: want {want} (jose-jwk {before}), got {got} ({res:?})"
+                    ));
                 }
             }
             assert!(wrong.is_empty(), "{}", wrong.join("\n"));
@@ -1707,7 +1747,7 @@ X0n5X2/pBLJzxZc62ccvZYVnctBiFs6HbSnxpuMQCfkt/BcR/ttIepBQQIW86wHL
         .await;
     }
 
-    /// AC 4: each refusal keeps its `JwtError` class.
+    /// AC 4: each of these is still refused (its `JwtError` class may differ).
     #[tokio::test]
     async fn parity_key_lookup_signature_and_alg() {
         let (ec, rsa, other) = (TestKey::p256(), TestKey::rsa_pem(RS1), TestKey::p256());
@@ -1957,280 +1997,310 @@ X0n5X2/pBLJzxZc62ccvZYVnctBiFs6HbSnxpuMQCfkt/BcR/ttIepBQQIW86wHL
         let rsa_with = |edit: &dyn Fn(&mut serde_json::Map<String, Value>)| {
             one(with(rsa_jwk.clone(), |k| edit(k)))
         };
-        run(vec![
-            (
-                "P-384 key labelled P-256, ES256",
-                one(p384_as_p256.clone()),
-                resign(&p384, &header("ES256", "k"), &claims),
-                "InvalidP256Key",
-            ),
-            (
-                "P-384 key labelled P-256, ES384",
-                one(p384_as_p256.clone()),
-                es384.clone(),
-                "SignatureAlgorithmNotSupported",
-            ),
-            (
-                "P-256 key labelled P-384, ES384",
-                ec_with(&|k| {
-                    k.insert("crv".into(), "P-384".into());
-                }),
-                resign(&ec, &header("ES384", "k"), &claims),
-                "UnsupportedEcKeyType",
-            ),
-            (
-                "P-256 key labelled P-384, ES256",
-                ec_with(&|k| {
-                    k.insert("crv".into(), "P-384".into());
-                }),
-                es.clone(),
-                "SignatureAlgorithmNotSupported",
-            ),
-            (
-                "P-256 key labelled P-521, ES512",
-                ec_with(&|k| {
-                    k.insert("crv".into(), "P-521".into());
-                }),
-                resign(&ec, &header("ES512", "k"), &claims),
-                "UnsupportedEcKeyType",
-            ),
-            (
-                "P-256 key labelled secp256k1, ES256K",
-                ec_with(&|k| {
-                    k.insert("crv".into(), "secp256k1".into());
-                }),
-                resign(&ec, &header("ES256K", "k"), &claims),
-                "UnsupportedEcKeyType",
-            ),
-            (
-                "P-256 key with crv Ed25519",
-                ec_with(&|k| {
-                    k.insert("crv".into(), "Ed25519".into());
-                }),
-                es.clone(),
-                "JwkNotFound",
-            ),
-            (
-                "P-256 key with no crv",
-                ec_with(&|k| {
-                    k.remove("crv");
-                }),
-                es.clone(),
-                "JwkNotFound",
-            ),
-            (
-                "off-curve point",
-                ec_with(&|k| {
-                    k.insert("y".into(), b64(&y1).into());
-                }),
-                es.clone(),
-                "InvalidP256Key",
-            ),
-            (
-                "x = p (not a field element)",
-                ec_with(&|k| {
-                    k.insert("x".into(), b64(&p256_p).into());
-                }),
-                es.clone(),
-                "InvalidP256Key",
-            ),
-            (
-                "31-byte x",
-                ec_with(&|k| {
-                    k.insert("x".into(), b64(&ec_x[1..]).into());
-                }),
-                es.clone(),
-                "InvalidP256Key",
-            ),
-            (
-                "33-byte x (leading zero)",
-                ec_with(&|k| {
-                    let mut v0 = vec![0];
-                    v0.extend_from_slice(&ec_x);
-                    k.insert("x".into(), b64(v0).into());
-                }),
-                es.clone(),
-                "InvalidP256Key",
-            ),
-            (
-                "x and y swapped",
-                ec_with(&|k| {
-                    k.insert("x".into(), b64(&ec_y).into());
-                    k.insert("y".into(), b64(&ec_x).into());
-                }),
-                es.clone(),
-                "InvalidP256Key",
-            ),
-            (
-                "EC JWK missing x",
-                ec_with(&|k| {
-                    k.remove("x");
-                }),
-                es.clone(),
-                "JwkNotFound",
-            ),
-            (
-                "EC JWK missing y",
-                ec_with(&|k| {
-                    k.remove("y");
-                }),
-                es.clone(),
-                "JwkNotFound",
-            ),
-            (
-                "EC JWK with padded x",
-                ec_with(&|k| {
-                    let v = format!("{}=", k["x"].as_str().unwrap());
-                    k.insert("x".into(), v.into());
-                }),
-                es.clone(),
-                "JwkNotFound",
-            ),
-            (
-                "EC JWK with standard-alphabet x",
-                ec_with(&|k| {
-                    let v = format!("+{}", &k["x"].as_str().unwrap()[1..]);
-                    k.insert("x".into(), v.into());
-                }),
-                es.clone(),
-                "JwkNotFound",
-            ),
-            (
-                "EC JWK with x as a number",
-                ec_with(&|k| {
-                    k.insert("x".into(), 5.into());
-                }),
-                es.clone(),
-                "JwkNotFound",
-            ),
-            (
-                "EC JWK with non-canonical x",
-                ec_with(&|k| {
-                    k.insert("x".into(), non_canonical(k["x"].as_str().unwrap()).into());
-                }),
-                es.clone(),
-                "JwkNotFound",
-            ),
-            (
-                "EC JWK with d",
-                ec_with(&|k| {
-                    k.insert("d".into(), b64([5u8; 32]).into());
-                }),
-                es.clone(),
-                "ok",
-            ),
-            (
-                "ES256 high-S signature",
-                one(ec_jwk.clone()),
-                high_s(&es),
-                "ok",
-            ),
-            (
-                "OKP JWK with crv P-256",
-                one(json!({ "kty": "OKP", "crv": "P-256", "kid": "k", "x": b64([3u8; 32]) })),
-                resign(&ec, &header("EdDSA", "k"), &claims),
-                "JwkNotFound",
-            ),
-            (
-                "OKP JWK with no x",
-                one(json!({ "kty": "OKP", "crv": "Ed25519", "kid": "k" })),
-                resign(&ec, &header("EdDSA", "k"), &claims),
-                "JwkNotFound",
-            ),
-            (
-                "oct JWK with padded k",
-                one(json!({ "kty": "oct", "kid": "k", "k": "AAAA=" })),
-                resign(&ec, &header("HS256", "k"), &claims),
-                "JwkNotFound",
-            ),
-            (
-                "oct JWK with an 8-byte k",
-                one(json!({ "kty": "oct", "kid": "k", "k": b64([1u8; 8]) })),
-                resign(&ec, &header("HS256", "k"), &claims),
-                "SignatureAlgorithmNotSupported",
-            ),
-            (
-                "RSA JWK with d",
-                rsa_with(&|k| {
-                    k.insert("d".into(), b64([5u8; 256]).into());
-                }),
-                rs.clone(),
-                "ok",
-            ),
-            (
-                "RSA JWK missing n",
-                rsa_with(&|k| {
-                    k.remove("n");
-                }),
-                rs.clone(),
-                "JwkNotFound",
-            ),
-            (
-                "RSA JWK missing e",
-                rsa_with(&|k| {
-                    k.remove("e");
-                }),
-                rs.clone(),
-                "JwkNotFound",
-            ),
-            (
-                "RSA JWK with kty EC",
-                rsa_with(&|k| {
-                    k.insert("kty".into(), "EC".into());
-                }),
-                rs.clone(),
-                "JwkNotFound",
-            ),
-            (
-                "RSA n with a leading zero byte",
-                rsa_with(&|k| {
-                    k.insert("n".into(), b64(&n0).into());
-                }),
-                rs.clone(),
-                // jose-jwk: ok. aws-lc refuses a modulus with a leading zero byte (RFC 7518 6.3.1.1 forbids it).
-                "refused",
-            ),
-            (
-                "RSA e = 1",
-                rsa_with(&|k| {
-                    k.insert("e".into(), b64([1u8]).into());
-                }),
-                rs.clone(),
-                "InvalidRsaKey",
-            ),
-            (
-                "RSA e = 0",
-                rsa_with(&|k| {
-                    k.insert("e".into(), "".into());
-                }),
-                rs.clone(),
-                "InvalidRsaKey",
-            ),
-            (
-                "RSA e = 2^33",
-                rsa_with(&|k| {
-                    k.insert("e".into(), b64([2u8, 0, 0, 0, 0]).into());
-                }),
-                rs.clone(),
-                "InvalidRsaKey",
-            ),
-            (
-                "RSA 8192-bit n",
-                rsa_with(&|k| {
-                    k.insert("n".into(), b64(&n8k).into());
-                }),
-                rs.clone(),
-                "InvalidRsaKey",
-            ),
-            (
-                "RSA 1024-bit n",
-                rsa_with(&|k| {
-                    k.insert("n".into(), b64(&rsa_n[..128]).into());
-                }),
-                rs.clone(),
-                "SignatureAlgorithmNotSupported",
-            ),
-        ])
+        parity::run_with_changes(
+            vec![
+                (
+                    "P-384 key labelled P-256, ES256",
+                    one(p384_as_p256.clone()),
+                    resign(&p384, &header("ES256", "k"), &claims),
+                    "InvalidP256Key",
+                ),
+                (
+                    "P-384 key labelled P-256, ES384",
+                    one(p384_as_p256.clone()),
+                    es384.clone(),
+                    "SignatureAlgorithmNotSupported",
+                ),
+                (
+                    "P-256 key labelled P-384, ES384",
+                    ec_with(&|k| {
+                        k.insert("crv".into(), "P-384".into());
+                    }),
+                    resign(&ec, &header("ES384", "k"), &claims),
+                    "UnsupportedEcKeyType",
+                ),
+                (
+                    "P-256 key labelled P-384, ES256",
+                    ec_with(&|k| {
+                        k.insert("crv".into(), "P-384".into());
+                    }),
+                    es.clone(),
+                    "SignatureAlgorithmNotSupported",
+                ),
+                (
+                    "P-256 key labelled P-521, ES512",
+                    ec_with(&|k| {
+                        k.insert("crv".into(), "P-521".into());
+                    }),
+                    resign(&ec, &header("ES512", "k"), &claims),
+                    "UnsupportedEcKeyType",
+                ),
+                (
+                    "P-256 key labelled secp256k1, ES256K",
+                    ec_with(&|k| {
+                        k.insert("crv".into(), "secp256k1".into());
+                    }),
+                    resign(&ec, &header("ES256K", "k"), &claims),
+                    "UnsupportedEcKeyType",
+                ),
+                (
+                    "P-256 key with crv Ed25519",
+                    ec_with(&|k| {
+                        k.insert("crv".into(), "Ed25519".into());
+                    }),
+                    es.clone(),
+                    "JwkNotFound",
+                ),
+                (
+                    "P-256 key with no crv",
+                    ec_with(&|k| {
+                        k.remove("crv");
+                    }),
+                    es.clone(),
+                    "JwkNotFound",
+                ),
+                (
+                    "off-curve point",
+                    ec_with(&|k| {
+                        k.insert("y".into(), b64(&y1).into());
+                    }),
+                    es.clone(),
+                    "InvalidP256Key",
+                ),
+                (
+                    "x = p (not a field element)",
+                    ec_with(&|k| {
+                        k.insert("x".into(), b64(&p256_p).into());
+                    }),
+                    es.clone(),
+                    "InvalidP256Key",
+                ),
+                (
+                    "31-byte x",
+                    ec_with(&|k| {
+                        k.insert("x".into(), b64(&ec_x[1..]).into());
+                    }),
+                    es.clone(),
+                    "InvalidP256Key",
+                ),
+                (
+                    "33-byte x (leading zero)",
+                    ec_with(&|k| {
+                        let mut v0 = vec![0];
+                        v0.extend_from_slice(&ec_x);
+                        k.insert("x".into(), b64(v0).into());
+                    }),
+                    es.clone(),
+                    "InvalidP256Key",
+                ),
+                (
+                    "x and y swapped",
+                    ec_with(&|k| {
+                        k.insert("x".into(), b64(&ec_y).into());
+                        k.insert("y".into(), b64(&ec_x).into());
+                    }),
+                    es.clone(),
+                    "InvalidP256Key",
+                ),
+                (
+                    "EC JWK missing x",
+                    ec_with(&|k| {
+                        k.remove("x");
+                    }),
+                    es.clone(),
+                    "JwkNotFound",
+                ),
+                (
+                    "EC JWK missing y",
+                    ec_with(&|k| {
+                        k.remove("y");
+                    }),
+                    es.clone(),
+                    "JwkNotFound",
+                ),
+                (
+                    "EC JWK with padded x",
+                    ec_with(&|k| {
+                        let v = format!("{}=", k["x"].as_str().unwrap());
+                        k.insert("x".into(), v.into());
+                    }),
+                    es.clone(),
+                    "JwkNotFound",
+                ),
+                (
+                    "EC JWK with standard-alphabet x",
+                    ec_with(&|k| {
+                        let v = format!("+{}", &k["x"].as_str().unwrap()[1..]);
+                        k.insert("x".into(), v.into());
+                    }),
+                    es.clone(),
+                    "JwkNotFound",
+                ),
+                (
+                    "EC JWK with x as a number",
+                    ec_with(&|k| {
+                        k.insert("x".into(), 5.into());
+                    }),
+                    es.clone(),
+                    "JwkNotFound",
+                ),
+                (
+                    "EC JWK with non-canonical x",
+                    ec_with(&|k| {
+                        k.insert("x".into(), non_canonical(k["x"].as_str().unwrap()).into());
+                    }),
+                    es.clone(),
+                    "JwkNotFound",
+                ),
+                (
+                    "EC JWK with d",
+                    ec_with(&|k| {
+                        k.insert("d".into(), b64([5u8; 32]).into());
+                    }),
+                    es.clone(),
+                    "ok",
+                ),
+                (
+                    "ES256 high-S signature",
+                    one(ec_jwk.clone()),
+                    high_s(&es),
+                    "ok",
+                ),
+                (
+                    "OKP JWK with crv P-256",
+                    one(json!({ "kty": "OKP", "crv": "P-256", "kid": "k", "x": b64([3u8; 32]) })),
+                    resign(&ec, &header("EdDSA", "k"), &claims),
+                    "JwkNotFound",
+                ),
+                (
+                    "OKP JWK with no x",
+                    one(json!({ "kty": "OKP", "crv": "Ed25519", "kid": "k" })),
+                    resign(&ec, &header("EdDSA", "k"), &claims),
+                    "JwkNotFound",
+                ),
+                (
+                    "oct JWK with padded k",
+                    one(json!({ "kty": "oct", "kid": "k", "k": "AAAA=" })),
+                    resign(&ec, &header("HS256", "k"), &claims),
+                    "JwkNotFound",
+                ),
+                (
+                    "oct JWK with an 8-byte k",
+                    one(json!({ "kty": "oct", "kid": "k", "k": b64([1u8; 8]) })),
+                    resign(&ec, &header("HS256", "k"), &claims),
+                    "SignatureAlgorithmNotSupported",
+                ),
+                (
+                    "RSA JWK with d",
+                    rsa_with(&|k| {
+                        k.insert("d".into(), b64([5u8; 256]).into());
+                    }),
+                    rs.clone(),
+                    "ok",
+                ),
+                (
+                    "RSA JWK missing n",
+                    rsa_with(&|k| {
+                        k.remove("n");
+                    }),
+                    rs.clone(),
+                    "JwkNotFound",
+                ),
+                (
+                    "RSA JWK missing e",
+                    rsa_with(&|k| {
+                        k.remove("e");
+                    }),
+                    rs.clone(),
+                    "JwkNotFound",
+                ),
+                (
+                    "RSA JWK with kty EC",
+                    rsa_with(&|k| {
+                        k.insert("kty".into(), "EC".into());
+                    }),
+                    rs.clone(),
+                    "JwkNotFound",
+                ),
+                (
+                    "RSA n with a leading zero byte",
+                    rsa_with(&|k| {
+                        k.insert("n".into(), b64(&n0).into());
+                    }),
+                    rs.clone(),
+                    "ok",
+                ),
+                (
+                    "RSA e = 1",
+                    rsa_with(&|k| {
+                        k.insert("e".into(), b64([1u8]).into());
+                    }),
+                    rs.clone(),
+                    "InvalidRsaKey",
+                ),
+                (
+                    "RSA e = 0",
+                    rsa_with(&|k| {
+                        k.insert("e".into(), "".into());
+                    }),
+                    rs.clone(),
+                    "InvalidRsaKey",
+                ),
+                (
+                    "RSA e = 2^33",
+                    rsa_with(&|k| {
+                        k.insert("e".into(), b64([2u8, 0, 0, 0, 0]).into());
+                    }),
+                    rs.clone(),
+                    "InvalidRsaKey",
+                ),
+                (
+                    "RSA 8192-bit n",
+                    rsa_with(&|k| {
+                        k.insert("n".into(), b64(&n8k).into());
+                    }),
+                    rs.clone(),
+                    "InvalidRsaKey",
+                ),
+                (
+                    "RSA 1024-bit n",
+                    rsa_with(&|k| {
+                        k.insert("n".into(), b64(&rsa_n[..128]).into());
+                    }),
+                    rs.clone(),
+                    "SignatureAlgorithmNotSupported",
+                ),
+                (
+                    "31-byte x, 33-byte y",
+                    ec_with(&|k| {
+                        let mut y = ec_x[31..].to_vec();
+                        y.extend_from_slice(&ec_y);
+                        k.insert("x".into(), b64(&ec_x[..31]).into());
+                        k.insert("y".into(), b64(y).into());
+                    }),
+                    es.clone(),
+                    "InvalidP256Key",
+                ),
+                (
+                    "x = X || Y, empty y",
+                    ec_with(&|k| {
+                        let mut x = ec_x.clone();
+                        x.extend_from_slice(&ec_y);
+                        k.insert("x".into(), b64(x).into());
+                        k.insert("y".into(), "".into());
+                    }),
+                    es.clone(),
+                    "InvalidP256Key",
+                ),
+            ],
+            &[
+                // `DecodingKey::from_ec_components` concatenates x and y without checking
+                // their lengths, so the right point split wrongly still verifies. Harmless:
+                // the point is the signer's own key.
+                ("31-byte x, 33-byte y", "ok"),
+                ("x = X || Y, empty y", "ok"),
+            ],
+        )
         .await;
     }
 
@@ -2261,6 +2331,48 @@ X0n5X2/pBLJzxZc62ccvZYVnctBiFs6HbSnxpuMQCfkt/BcR/ttIepBQQIW86wHL
             sig[32 + i] = (d + 256 * borrow) as u8;
         }
         format!("{input}.{}", b64(sig))
+    }
+
+    /// RFC 7515 4.1.11: proxy understands no JWS extension, so a header with a `crit`
+    /// member is refused whatever it holds, before the key is looked up.
+    #[tokio::test]
+    async fn crit_header_is_refused() {
+        let key = TestKey::p256();
+        let jwks = set(&[key.jwk("k")]);
+        for crit in [json!(["foo"]), json!([]), json!("foo")] {
+            let mut hdr = header("ES256", "k");
+            hdr["crit"] = crit.clone();
+            hdr["foo"] = json!(1);
+            let res = check(&jwks, &token(&key, &hdr, &parity::claims())).await;
+            assert_eq!(
+                class(&res),
+                "CriticalHeaderNotSupported",
+                "crit {crit}: {res:?}"
+            );
+        }
+        // The same token without `crit` verifies.
+        let res = check(
+            &jwks,
+            &token(&key, &header("ES256", "k"), &parity::claims()),
+        )
+        .await;
+        assert_eq!(class(&res), "ok", "{res:?}");
+    }
+
+    /// A real RSA key over 4096 bits signing RS256 is refused for its size (jose-jwk:
+    /// `InvalidRsaKey`; aws-lc on its own would verify it).
+    #[tokio::test]
+    async fn rsa_keys_over_4096_bits_are_refused() {
+        let key = TestKey::rsa(aws_lc_rs::rsa::KeySize::Rsa8192);
+        let res = check(
+            &set(&[key.jwk("big")]),
+            &token(&key, &header("RS256", "big"), &parity::claims()),
+        )
+        .await;
+        assert!(
+            matches!(res, Err(JwtError::RsaKeyTooLarge(8192))),
+            "got {res:?}"
+        );
     }
 
     /// Sign with `signer`, whatever the header's `alg` says.
@@ -2310,155 +2422,161 @@ X0n5X2/pBLJzxZc62ccvZYVnctBiFs6HbSnxpuMQCfkt/BcR/ttIepBQQIW86wHL
         ]);
         let now = parity::now();
         let tok = |kid: &str, claims: serde_json::Value| token(&ec, &header("ES256", kid), &claims);
-        run(vec![
-            (
-                "use: enc",
-                jwks.clone(),
-                tok("enc", parity::claims()),
-                "JwkNotFound",
-            ),
-            (
-                "use: foo",
-                jwks.clone(),
-                tok("use-foo", parity::claims()),
-                "JwkNotFound",
-            ),
-            (
-                "key_ops with an unknown op",
-                jwks.clone(),
-                tok("ops-foo", parity::claims()),
-                // jose-jwk: JwkNotFound (it parsed this member strictly). Harmless: proxy never reads it.
-                "ok",
-            ),
-            (
-                "key_ops: sign only",
-                jwks.clone(),
-                tok("ops-sign", parity::claims()),
-                "ok",
-            ),
-            (
-                "alg: RSA-OAEP",
-                jwks.clone(),
-                tok("alg-oaep", parity::claims()),
-                "JwkNotFound",
-            ),
-            (
-                "19-byte x5t",
-                jwks.clone(),
-                tok("x5t-short", parity::claims()),
-                // jose-jwk: JwkNotFound (it parsed this member strictly). Harmless: proxy never reads it.
-                "ok",
-            ),
-            (
-                "x5t, x5t#S256, x5c, x5u",
-                jwks.clone(),
-                tok("x5t", parity::claims()),
-                "ok",
-            ),
-            (
-                "x5c in base64url",
-                jwks.clone(),
-                tok("x5c-url", parity::claims()),
-                // jose-jwk: JwkNotFound (it parsed this member strictly). Harmless: proxy never reads it.
-                "ok",
-            ),
-            (
-                "audience matches",
-                jwks.clone(),
-                tok("k", json!({ "aud": "neon" })),
-                "ok",
-            ),
-            (
-                "audience in a list",
-                jwks.clone(),
-                tok("k", json!({ "aud": ["x", "neon"] })),
-                "ok",
-            ),
-            (
-                "wrong audience",
-                jwks.clone(),
-                tok("k", json!({ "aud": "neon2" })),
-                "InvalidClaims",
-            ),
-            (
-                "audience of other case",
-                jwks.clone(),
-                tok("k", json!({ "aud": "Neon" })),
-                "InvalidClaims",
-            ),
-            (
-                "no audience",
-                jwks.clone(),
-                tok("k", json!({})),
-                "InvalidClaims",
-            ),
-            (
-                "audience a number",
-                jwks.clone(),
-                tok("k", json!({ "aud": 1 })),
-                "JwtEncoding",
-            ),
-            (
-                "expired inside the leeway",
-                jwks.clone(),
-                tok("k", json!({ "aud": AUD, "exp": now - 20 })),
-                "ok",
-            ),
-            (
-                "expired outside the leeway",
-                jwks.clone(),
-                tok("k", json!({ "aud": AUD, "exp": now - 40 })),
-                "InvalidClaims",
-            ),
-            (
-                "exp 0",
-                jwks.clone(),
-                tok("k", json!({ "aud": AUD, "exp": 0 })),
-                "InvalidClaims",
-            ),
-            (
-                "exp a string",
-                jwks.clone(),
-                tok("k", json!({ "aud": AUD, "exp": (now + 60).to_string() })),
-                "JwtEncoding",
-            ),
-            (
-                "exp negative",
-                jwks.clone(),
-                tok("k", json!({ "aud": AUD, "exp": -1 })),
-                "JwtEncoding",
-            ),
-            (
-                "exp a float",
-                jwks.clone(),
-                tok("k", json!({ "aud": AUD, "exp": (now + 60) as f64 + 0.5 })),
-                "JwtEncoding",
-            ),
-            (
-                "exp null",
-                jwks.clone(),
-                tok("k", json!({ "aud": AUD, "exp": null })),
-                "ok",
-            ),
-            (
-                "not yet valid inside the leeway",
-                jwks.clone(),
-                tok("k", json!({ "aud": AUD, "nbf": now + 20 })),
-                "ok",
-            ),
-            (
-                "not yet valid outside the leeway",
-                jwks.clone(),
-                tok("k", json!({ "aud": AUD, "nbf": now + 40 })),
-                "InvalidClaims",
-            ),
-            (
-                "nbf u64::MAX",
-                jwks.clone(),
-                tok("k", json!({ "aud": AUD, "nbf": u64::MAX })),
-                "JwtEncoding",
-            ),
-        ])
+        parity::run_with_changes(
+            vec![
+                (
+                    "use: enc",
+                    jwks.clone(),
+                    tok("enc", parity::claims()),
+                    "JwkNotFound",
+                ),
+                (
+                    "use: foo",
+                    jwks.clone(),
+                    tok("use-foo", parity::claims()),
+                    "JwkNotFound",
+                ),
+                (
+                    "key_ops with an unknown op",
+                    jwks.clone(),
+                    tok("ops-foo", parity::claims()),
+                    "JwkNotFound",
+                ),
+                (
+                    "key_ops: sign only",
+                    jwks.clone(),
+                    tok("ops-sign", parity::claims()),
+                    "ok",
+                ),
+                (
+                    "alg: RSA-OAEP",
+                    jwks.clone(),
+                    tok("alg-oaep", parity::claims()),
+                    "JwkNotFound",
+                ),
+                (
+                    "19-byte x5t",
+                    jwks.clone(),
+                    tok("x5t-short", parity::claims()),
+                    "JwkNotFound",
+                ),
+                (
+                    "x5t, x5t#S256, x5c, x5u",
+                    jwks.clone(),
+                    tok("x5t", parity::claims()),
+                    "ok",
+                ),
+                (
+                    "x5c in base64url",
+                    jwks.clone(),
+                    tok("x5c-url", parity::claims()),
+                    "JwkNotFound",
+                ),
+                (
+                    "audience matches",
+                    jwks.clone(),
+                    tok("k", json!({ "aud": "neon" })),
+                    "ok",
+                ),
+                (
+                    "audience in a list",
+                    jwks.clone(),
+                    tok("k", json!({ "aud": ["x", "neon"] })),
+                    "ok",
+                ),
+                (
+                    "wrong audience",
+                    jwks.clone(),
+                    tok("k", json!({ "aud": "neon2" })),
+                    "InvalidClaims",
+                ),
+                (
+                    "audience of other case",
+                    jwks.clone(),
+                    tok("k", json!({ "aud": "Neon" })),
+                    "InvalidClaims",
+                ),
+                (
+                    "no audience",
+                    jwks.clone(),
+                    tok("k", json!({})),
+                    "InvalidClaims",
+                ),
+                (
+                    "audience a number",
+                    jwks.clone(),
+                    tok("k", json!({ "aud": 1 })),
+                    "JwtEncoding",
+                ),
+                (
+                    "expired inside the leeway",
+                    jwks.clone(),
+                    tok("k", json!({ "aud": AUD, "exp": now - 20 })),
+                    "ok",
+                ),
+                (
+                    "expired outside the leeway",
+                    jwks.clone(),
+                    tok("k", json!({ "aud": AUD, "exp": now - 40 })),
+                    "InvalidClaims",
+                ),
+                (
+                    "exp 0",
+                    jwks.clone(),
+                    tok("k", json!({ "aud": AUD, "exp": 0 })),
+                    "InvalidClaims",
+                ),
+                (
+                    "exp a string",
+                    jwks.clone(),
+                    tok("k", json!({ "aud": AUD, "exp": (now + 60).to_string() })),
+                    "JwtEncoding",
+                ),
+                (
+                    "exp negative",
+                    jwks.clone(),
+                    tok("k", json!({ "aud": AUD, "exp": -1 })),
+                    "JwtEncoding",
+                ),
+                (
+                    "exp a float",
+                    jwks.clone(),
+                    tok("k", json!({ "aud": AUD, "exp": (now + 60) as f64 + 0.5 })),
+                    "JwtEncoding",
+                ),
+                (
+                    "exp null",
+                    jwks.clone(),
+                    tok("k", json!({ "aud": AUD, "exp": null })),
+                    "ok",
+                ),
+                (
+                    "not yet valid inside the leeway",
+                    jwks.clone(),
+                    tok("k", json!({ "aud": AUD, "nbf": now + 20 })),
+                    "ok",
+                ),
+                (
+                    "not yet valid outside the leeway",
+                    jwks.clone(),
+                    tok("k", json!({ "aud": AUD, "nbf": now + 40 })),
+                    "InvalidClaims",
+                ),
+                (
+                    "nbf u64::MAX",
+                    jwks.clone(),
+                    tok("k", json!({ "aud": AUD, "nbf": u64::MAX })),
+                    "JwtEncoding",
+                ),
+            ],
+            &[
+                // jose-jwk parsed these members strictly and skipped the key; jsonwebtoken
+                // keeps them as free strings. Harmless: proxy never reads them.
+                ("key_ops with an unknown op", "ok"),
+                ("19-byte x5t", "ok"),
+                ("x5c in base64url", "ok"),
+            ],
+        )
         .await;
     }
 
