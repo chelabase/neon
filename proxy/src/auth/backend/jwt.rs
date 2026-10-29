@@ -7,14 +7,14 @@ use arc_swap::ArcSwapOption;
 use base64::Engine as _;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use clashmap::ClashMap;
-use jose_jwk::crypto::KeyInfo;
+use jsonwebtoken::jwk::{AlgorithmParameters, EllipticCurve, Jwk, KeyAlgorithm, PublicKeyUse};
+use jsonwebtoken::{Algorithm, DecodingKey};
 use reqwest::{Client, redirect};
 use reqwest_retry::RetryTransientMiddleware;
 use reqwest_retry::policies::ExponentialBackoff;
 use serde::de::Visitor;
 use serde::{Deserialize, Deserializer};
 use serde_json::value::RawValue;
-use signature::Verifier;
 use thiserror::Error;
 use tokio::time::Instant;
 
@@ -83,7 +83,7 @@ impl JwkCacheEntry {
         &self,
         key_id: &str,
         role_name: &RoleName,
-    ) -> Option<(&jose_jwk::Jwk, Option<&str>)> {
+    ) -> Option<(&Jwk, Option<&str>)> {
         self.key_sets
             .values()
             // make sure our requested role has access to the key set
@@ -98,17 +98,17 @@ impl JwkCacheEntry {
 }
 
 struct KeySet {
-    jwks: jose_jwk::JwkSet,
+    jwks: jsonwebtoken::jwk::JwkSet,
     audience: Option<String>,
     role_names: Vec<RoleNameInt>,
 }
 
 impl KeySet {
-    fn find_key(&self, key_id: &str) -> Option<&jose_jwk::Jwk> {
+    fn find_key(&self, key_id: &str) -> Option<&Jwk> {
         self.jwks
             .keys
             .iter()
-            .find(|jwk| jwk.prm.kid.as_deref() == Some(key_id))
+            .find(|jwk| jwk.common.key_id.as_deref() == Some(key_id))
     }
 }
 
@@ -139,7 +139,7 @@ struct JwkSet<'a> {
 async fn fetch_jwks(
     client: &reqwest_middleware::ClientWithMiddleware,
     jwks_url: url::Url,
-) -> Option<jose_jwk::JwkSet> {
+) -> Option<jsonwebtoken::jwk::JwkSet> {
     let req = client.get(jwks_url.clone());
     // TODO(conrad): We need to filter out URLs that point to local resources. Public internet only.
     let resp = req.send().await.and_then(|r| {
@@ -175,16 +175,31 @@ async fn fetch_jwks(
         }
     };
 
-    // `jose_jwk::Jwk` is quite large (288 bytes). Let's not pre-allocate for what we don't need.
+    // `Jwk` is quite large (over 300 bytes). Let's not pre-allocate for what we don't need.
     //
     // Even though we limit our responses to 64KiB, we could still receive a payload like
     // `{"keys":[` + repeat(`0`).take(30000).join(`,`) + `]}`. Parsing this as `RawValue` uses 468KiB.
-    // Pre-allocating the corresponding `Vec::<jose_jwk::Jwk>::with_capacity(30000)` uses 8.2MiB.
+    // Pre-allocating the corresponding `Vec::<Jwk>::with_capacity(30000)` would use over 9MiB.
     let mut keys = vec![];
 
     let mut failed = 0;
     for key in jwks.keys {
-        let key = match serde_json::from_str::<jose_jwk::Jwk>(key.get()) {
+        let key = match serde_json::from_str::<Jwk>(key.get()) {
+            // An unknown `kty`, or a key missing its key material, parses as `Other`.
+            Ok(Jwk {
+                algorithm: AlgorithmParameters::Other(_),
+                ..
+            }) => {
+                tracing::debug!(url=?jwks_url, "could not decode JWK: unsupported key type");
+                failed += 1;
+                continue;
+            }
+            // Key material that isn't base64url.
+            Ok(key) if DecodingKey::from_jwk(&key).is_err() => {
+                tracing::debug!(url=?jwks_url, "could not decode JWK: invalid key material");
+                failed += 1;
+                continue;
+            }
             Ok(key) => key,
             Err(e) => {
                 tracing::debug!(url=?jwks_url, failed=?e, "could not decode JWK");
@@ -193,13 +208,12 @@ async fn fetch_jwks(
             }
         };
 
-        // if `use` (called `cls` in rust) is specified to be something other than signing,
-        // we can skip storing it.
+        // if `use` is specified to be something other than signing, we can skip storing it.
         if key
-            .prm
-            .cls
+            .common
+            .public_key_use
             .as_ref()
-            .is_some_and(|c| *c != jose_jwk::Class::Signing)
+            .is_some_and(|u| *u != PublicKeyUse::Signature)
         {
             continue;
         }
@@ -218,7 +232,7 @@ async fn fetch_jwks(
         return None;
     }
 
-    Some(jose_jwk::JwkSet { keys })
+    Some(jsonwebtoken::jwk::JwkSet { keys })
 }
 
 impl JwkCacheEntryLock {
@@ -359,7 +373,8 @@ impl JwkCacheEntryLock {
             ctx.set_jwt_issuer(iss.as_ref().to_owned());
         }
 
-        let sig = BASE64_URL_SAFE_NO_PAD.decode(signature)?;
+        // Refuse a signature that isn't base64url before looking for the key.
+        BASE64_URL_SAFE_NO_PAD.decode(signature)?;
 
         let kid = header.key_id.ok_or(JwtError::MissingKeyId)?;
 
@@ -383,16 +398,16 @@ impl JwkCacheEntryLock {
             }
         };
 
-        if !jwk.is_supported(&header.algorithm) {
+        if !is_supported(jwk, header.algorithm) {
             return Err(JwtError::SignatureAlgorithmNotSupported);
         }
 
-        match &jwk.key {
-            jose_jwk::Key::Ec(key) => {
-                verify_ec_signature(header_payload.as_bytes(), &sig, key)?;
+        match &jwk.algorithm {
+            AlgorithmParameters::EllipticCurve(key) => {
+                verify_ec_signature(header_payload.as_bytes(), signature, jwk, &key.curve)?;
             }
-            jose_jwk::Key::Rsa(key) => {
-                verify_rsa_signature(header_payload.as_bytes(), &sig, key, &header.algorithm)?;
+            AlgorithmParameters::RSA(_) => {
+                verify_rsa_signature(header_payload.as_bytes(), signature, jwk, header.algorithm)?;
             }
             key => return Err(JwtError::UnsupportedKeyType(key.into())),
         }
@@ -484,45 +499,98 @@ impl Default for JwkCache {
     }
 }
 
-fn verify_ec_signature(data: &[u8], sig: &[u8], key: &jose_jwk::Ec) -> Result<(), JwtError> {
-    use ecdsa::Signature;
-    use signature::Verifier;
+/// RSA keys over this many bits are refused, as `rsa` 0.9 refused them.
+const MAX_RSA_BITS: usize = 4096;
 
-    match key.crv {
-        jose_jwk::EcCurves::P256 => {
-            let pk = p256::PublicKey::try_from(key).map_err(JwtError::InvalidP256Key)?;
-            let key = p256::ecdsa::VerifyingKey::from(&pk);
-            let sig = Signature::from_slice(sig)?;
-            key.verify(data, &sig)?;
+/// Whether `jwk` may verify a token signed with `alg`: the algorithm matches the key's
+/// type and curve (and, for RSA, its size), and the JWK's own `alg`, when it has one.
+fn is_supported(jwk: &Jwk, alg: Algorithm) -> bool {
+    use Algorithm::{
+        ES256, ES384, EdDSA, HS256, HS384, HS512, PS256, PS384, PS512, RS256, RS384, RS512,
+    };
+
+    let by_key = match &jwk.algorithm {
+        AlgorithmParameters::EllipticCurve(ec) => matches!(
+            (&ec.curve, alg),
+            (EllipticCurve::P256, ES256) | (EllipticCurve::P384, ES384)
+        ),
+        AlgorithmParameters::RSA(rsa) => {
+            // The modulus length in bytes, as sent, over 16: 2048 bits for RS256/PS256
+            // (RFC 7518 3.3), more for the longer hashes.
+            let strength = BASE64_URL_SAFE_NO_PAD
+                .decode(&rsa.n)
+                .map_or(0, |n| n.len() / 16);
+            match alg {
+                RS256 | PS256 => strength >= 16,
+                RS384 | PS384 => strength >= 24,
+                RS512 | PS512 => strength >= 32,
+                _ => false,
+            }
         }
-        key => return Err(JwtError::UnsupportedEcKeyType(key)),
-    }
+        AlgorithmParameters::OctetKey(oct) => {
+            let len = BASE64_URL_SAFE_NO_PAD
+                .decode(&oct.value)
+                .map_or(0, |k| k.len());
+            matches!((alg, len), (HS256, 16..) | (HS384, 24..) | (HS512, 32..))
+        }
+        AlgorithmParameters::OctetKeyPair(_) => alg == EdDSA,
+        // `Other` (an unknown `kty`) is skipped when the JWKS is fetched.
+        _ => false,
+    };
+    by_key
+        && jwk
+            .common
+            .key_algorithm
+            .is_none_or(|a| a == KeyAlgorithm::from(alg))
+}
 
-    Ok(())
+/// Verify `signature` (base64url) over `data` as `alg` with `key`.
+fn verify(data: &[u8], signature: &str, key: &DecodingKey, alg: Algorithm) -> Result<(), JwtError> {
+    match jsonwebtoken::crypto::verify(signature, data, key, alg) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(JwtError::Signature(signature::Error::new())),
+        Err(e) => Err(JwtError::Signature(signature::Error::from_source(e))),
+    }
+}
+
+fn verify_ec_signature(
+    data: &[u8],
+    signature: &str,
+    jwk: &Jwk,
+    curve: &EllipticCurve,
+) -> Result<(), JwtError> {
+    match curve {
+        // aws-lc refuses a point that isn't on the curve when it verifies.
+        EllipticCurve::P256 => {
+            let key = DecodingKey::from_jwk(jwk).map_err(JwtError::InvalidP256Key)?;
+            verify(data, signature, &key, Algorithm::ES256)
+        }
+        curve => Err(JwtError::UnsupportedEcKeyType(curve.clone())),
+    }
 }
 
 fn verify_rsa_signature(
     data: &[u8],
-    sig: &[u8],
-    key: &jose_jwk::Rsa,
-    alg: &jose_jwa::Algorithm,
+    signature: &str,
+    jwk: &Jwk,
+    alg: Algorithm,
 ) -> Result<(), JwtError> {
-    use jose_jwa::{Algorithm, Signing};
-    use rsa::RsaPublicKey;
-    use rsa::pkcs1v15::{Signature, VerifyingKey};
-
-    let key = RsaPublicKey::try_from(key).map_err(JwtError::InvalidRsaKey)?;
-
-    match alg {
-        Algorithm::Signing(Signing::Rs256) => {
-            let key = VerifyingKey::<sha2::Sha256>::new(key);
-            let sig = Signature::try_from(sig)?;
-            key.verify(data, &sig)?;
+    let key = DecodingKey::from_jwk(jwk).map_err(JwtError::InvalidRsaKey)?;
+    if let AlgorithmParameters::RSA(rsa) = &jwk.algorithm {
+        let n = BASE64_URL_SAFE_NO_PAD.decode(&rsa.n)?;
+        let n = &n[n.iter().take_while(|&&b| b == 0).count()..];
+        let bits = n
+            .first()
+            .map_or(0, |top| n.len() * 8 - top.leading_zeros() as usize);
+        if bits > MAX_RSA_BITS {
+            return Err(JwtError::RsaKeyTooLarge(bits));
         }
-        _ => return Err(JwtError::InvalidRsaSigningAlgorithm),
     }
 
-    Ok(())
+    match alg {
+        Algorithm::RS256 => verify(data, signature, &key, Algorithm::RS256),
+        _ => Err(JwtError::InvalidRsaSigningAlgorithm),
+    }
 }
 
 /// <https://datatracker.ietf.org/doc/html/rfc7515#section-4.1>
@@ -530,7 +598,7 @@ fn verify_rsa_signature(
 struct JwtHeader<'a> {
     /// must be a supported alg
     #[serde(rename = "alg")]
-    algorithm: jose_jwa::Algorithm,
+    algorithm: Algorithm,
     /// key id, must be provided for our usecase
     #[serde(rename = "kid", borrow)]
     key_id: Option<Cow<'a, str>>,
@@ -708,16 +776,19 @@ pub(crate) enum JwtError {
     InvalidClaims(#[from] JwtClaimsError),
 
     #[error("invalid P256 key")]
-    InvalidP256Key(jose_jwk::crypto::Error),
+    InvalidP256Key(jsonwebtoken::errors::Error),
 
     #[error("invalid RSA key")]
-    InvalidRsaKey(jose_jwk::crypto::Error),
+    InvalidRsaKey(jsonwebtoken::errors::Error),
+
+    #[error("RSA key too large ({0} bits)")]
+    RsaKeyTooLarge(usize),
 
     #[error("invalid RSA signing algorithm")]
     InvalidRsaSigningAlgorithm,
 
     #[error("unsupported EC key type {0:?}")]
-    UnsupportedEcKeyType(jose_jwk::EcCurves),
+    UnsupportedEcKeyType(EllipticCurve),
 
     #[error("unsupported key type {0:?}")]
     UnsupportedKeyType(KeyType),
@@ -773,20 +844,16 @@ pub enum JwtClaimsError {
 #[allow(dead_code, reason = "Debug use only")]
 #[derive(Debug)]
 pub(crate) enum KeyType {
-    Ec(jose_jwk::EcCurves),
-    Rsa,
     Oct,
-    Okp(jose_jwk::OkpCurves),
+    Okp(EllipticCurve),
     Unknown,
 }
 
-impl From<&jose_jwk::Key> for KeyType {
-    fn from(key: &jose_jwk::Key) -> Self {
+impl From<&AlgorithmParameters> for KeyType {
+    fn from(key: &AlgorithmParameters) -> Self {
         match key {
-            jose_jwk::Key::Ec(ec) => Self::Ec(ec.crv),
-            jose_jwk::Key::Rsa(_rsa) => Self::Rsa,
-            jose_jwk::Key::Oct(_oct) => Self::Oct,
-            jose_jwk::Key::Okp(okp) => Self::Okp(okp.crv),
+            AlgorithmParameters::OctetKey(_) => Self::Oct,
+            AlgorithmParameters::OctetKeyPair(okp) => Self::Okp(okp.curve.clone()),
             _ => Self::Unknown,
         }
     }
@@ -803,42 +870,31 @@ mod tests {
     use http_body_util::Full;
     use hyper::service::service_fn;
     use hyper_util::rt::TokioIo;
-    use rand_core::OsRng;
-    use rsa::pkcs8::DecodePrivateKey;
     use serde::Serialize;
     use serde_json::json;
-    use signature::Signer;
     use tokio::net::TcpListener;
 
     use super::*;
     use crate::types::RoleName;
 
-    fn new_ec_jwk(kid: String) -> (p256::SecretKey, jose_jwk::Jwk) {
-        let sk = p256::SecretKey::random(&mut OsRng);
-        let pk = sk.public_key().into();
-        let jwk = jose_jwk::Jwk {
-            key: jose_jwk::Key::Ec(pk),
-            prm: jose_jwk::Parameters {
-                kid: Some(kid),
-                alg: Some(jose_jwa::Algorithm::Signing(jose_jwa::Signing::Es256)),
-                ..Default::default()
-            },
-        };
-        (sk, jwk)
+    fn new_ec_jwk(kid: String) -> (TestKey, Jwk) {
+        let key = TestKey::p256();
+        let jwk = with(key.jwk(&kid), |k| {
+            k.insert("alg".into(), "ES256".into());
+        });
+        (key, serde_json::from_value(jwk).unwrap())
     }
 
-    fn new_rsa_jwk(key: &str, kid: String) -> (rsa::RsaPrivateKey, jose_jwk::Jwk) {
-        let sk = rsa::RsaPrivateKey::from_pkcs8_pem(key).unwrap();
-        let pk = sk.to_public_key().into();
-        let jwk = jose_jwk::Jwk {
-            key: jose_jwk::Key::Rsa(pk),
-            prm: jose_jwk::Parameters {
-                kid: Some(kid),
-                alg: Some(jose_jwa::Algorithm::Signing(jose_jwa::Signing::Rs256)),
-                ..Default::default()
-            },
-        };
-        (sk, jwk)
+    fn new_rsa_jwk(pem: &str, kid: String) -> (TestKey, Jwk) {
+        let key = TestKey::rsa_pem(pem);
+        let jwk = with(key.jwk(&kid), |k| {
+            k.insert("alg".into(), "RS256".into());
+        });
+        (key, serde_json::from_value(jwk).unwrap())
+    }
+
+    fn jwk_set(keys: Vec<Jwk>) -> jsonwebtoken::jwk::JwkSet {
+        jsonwebtoken::jwk::JwkSet { keys }
     }
 
     fn now() -> u64 {
@@ -848,9 +904,9 @@ mod tests {
             .as_secs()
     }
 
-    fn build_jwt_payload(kid: String, sig: jose_jwa::Signing) -> String {
+    fn jwt_body() -> serde_json::Value {
         let now = now();
-        let body = typed_json::json! {{
+        json!({
             "exp": now + 3600,
             "nbf": now,
             "aud": ["audience1", "neon", "audience2"],
@@ -858,55 +914,23 @@ mod tests {
             "sid": "session1",
             "jti": "token1",
             "iss": "neon-testing",
-        }};
-        build_custom_jwt_payload(kid, body, sig)
+        })
     }
 
-    fn build_custom_jwt_payload(
-        kid: String,
-        body: impl Serialize,
-        sig: jose_jwa::Signing,
-    ) -> String {
-        let header = JwtHeader {
-            algorithm: jose_jwa::Algorithm::Signing(sig),
-            key_id: Some(Cow::Owned(kid)),
-        };
-
-        let header = BASE64_URL_SAFE_NO_PAD.encode(serde_json::to_string(&header).unwrap());
-        let body = BASE64_URL_SAFE_NO_PAD.encode(serde_json::to_string(&body).unwrap());
-
-        format!("{header}.{body}")
+    fn new_ec_jwt(kid: String, key: &TestKey) -> String {
+        token(key, &header("ES256", &kid), &jwt_body())
     }
 
-    fn new_ec_jwt(kid: String, key: &p256::SecretKey) -> String {
-        use p256::ecdsa::{Signature, SigningKey};
-
-        let payload = build_jwt_payload(kid, jose_jwa::Signing::Es256);
-        let sig: Signature = SigningKey::from(key).sign(payload.as_bytes());
-        let sig = BASE64_URL_SAFE_NO_PAD.encode(sig.to_bytes());
-
-        format!("{payload}.{sig}")
+    fn new_custom_ec_jwt(kid: String, key: &TestKey, body: impl Serialize) -> String {
+        token(
+            key,
+            &header("ES256", &kid),
+            &serde_json::to_value(body).unwrap(),
+        )
     }
 
-    fn new_custom_ec_jwt(kid: String, key: &p256::SecretKey, body: impl Serialize) -> String {
-        use p256::ecdsa::{Signature, SigningKey};
-
-        let payload = build_custom_jwt_payload(kid, body, jose_jwa::Signing::Es256);
-        let sig: Signature = SigningKey::from(key).sign(payload.as_bytes());
-        let sig = BASE64_URL_SAFE_NO_PAD.encode(sig.to_bytes());
-
-        format!("{payload}.{sig}")
-    }
-
-    fn new_rsa_jwt(kid: String, key: rsa::RsaPrivateKey) -> String {
-        use rsa::pkcs1v15::SigningKey;
-        use rsa::signature::SignatureEncoding;
-
-        let payload = build_jwt_payload(kid, jose_jwa::Signing::Rs256);
-        let sig = SigningKey::<sha2::Sha256>::new(key).sign(payload.as_bytes());
-        let sig = BASE64_URL_SAFE_NO_PAD.encode(sig.to_bytes());
-
-        format!("{payload}.{sig}")
+    fn new_rsa_jwt(kid: String, key: TestKey) -> String {
+        token(&key, &header("RS256", &kid), &jwt_body())
     }
 
     // RSA key gen is slow....
@@ -1021,12 +1045,8 @@ X0n5X2/pBLJzxZc62ccvZYVnctBiFs6HbSnxpuMQCfkt/BcR/ttIepBQQIW86wHL
         let (ec1, jwk3) = new_ec_jwk("ec1".into());
         let (ec2, jwk4) = new_ec_jwk("ec2".into());
 
-        let foo_jwks = jose_jwk::JwkSet {
-            keys: vec![jwk1, jwk3],
-        };
-        let bar_jwks = jose_jwk::JwkSet {
-            keys: vec![jwk2, jwk4],
-        };
+        let foo_jwks = jwk_set(vec![jwk1, jwk3]);
+        let bar_jwks = jwk_set(vec![jwk2, jwk4]);
 
         let jwks_addr = jwks_server(move |path| match path {
             "/foo" => Some(serde_json::to_vec(&foo_jwks).unwrap()),
@@ -1112,7 +1132,7 @@ X0n5X2/pBLJzxZc62ccvZYVnctBiFs6HbSnxpuMQCfkt/BcR/ttIepBQQIW86wHL
             }},
         );
 
-        let jwks = jose_jwk::JwkSet { keys: vec![jwk] };
+        let jwks = jwk_set(vec![jwk]);
 
         let jwks_addr = jwks_server(move |_path| Some(serde_json::to_vec(&jwks).unwrap())).await;
 
@@ -1149,7 +1169,7 @@ X0n5X2/pBLJzxZc62ccvZYVnctBiFs6HbSnxpuMQCfkt/BcR/ttIepBQQIW86wHL
         // has a matching kid, but signed by the wrong key
         let bad_jwt = new_ec_jwt("1".into(), &key);
 
-        let jwks = jose_jwk::JwkSet { keys: vec![jwk] };
+        let jwks = jwk_set(vec![jwk]);
         let jwks_addr = jwks_server(move |path| match path {
             "/" => Some(serde_json::to_vec(&jwks).unwrap()),
             _ => None,
@@ -1186,7 +1206,7 @@ X0n5X2/pBLJzxZc62ccvZYVnctBiFs6HbSnxpuMQCfkt/BcR/ttIepBQQIW86wHL
         let (key, jwk) = new_rsa_jwk(RS1, "1".into());
         let jwt = new_rsa_jwt("1".into(), key);
 
-        let jwks = jose_jwk::JwkSet { keys: vec![jwk] };
+        let jwks = jwk_set(vec![jwk]);
         let jwks_addr = jwks_server(move |path| match path {
             "/" => Some(serde_json::to_vec(&jwks).unwrap()),
             _ => None,
@@ -1225,7 +1245,7 @@ X0n5X2/pBLJzxZc62ccvZYVnctBiFs6HbSnxpuMQCfkt/BcR/ttIepBQQIW86wHL
     async fn check_jwt_invalid_claims() {
         let (key, jwk) = new_ec_jwk("1".into());
 
-        let jwks = jose_jwk::JwkSet { keys: vec![jwk] };
+        let jwks = jwk_set(vec![jwk]);
         let jwks_addr = jwks_server(move |path| match path {
             "/" => Some(serde_json::to_vec(&jwks).unwrap()),
             _ => None,
@@ -1378,5 +1398,1125 @@ X0n5X2/pBLJzxZc62ccvZYVnctBiFs6HbSnxpuMQCfkt/BcR/ttIepBQQIW86wHL
             )
             .await
             .unwrap();
+    }
+
+    // ---- Parity cases. Each was run against the `jose-jwk` verifier first; the class
+    // in each case is what it gave then ("ok" for accepted). On jsonwebtoken a case
+    // jose-jwk accepted must still be accepted and every other case must be refused;
+    // the refusal's `JwtError` class may differ. The JWKS documents are raw JSON and
+    // the tokens are signed with aws-lc-rs, so nothing here depends on the JWK library
+    // under test.
+
+    mod parity {
+        use aws_lc_rs::rand::SystemRandom;
+        use aws_lc_rs::rsa::KeySize;
+        use aws_lc_rs::signature::{
+            ECDSA_P256_SHA256_FIXED_SIGNING, ECDSA_P384_SHA384_FIXED_SIGNING, EcdsaKeyPair,
+            KeyPair, RSA_PKCS1_SHA256, RSA_PKCS1_SHA384, RSA_PKCS1_SHA512, RSA_PSS_SHA256,
+            RsaEncoding, RsaKeyPair,
+        };
+        use base64::prelude::BASE64_STANDARD;
+        use serde_json::{Value, json};
+
+        use super::*;
+
+        pub(super) const AUD: &str = "neon";
+
+        pub(super) fn b64(bytes: impl AsRef<[u8]>) -> String {
+            BASE64_URL_SAFE_NO_PAD.encode(bytes)
+        }
+
+        pub(super) fn now() -> u64 {
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        }
+
+        /// A key that signs, and the JWK fields (`kty`, `crv`, `x`, `y` / `n`, `e`) of its
+        /// public half.
+        pub(super) enum TestKey {
+            Ec(EcdsaKeyPair),
+            Rsa(RsaKeyPair),
+        }
+
+        impl TestKey {
+            pub(super) fn p256() -> Self {
+                Self::Ec(EcdsaKeyPair::generate(&ECDSA_P256_SHA256_FIXED_SIGNING).unwrap())
+            }
+            pub(super) fn p384() -> Self {
+                Self::Ec(EcdsaKeyPair::generate(&ECDSA_P384_SHA384_FIXED_SIGNING).unwrap())
+            }
+            pub(super) fn rsa_pem(pem: &str) -> Self {
+                let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+                let der = BASE64_STANDARD.decode(body).unwrap();
+                Self::Rsa(RsaKeyPair::from_pkcs8(&der).unwrap())
+            }
+            pub(super) fn rsa(size: KeySize) -> Self {
+                Self::Rsa(RsaKeyPair::generate(size).unwrap())
+            }
+
+            /// The public key's JWK members.
+            pub(super) fn jwk(&self, kid: &str) -> Value {
+                match self {
+                    Self::Ec(kp) => {
+                        let point = kp.public_key().as_ref();
+                        let len = (point.len() - 1) / 2;
+                        let crv = if len == 32 { "P-256" } else { "P-384" };
+                        json!({
+                            "kty": "EC",
+                            "crv": crv,
+                            "kid": kid,
+                            "x": b64(&point[1..=len]),
+                            "y": b64(&point[1 + len..]),
+                        })
+                    }
+                    Self::Rsa(kp) => {
+                        let pk = kp.public_key();
+                        json!({
+                            "kty": "RSA",
+                            "kid": kid,
+                            "n": b64(pk.modulus().big_endian_without_leading_zero()),
+                            "e": b64(pk.exponent().big_endian_without_leading_zero()),
+                        })
+                    }
+                }
+            }
+
+            /// The signature of `input` under `alg` (an ECDSA key signs with its own curve).
+            pub(super) fn sign(&self, alg: &str, input: &[u8]) -> Vec<u8> {
+                let rng = SystemRandom::new();
+                match self {
+                    Self::Ec(kp) => kp.sign(&rng, input).unwrap().as_ref().to_vec(),
+                    Self::Rsa(kp) => {
+                        let padding: &'static dyn RsaEncoding = match alg {
+                            "RS384" => &RSA_PKCS1_SHA384,
+                            "RS512" => &RSA_PKCS1_SHA512,
+                            "PS256" => &RSA_PSS_SHA256,
+                            _ => &RSA_PKCS1_SHA256,
+                        };
+                        let mut sig = vec![0; kp.public_modulus_len()];
+                        kp.sign(padding, &rng, input, &mut sig).unwrap();
+                        sig
+                    }
+                }
+            }
+        }
+
+        pub(super) fn claims() -> Value {
+            let now = now();
+            json!({ "exp": now + 3600, "nbf": now, "aud": [AUD], "sub": "user1" })
+        }
+
+        /// `header.payload.signature`, signed by `signer` under the header's `alg`.
+        pub(super) fn token(signer: &TestKey, header: &Value, payload: &Value) -> String {
+            let input = format!(
+                "{}.{}",
+                b64(serde_json::to_vec(header).unwrap()),
+                b64(serde_json::to_vec(payload).unwrap())
+            );
+            let alg = header["alg"].as_str().unwrap_or("");
+            let sig = signer.sign(alg, input.as_bytes());
+            format!("{input}.{}", b64(sig))
+        }
+
+        pub(super) fn header(alg: &str, kid: &str) -> Value {
+            json!({ "alg": alg, "kid": kid, "typ": "JWT" })
+        }
+
+        /// Serve `jwks` and verify `token` against it, for a role the rule allows, with
+        /// the rule's audience `AUD`.
+        pub(super) async fn check(jwks: &Value, token: &str) -> Result<(), JwtError> {
+            let body = serde_json::to_vec(jwks).unwrap();
+            let addr = jwks_server(move |_| Some(body.clone())).await;
+            let role = RoleName::from("authenticated");
+            let fetch = Fetch(vec![AuthRule {
+                id: "rule".to_owned(),
+                jwks_url: format!("http://{addr}/").parse().unwrap(),
+                audience: Some(AUD.to_owned()),
+                role_names: vec![RoleNameInt::from(&role)],
+            }]);
+            JwkCache::default()
+                .check_jwt(
+                    &RequestContext::test(),
+                    EndpointId::from("ep"),
+                    &role,
+                    &fetch,
+                    token,
+                )
+                .await
+                .map(|_| ())
+        }
+
+        /// The `JwtError` variant's name ("Signature", "JwkNotFound", ...), or "ok".
+        pub(super) fn class(res: &Result<(), JwtError>) -> String {
+            match res {
+                Ok(()) => "ok".to_owned(),
+                Err(e) => {
+                    let debug = format!("{e:?}");
+                    debug
+                        .split(|c: char| !c.is_alphanumeric())
+                        .next()
+                        .unwrap()
+                        .to_owned()
+                }
+            }
+        }
+
+        /// Run every `(name, jwks, token, jose-jwk class)` case and print what each
+        /// gave. Fail, listing them, on every case jose-jwk accepted ("ok") that is now
+        /// refused, or that it refused and is now accepted.
+        pub(super) async fn run(cases: Vec<(&str, Value, String, &str)>) {
+            let mut wrong = vec![];
+            for (name, jwks, token, before) in cases {
+                let res = check(&jwks, &token).await;
+                let got = class(&res);
+                println!("{name}: {got} (jose-jwk: {before}) ({res:?})");
+                if (got == "ok") != (before == "ok") {
+                    wrong.push(format!("{name}: jose-jwk {before}, now {got} ({res:?})"));
+                }
+            }
+            assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+        }
+
+        /// `jwk` with `edit` applied to its members.
+        pub(super) fn with(
+            mut jwk: Value,
+            edit: impl FnOnce(&mut serde_json::Map<String, Value>),
+        ) -> Value {
+            edit(jwk.as_object_mut().unwrap());
+            jwk
+        }
+
+        pub(super) fn set(keys: &[Value]) -> Value {
+            json!({ "keys": keys })
+        }
+
+        /// Flip one bit of the signature's first byte.
+        pub(super) fn tamper(token: &str) -> String {
+            let (input, sig) = token.rsplit_once('.').unwrap();
+            let mut sig = BASE64_URL_SAFE_NO_PAD.decode(sig).unwrap();
+            sig[0] ^= 1;
+            format!("{input}.{}", b64(sig))
+        }
+
+        /// The token with its signature replaced by `sig` (base64url text).
+        pub(super) fn resig(token: &str, sig: &str) -> String {
+            let (input, _) = token.rsplit_once('.').unwrap();
+            format!("{input}.{sig}")
+        }
+
+        pub(super) fn rsa3072() -> TestKey {
+            TestKey::rsa(KeySize::Rsa3072)
+        }
+    }
+
+    use parity::{AUD, TestKey, b64, check, class, header, run, set, token, with};
+    use serde_json::Value;
+
+    /// AC 3: a JWKS with P-256, P-384 and RSA keys. ES256 on P-256 and RS256 on RSA are
+    /// the algorithms the verifier accepts; the P-384 key and the other RSA algorithms
+    /// are refused (they always were: only ES256 and RS256 have a verifier).
+    #[tokio::test]
+    async fn parity_accepted_algorithms() {
+        let (ec, p384, rsa) = (TestKey::p256(), TestKey::p384(), TestKey::rsa_pem(RS1));
+        let rsa3k = parity::rsa3072();
+        let jwks = set(&[
+            ec.jwk("ec"),
+            p384.jwk("p384"),
+            rsa.jwk("rsa"),
+            rsa3k.jwk("rsa3k"),
+            with(ec.jwk("ec-alg"), |k| {
+                k.insert("alg".into(), "ES256".into());
+                k.insert("use".into(), "sig".into());
+                k.insert("key_ops".into(), json!(["verify"]));
+            }),
+            with(rsa.jwk("rsa-alg"), |k| {
+                k.insert("alg".into(), "RS256".into());
+            }),
+        ]);
+        let c = parity::claims();
+        run(vec![
+            (
+                "ES256 / P-256",
+                jwks.clone(),
+                token(&ec, &header("ES256", "ec"), &c),
+                "ok",
+            ),
+            (
+                "ES256 / P-256 alg ES256",
+                jwks.clone(),
+                token(&ec, &header("ES256", "ec-alg"), &c),
+                "ok",
+            ),
+            (
+                "RS256 / RSA-2048",
+                jwks.clone(),
+                token(&rsa, &header("RS256", "rsa"), &c),
+                "ok",
+            ),
+            (
+                "RS256 / RSA-2048 alg RS256",
+                jwks.clone(),
+                token(&rsa, &header("RS256", "rsa-alg"), &c),
+                "ok",
+            ),
+            (
+                "RS256 / RSA-3072",
+                jwks.clone(),
+                token(&rsa3k, &header("RS256", "rsa3k"), &c),
+                "ok",
+            ),
+            (
+                "ES384 / P-384",
+                jwks.clone(),
+                token(&p384, &header("ES384", "p384"), &c),
+                "UnsupportedEcKeyType",
+            ),
+            (
+                "RS384 / RSA-2048",
+                jwks.clone(),
+                token(&rsa, &header("RS384", "rsa"), &c),
+                "SignatureAlgorithmNotSupported",
+            ),
+            (
+                "RS384 / RSA-3072",
+                jwks.clone(),
+                token(&rsa3k, &header("RS384", "rsa3k"), &c),
+                "InvalidRsaSigningAlgorithm",
+            ),
+            (
+                "RS512 / RSA-3072",
+                jwks.clone(),
+                token(&rsa3k, &header("RS512", "rsa3k"), &c),
+                "SignatureAlgorithmNotSupported",
+            ),
+            (
+                "PS256 / RSA-2048",
+                jwks.clone(),
+                token(&rsa, &header("PS256", "rsa"), &c),
+                "InvalidRsaSigningAlgorithm",
+            ),
+            (
+                "PS256 / RSA-3072",
+                jwks.clone(),
+                token(&rsa3k, &header("PS256", "rsa3k"), &c),
+                "InvalidRsaSigningAlgorithm",
+            ),
+        ])
+        .await;
+    }
+
+    /// AC 4: each refusal keeps its `JwtError` class.
+    #[tokio::test]
+    async fn parity_key_lookup_signature_and_alg() {
+        let (ec, rsa, other) = (TestKey::p256(), TestKey::rsa_pem(RS1), TestKey::p256());
+        let jwks = set(&[
+            ec.jwk("ec"),
+            rsa.jwk("rsa"),
+            with(ec.jwk("ec-rs256"), |k| {
+                k.insert("alg".into(), "RS256".into());
+            }),
+            with(rsa.jwk("rsa-ps256"), |k| {
+                k.insert("alg".into(), "PS256".into());
+            }),
+            json!({ "kty": "oct", "kid": "oct", "k": b64([7u8; 32]) }),
+            json!({ "kty": "OKP", "crv": "Ed25519", "kid": "okp", "x": b64([9u8; 32]) }),
+        ]);
+        let c = parity::claims();
+        let es = token(&ec, &header("ES256", "ec"), &c);
+        let rs = token(&rsa, &header("RS256", "rsa"), &c);
+        let input = |t: &str| t.rsplit_once('.').unwrap().0.to_owned();
+        let unsigned = |alg: &str, kid: &str| {
+            format!(
+                "{}.{}.",
+                b64(serde_json::to_vec(&header(alg, kid)).unwrap()),
+                b64(serde_json::to_vec(&c).unwrap())
+            )
+        };
+        let no_kid = format!(
+            "{}.{}",
+            b64(serde_json::to_vec(&json!({ "alg": "ES256" })).unwrap()),
+            b64(serde_json::to_vec(&c).unwrap())
+        );
+        let no_kid = format!("{no_kid}.{}", b64(ec.sign("ES256", no_kid.as_bytes())));
+        run(vec![
+            // key not found
+            (
+                "kid not in the JWKS",
+                jwks.clone(),
+                token(&ec, &header("ES256", "nope"), &c),
+                "JwkNotFound",
+            ),
+            ("no kid", jwks.clone(), no_kid, "MissingKeyId"),
+            // signature
+            (
+                "ES256 signed by another key",
+                jwks.clone(),
+                token(&other, &header("ES256", "ec"), &c),
+                "Signature",
+            ),
+            (
+                "ES256 tampered",
+                jwks.clone(),
+                parity::tamper(&es),
+                "Signature",
+            ),
+            (
+                "ES256 empty signature",
+                jwks.clone(),
+                parity::resig(&es, ""),
+                "Signature",
+            ),
+            (
+                "ES256 63-byte signature",
+                jwks.clone(),
+                parity::resig(&es, &b64([1u8; 63])),
+                "Signature",
+            ),
+            (
+                "ES256 zero signature",
+                jwks.clone(),
+                parity::resig(&es, &b64([0u8; 64])),
+                "Signature",
+            ),
+            (
+                "ES256 padded signature",
+                jwks.clone(),
+                format!("{es}="),
+                "JwtEncoding",
+            ),
+            (
+                "RS256 tampered",
+                jwks.clone(),
+                parity::tamper(&rs),
+                "Signature",
+            ),
+            (
+                "RS256 short signature",
+                jwks.clone(),
+                parity::resig(&rs, &b64([1u8; 255])),
+                "Signature",
+            ),
+            (
+                "RS256 signed by another key",
+                jwks.clone(),
+                token(&TestKey::rsa_pem(RS2), &header("RS256", "rsa"), &c),
+                "Signature",
+            ),
+            (
+                "alg none, no signature",
+                jwks.clone(),
+                unsigned("none", "ec"),
+                "SignatureAlgorithmNotSupported",
+            ),
+            (
+                "alg none, ES256 signature",
+                jwks.clone(),
+                format!(
+                    "{}.{}",
+                    unsigned("none", "ec").trim_end_matches('.'),
+                    b64(ec.sign("ES256", input(&unsigned("none", "ec")).as_bytes()))
+                ),
+                "SignatureAlgorithmNotSupported",
+            ),
+            (
+                "alg None",
+                jwks.clone(),
+                unsigned("None", "ec"),
+                "JwtEncoding",
+            ),
+            (
+                "alg es256 (lower case)",
+                jwks.clone(),
+                token(&ec, &header("es256", "ec"), &c),
+                "JwtEncoding",
+            ),
+            (
+                "alg FOO",
+                jwks.clone(),
+                token(&ec, &header("FOO", "ec"), &c),
+                "JwtEncoding",
+            ),
+            // unsupported algorithm
+            (
+                "HS256 against an EC key",
+                jwks.clone(),
+                unsigned("HS256", "ec"),
+                "SignatureAlgorithmNotSupported",
+            ),
+            (
+                "HS256 against an RSA key",
+                jwks.clone(),
+                unsigned("HS256", "rsa"),
+                "SignatureAlgorithmNotSupported",
+            ),
+            (
+                "ES256 against an RSA key",
+                jwks.clone(),
+                token(&ec, &header("ES256", "rsa"), &c),
+                "SignatureAlgorithmNotSupported",
+            ),
+            (
+                "RS256 against an EC key",
+                jwks.clone(),
+                token(&rsa, &header("RS256", "ec"), &c),
+                "SignatureAlgorithmNotSupported",
+            ),
+            (
+                "ES384 against a P-256 key",
+                jwks.clone(),
+                token(&ec, &header("ES384", "ec"), &c),
+                "SignatureAlgorithmNotSupported",
+            ),
+            (
+                "ES256K against a P-256 key",
+                jwks.clone(),
+                token(&ec, &header("ES256K", "ec"), &c),
+                "SignatureAlgorithmNotSupported",
+            ),
+            (
+                "EdDSA against a P-256 key",
+                jwks.clone(),
+                token(&ec, &header("EdDSA", "ec"), &c),
+                "SignatureAlgorithmNotSupported",
+            ),
+            (
+                "ES256 against an EC key with alg RS256",
+                jwks.clone(),
+                token(&ec, &header("ES256", "ec-rs256"), &c),
+                "SignatureAlgorithmNotSupported",
+            ),
+            (
+                "RS256 against an RSA key with alg PS256",
+                jwks.clone(),
+                token(&rsa, &header("RS256", "rsa-ps256"), &c),
+                "SignatureAlgorithmNotSupported",
+            ),
+            (
+                "PS256 against an RSA key with alg PS256",
+                jwks.clone(),
+                token(&rsa, &header("PS256", "rsa-ps256"), &c),
+                "InvalidRsaSigningAlgorithm",
+            ),
+            (
+                "HS256 against an oct key",
+                jwks.clone(),
+                unsigned("HS256", "oct"),
+                "UnsupportedKeyType",
+            ),
+            (
+                "ES256 against an oct key",
+                jwks.clone(),
+                unsigned("ES256", "oct"),
+                "SignatureAlgorithmNotSupported",
+            ),
+            (
+                "EdDSA against an OKP key",
+                jwks.clone(),
+                unsigned("EdDSA", "okp"),
+                "UnsupportedKeyType",
+            ),
+        ])
+        .await;
+    }
+
+    /// AC 4: curve confusion, bad points and incomplete JWKs.
+    #[tokio::test]
+    async fn parity_bad_keys() {
+        let (ec, p384, rsa) = (TestKey::p256(), TestKey::p384(), TestKey::rsa_pem(RS1));
+        let ec_jwk = ec.jwk("k");
+        let get = |jwk: &Value, m: &str| {
+            BASE64_URL_SAFE_NO_PAD
+                .decode(jwk[m].as_str().unwrap())
+                .unwrap()
+        };
+        let (ec_x, ec_y) = (get(&ec_jwk, "x"), get(&ec_jwk, "y"));
+        let mut y1 = ec_y.clone();
+        *y1.last_mut().unwrap() ^= 1;
+        let p256_p: Vec<u8> = (0..32).map(|_| 0xffu8).collect();
+        let rsa_jwk = rsa.jwk("k");
+        let rsa_n = get(&rsa_jwk, "n");
+        let mut n0 = vec![0u8];
+        n0.extend_from_slice(&rsa_n);
+        // A 8192-bit modulus (odd, top bit set). Nothing can sign for it; the key must be
+        // refused before any signature check.
+        let mut n8k = vec![0xc5u8; 1024];
+        n8k[1023] |= 1;
+        let claims = parity::claims();
+        let es = token(&ec, &header("ES256", "k"), &claims);
+        let es384 = token(&p384, &header("ES384", "k"), &claims);
+        let p384_as_p256 = with(p384.jwk("k"), |k| {
+            k.insert("crv".into(), "P-256".into());
+        });
+        let rs = token(&rsa, &header("RS256", "k"), &claims);
+        let one = |jwk: Value| set(&[jwk]);
+        let ec_with = |edit: &dyn Fn(&mut serde_json::Map<String, Value>)| {
+            one(with(ec_jwk.clone(), |k| edit(k)))
+        };
+        let rsa_with = |edit: &dyn Fn(&mut serde_json::Map<String, Value>)| {
+            one(with(rsa_jwk.clone(), |k| edit(k)))
+        };
+        run(vec![
+            (
+                "P-384 key labelled P-256, ES256",
+                one(p384_as_p256.clone()),
+                resign(&p384, &header("ES256", "k"), &claims),
+                "InvalidP256Key",
+            ),
+            (
+                "P-384 key labelled P-256, ES384",
+                one(p384_as_p256.clone()),
+                es384.clone(),
+                "SignatureAlgorithmNotSupported",
+            ),
+            (
+                "P-256 key labelled P-384, ES384",
+                ec_with(&|k| {
+                    k.insert("crv".into(), "P-384".into());
+                }),
+                resign(&ec, &header("ES384", "k"), &claims),
+                "UnsupportedEcKeyType",
+            ),
+            (
+                "P-256 key labelled P-384, ES256",
+                ec_with(&|k| {
+                    k.insert("crv".into(), "P-384".into());
+                }),
+                es.clone(),
+                "SignatureAlgorithmNotSupported",
+            ),
+            (
+                "P-256 key labelled P-521, ES512",
+                ec_with(&|k| {
+                    k.insert("crv".into(), "P-521".into());
+                }),
+                resign(&ec, &header("ES512", "k"), &claims),
+                "UnsupportedEcKeyType",
+            ),
+            (
+                "P-256 key labelled secp256k1, ES256K",
+                ec_with(&|k| {
+                    k.insert("crv".into(), "secp256k1".into());
+                }),
+                resign(&ec, &header("ES256K", "k"), &claims),
+                "UnsupportedEcKeyType",
+            ),
+            (
+                "P-256 key with crv Ed25519",
+                ec_with(&|k| {
+                    k.insert("crv".into(), "Ed25519".into());
+                }),
+                es.clone(),
+                "JwkNotFound",
+            ),
+            (
+                "P-256 key with no crv",
+                ec_with(&|k| {
+                    k.remove("crv");
+                }),
+                es.clone(),
+                "JwkNotFound",
+            ),
+            (
+                "off-curve point",
+                ec_with(&|k| {
+                    k.insert("y".into(), b64(&y1).into());
+                }),
+                es.clone(),
+                "InvalidP256Key",
+            ),
+            (
+                "x = p (not a field element)",
+                ec_with(&|k| {
+                    k.insert("x".into(), b64(&p256_p).into());
+                }),
+                es.clone(),
+                "InvalidP256Key",
+            ),
+            (
+                "31-byte x",
+                ec_with(&|k| {
+                    k.insert("x".into(), b64(&ec_x[1..]).into());
+                }),
+                es.clone(),
+                "InvalidP256Key",
+            ),
+            (
+                "33-byte x (leading zero)",
+                ec_with(&|k| {
+                    let mut v0 = vec![0];
+                    v0.extend_from_slice(&ec_x);
+                    k.insert("x".into(), b64(v0).into());
+                }),
+                es.clone(),
+                "InvalidP256Key",
+            ),
+            (
+                "x and y swapped",
+                ec_with(&|k| {
+                    k.insert("x".into(), b64(&ec_y).into());
+                    k.insert("y".into(), b64(&ec_x).into());
+                }),
+                es.clone(),
+                "InvalidP256Key",
+            ),
+            (
+                "EC JWK missing x",
+                ec_with(&|k| {
+                    k.remove("x");
+                }),
+                es.clone(),
+                "JwkNotFound",
+            ),
+            (
+                "EC JWK missing y",
+                ec_with(&|k| {
+                    k.remove("y");
+                }),
+                es.clone(),
+                "JwkNotFound",
+            ),
+            (
+                "EC JWK with padded x",
+                ec_with(&|k| {
+                    let v = format!("{}=", k["x"].as_str().unwrap());
+                    k.insert("x".into(), v.into());
+                }),
+                es.clone(),
+                "JwkNotFound",
+            ),
+            (
+                "EC JWK with standard-alphabet x",
+                ec_with(&|k| {
+                    let v = format!("+{}", &k["x"].as_str().unwrap()[1..]);
+                    k.insert("x".into(), v.into());
+                }),
+                es.clone(),
+                "JwkNotFound",
+            ),
+            (
+                "EC JWK with x as a number",
+                ec_with(&|k| {
+                    k.insert("x".into(), 5.into());
+                }),
+                es.clone(),
+                "JwkNotFound",
+            ),
+            (
+                "EC JWK with non-canonical x",
+                ec_with(&|k| {
+                    k.insert("x".into(), non_canonical(k["x"].as_str().unwrap()).into());
+                }),
+                es.clone(),
+                "JwkNotFound",
+            ),
+            (
+                "EC JWK with d",
+                ec_with(&|k| {
+                    k.insert("d".into(), b64([5u8; 32]).into());
+                }),
+                es.clone(),
+                "ok",
+            ),
+            (
+                "ES256 high-S signature",
+                one(ec_jwk.clone()),
+                high_s(&es),
+                "ok",
+            ),
+            (
+                "OKP JWK with crv P-256",
+                one(json!({ "kty": "OKP", "crv": "P-256", "kid": "k", "x": b64([3u8; 32]) })),
+                resign(&ec, &header("EdDSA", "k"), &claims),
+                "JwkNotFound",
+            ),
+            (
+                "OKP JWK with no x",
+                one(json!({ "kty": "OKP", "crv": "Ed25519", "kid": "k" })),
+                resign(&ec, &header("EdDSA", "k"), &claims),
+                "JwkNotFound",
+            ),
+            (
+                "oct JWK with padded k",
+                one(json!({ "kty": "oct", "kid": "k", "k": "AAAA=" })),
+                resign(&ec, &header("HS256", "k"), &claims),
+                "JwkNotFound",
+            ),
+            (
+                "oct JWK with an 8-byte k",
+                one(json!({ "kty": "oct", "kid": "k", "k": b64([1u8; 8]) })),
+                resign(&ec, &header("HS256", "k"), &claims),
+                "SignatureAlgorithmNotSupported",
+            ),
+            (
+                "RSA JWK with d",
+                rsa_with(&|k| {
+                    k.insert("d".into(), b64([5u8; 256]).into());
+                }),
+                rs.clone(),
+                "ok",
+            ),
+            (
+                "RSA JWK missing n",
+                rsa_with(&|k| {
+                    k.remove("n");
+                }),
+                rs.clone(),
+                "JwkNotFound",
+            ),
+            (
+                "RSA JWK missing e",
+                rsa_with(&|k| {
+                    k.remove("e");
+                }),
+                rs.clone(),
+                "JwkNotFound",
+            ),
+            (
+                "RSA JWK with kty EC",
+                rsa_with(&|k| {
+                    k.insert("kty".into(), "EC".into());
+                }),
+                rs.clone(),
+                "JwkNotFound",
+            ),
+            (
+                "RSA n with a leading zero byte",
+                rsa_with(&|k| {
+                    k.insert("n".into(), b64(&n0).into());
+                }),
+                rs.clone(),
+                // jose-jwk: ok. aws-lc refuses a modulus with a leading zero byte (RFC 7518 6.3.1.1 forbids it).
+                "refused",
+            ),
+            (
+                "RSA e = 1",
+                rsa_with(&|k| {
+                    k.insert("e".into(), b64([1u8]).into());
+                }),
+                rs.clone(),
+                "InvalidRsaKey",
+            ),
+            (
+                "RSA e = 0",
+                rsa_with(&|k| {
+                    k.insert("e".into(), "".into());
+                }),
+                rs.clone(),
+                "InvalidRsaKey",
+            ),
+            (
+                "RSA e = 2^33",
+                rsa_with(&|k| {
+                    k.insert("e".into(), b64([2u8, 0, 0, 0, 0]).into());
+                }),
+                rs.clone(),
+                "InvalidRsaKey",
+            ),
+            (
+                "RSA 8192-bit n",
+                rsa_with(&|k| {
+                    k.insert("n".into(), b64(&n8k).into());
+                }),
+                rs.clone(),
+                "InvalidRsaKey",
+            ),
+            (
+                "RSA 1024-bit n",
+                rsa_with(&|k| {
+                    k.insert("n".into(), b64(&rsa_n[..128]).into());
+                }),
+                rs.clone(),
+                "SignatureAlgorithmNotSupported",
+            ),
+        ])
+        .await;
+    }
+
+    /// `value` (base64url, a length that leaves spare bits in its last character) with
+    /// those spare bits set.
+    fn non_canonical(value: &str) -> String {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut bytes = value.as_bytes().to_vec();
+        let last = bytes.last_mut().unwrap();
+        let idx = ALPHABET.iter().position(|c| c == last).unwrap();
+        *last = ALPHABET[idx | 1];
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// The token with its ES256 signature (r, s) replaced by (r, n - s).
+    fn high_s(token: &str) -> String {
+        const N: [u8; 32] = [
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2,
+            0xfc, 0x63, 0x25, 0x51,
+        ];
+        let (input, sig) = token.rsplit_once('.').unwrap();
+        let mut sig = BASE64_URL_SAFE_NO_PAD.decode(sig).unwrap();
+        let mut borrow = 0i16;
+        for i in (0..32).rev() {
+            let d = i16::from(N[i]) - i16::from(sig[32 + i]) - borrow;
+            borrow = i16::from(d < 0);
+            sig[32 + i] = (d + 256 * borrow) as u8;
+        }
+        format!("{input}.{}", b64(sig))
+    }
+
+    /// Sign with `signer`, whatever the header's `alg` says.
+    fn resign(signer: &TestKey, header: &serde_json::Value, payload: &serde_json::Value) -> String {
+        let input = format!(
+            "{}.{}",
+            b64(serde_json::to_vec(header).unwrap()),
+            b64(serde_json::to_vec(payload).unwrap())
+        );
+        format!("{input}.{}", b64(signer.sign("", input.as_bytes())))
+    }
+
+    /// AC 4: `use` filtering and the claim checks (audience, `exp`/`nbf` with the 30 s
+    /// leeway).
+    #[tokio::test]
+    async fn parity_use_and_claims() {
+        let ec = TestKey::p256();
+        let jwks = set(&[
+            ec.jwk("k"),
+            with(ec.jwk("enc"), |k| {
+                k.insert("use".into(), "enc".into());
+            }),
+            with(ec.jwk("use-foo"), |k| {
+                k.insert("use".into(), "foo".into());
+            }),
+            with(ec.jwk("ops-foo"), |k| {
+                k.insert("key_ops".into(), json!(["verify", "foo"]));
+            }),
+            with(ec.jwk("ops-sign"), |k| {
+                k.insert("key_ops".into(), json!(["sign"]));
+            }),
+            with(ec.jwk("alg-oaep"), |k| {
+                k.insert("alg".into(), "RSA-OAEP".into());
+            }),
+            with(ec.jwk("x5t-short"), |k| {
+                k.insert("x5t".into(), b64([1u8; 19]).into());
+            }),
+            with(ec.jwk("x5t"), |k| {
+                k.insert("x5t".into(), b64([1u8; 20]).into());
+                k.insert("x5t#S256".into(), b64([1u8; 32]).into());
+                k.insert("x5c".into(), json!(["AAEC"]));
+                k.insert("x5u".into(), "not a url".into());
+            }),
+            with(ec.jwk("x5c-url"), |k| {
+                k.insert("x5c".into(), json!(["AA-_"]));
+            }),
+        ]);
+        let now = parity::now();
+        let tok = |kid: &str, claims: serde_json::Value| token(&ec, &header("ES256", kid), &claims);
+        run(vec![
+            (
+                "use: enc",
+                jwks.clone(),
+                tok("enc", parity::claims()),
+                "JwkNotFound",
+            ),
+            (
+                "use: foo",
+                jwks.clone(),
+                tok("use-foo", parity::claims()),
+                "JwkNotFound",
+            ),
+            (
+                "key_ops with an unknown op",
+                jwks.clone(),
+                tok("ops-foo", parity::claims()),
+                // jose-jwk: JwkNotFound (it parsed this member strictly). Harmless: proxy never reads it.
+                "ok",
+            ),
+            (
+                "key_ops: sign only",
+                jwks.clone(),
+                tok("ops-sign", parity::claims()),
+                "ok",
+            ),
+            (
+                "alg: RSA-OAEP",
+                jwks.clone(),
+                tok("alg-oaep", parity::claims()),
+                "JwkNotFound",
+            ),
+            (
+                "19-byte x5t",
+                jwks.clone(),
+                tok("x5t-short", parity::claims()),
+                // jose-jwk: JwkNotFound (it parsed this member strictly). Harmless: proxy never reads it.
+                "ok",
+            ),
+            (
+                "x5t, x5t#S256, x5c, x5u",
+                jwks.clone(),
+                tok("x5t", parity::claims()),
+                "ok",
+            ),
+            (
+                "x5c in base64url",
+                jwks.clone(),
+                tok("x5c-url", parity::claims()),
+                // jose-jwk: JwkNotFound (it parsed this member strictly). Harmless: proxy never reads it.
+                "ok",
+            ),
+            (
+                "audience matches",
+                jwks.clone(),
+                tok("k", json!({ "aud": "neon" })),
+                "ok",
+            ),
+            (
+                "audience in a list",
+                jwks.clone(),
+                tok("k", json!({ "aud": ["x", "neon"] })),
+                "ok",
+            ),
+            (
+                "wrong audience",
+                jwks.clone(),
+                tok("k", json!({ "aud": "neon2" })),
+                "InvalidClaims",
+            ),
+            (
+                "audience of other case",
+                jwks.clone(),
+                tok("k", json!({ "aud": "Neon" })),
+                "InvalidClaims",
+            ),
+            (
+                "no audience",
+                jwks.clone(),
+                tok("k", json!({})),
+                "InvalidClaims",
+            ),
+            (
+                "audience a number",
+                jwks.clone(),
+                tok("k", json!({ "aud": 1 })),
+                "JwtEncoding",
+            ),
+            (
+                "expired inside the leeway",
+                jwks.clone(),
+                tok("k", json!({ "aud": AUD, "exp": now - 20 })),
+                "ok",
+            ),
+            (
+                "expired outside the leeway",
+                jwks.clone(),
+                tok("k", json!({ "aud": AUD, "exp": now - 40 })),
+                "InvalidClaims",
+            ),
+            (
+                "exp 0",
+                jwks.clone(),
+                tok("k", json!({ "aud": AUD, "exp": 0 })),
+                "InvalidClaims",
+            ),
+            (
+                "exp a string",
+                jwks.clone(),
+                tok("k", json!({ "aud": AUD, "exp": (now + 60).to_string() })),
+                "JwtEncoding",
+            ),
+            (
+                "exp negative",
+                jwks.clone(),
+                tok("k", json!({ "aud": AUD, "exp": -1 })),
+                "JwtEncoding",
+            ),
+            (
+                "exp a float",
+                jwks.clone(),
+                tok("k", json!({ "aud": AUD, "exp": (now + 60) as f64 + 0.5 })),
+                "JwtEncoding",
+            ),
+            (
+                "exp null",
+                jwks.clone(),
+                tok("k", json!({ "aud": AUD, "exp": null })),
+                "ok",
+            ),
+            (
+                "not yet valid inside the leeway",
+                jwks.clone(),
+                tok("k", json!({ "aud": AUD, "nbf": now + 20 })),
+                "ok",
+            ),
+            (
+                "not yet valid outside the leeway",
+                jwks.clone(),
+                tok("k", json!({ "aud": AUD, "nbf": now + 40 })),
+                "InvalidClaims",
+            ),
+            (
+                "nbf u64::MAX",
+                jwks.clone(),
+                tok("k", json!({ "aud": AUD, "nbf": u64::MAX })),
+                "JwtEncoding",
+            ),
+        ])
+        .await;
+    }
+
+    /// AC 5: a JWKS with entries of an unknown `kty`, unknown members and keys of other
+    /// types: the bad entries are skipped and the good keys still verify.
+    #[tokio::test]
+    async fn jwks_skips_unknown_entries() {
+        let (ec, rsa) = (TestKey::p256(), TestKey::rsa_pem(RS1));
+        let jwks = json!({ "keys": [
+            { "kty": "foo", "kid": "ec", "x": "y" },
+            { "kid": "ec" },
+            0,
+            "a string",
+            { "kty": "OKP", "crv": "X25519", "kid": "x25519", "x": b64([3u8; 32]) },
+            { "kty": "OKP", "crv": "Ed448", "kid": "ed448", "x": b64([3u8; 57]) },
+            { "kty": "EC", "crv": "P-256", "kid": "ec", "x": "not base64!" , "y": "AA" },
+            with(ec.jwk("ec"), |k| {
+                k.insert("extra".into(), json!({ "nested": [1, 2, 3] }));
+                k.insert("ext".into(), true.into());
+            }),
+            with(rsa.jwk("rsa"), |k| {
+                k.insert("x5c".into(), json!([]));
+                k.insert("qi".into(), "unused".into());
+            }),
+        ], "extra": "member" });
+        let c = parity::claims();
+        run(vec![
+            (
+                "P-256 key after bad entries with its kid",
+                jwks.clone(),
+                token(&ec, &header("ES256", "ec"), &c),
+                "ok",
+            ),
+            (
+                "RSA key with extra members",
+                jwks.clone(),
+                token(&rsa, &header("RS256", "rsa"), &c),
+                "ok",
+            ),
+            (
+                "X25519 key",
+                jwks.clone(),
+                resign(&ec, &header("EdDSA", "x25519"), &c),
+                "UnsupportedKeyType",
+            ),
+            (
+                "Ed448 key",
+                jwks.clone(),
+                resign(&ec, &header("EdDSA", "ed448"), &c),
+                "UnsupportedKeyType",
+            ),
+        ])
+        .await;
+        // Only unusable entries: the JWKS gives no key at all.
+        let only_bad = json!({ "keys": [{ "kty": "foo", "kid": "ec" }] });
+        assert_eq!(
+            class(&check(&only_bad, &token(&ec, &header("ES256", "ec"), &c)).await),
+            "JwkNotFound"
+        );
     }
 }

@@ -24,10 +24,6 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "warn"
 
 [[advisories.ignore]]
-id = "RUSTSEC-2023-0071"
-reason = "the marvin attack only affects private key decryption, not public key signature verification"
-
-[[advisories.ignore]]
 id = "RUSTSEC-2024-0436"
 reason = "The paste crate is a build-only dependency with no runtime components. It is unlikely to have any security impact."
 

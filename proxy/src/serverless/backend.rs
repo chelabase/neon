@@ -1,9 +1,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use ed25519_dalek::SigningKey;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
-use jose_jwk::jose_b64;
+use jsonwebtoken::jwk::{
+    AlgorithmParameters, CommonParameters, EllipticCurve, Jwk, OctetKeyPairParameters,
+    OctetKeyPairType,
+};
 use postgres_client::error::SqlState;
 use postgres_client::maybe_tls_stream::MaybeTlsStream;
 use rand_core::OsRng;
@@ -401,16 +406,23 @@ impl PoolingBackend {
     }
 }
 
-fn create_random_jwk() -> (SigningKey, jose_jwk::Key) {
+/// A fresh Ed25519 key, and its public JWK.
+fn create_random_jwk() -> (SigningKey, Jwk) {
     let key = SigningKey::generate(&mut OsRng);
-
-    let jwk = jose_jwk::Key::Okp(jose_jwk::Okp {
-        crv: jose_jwk::OkpCurves::Ed25519,
-        x: jose_b64::serde::Bytes::from(key.verifying_key().to_bytes().to_vec()),
-        d: None,
-    });
-
+    let jwk = public_jwk(&key);
     (key, jwk)
+}
+
+/// `key`'s public JWK: `{"kty":"OKP","crv":"Ed25519","x":"…"}`.
+fn public_jwk(key: &SigningKey) -> Jwk {
+    Jwk {
+        common: CommonParameters::default(),
+        algorithm: AlgorithmParameters::OctetKeyPair(OctetKeyPairParameters {
+            key_type: OctetKeyPairType::OctetKeyPair,
+            curve: EllipticCurve::Ed25519,
+            x: BASE64_URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes()),
+        }),
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -509,5 +521,23 @@ impl ReportableError for LocalProxyConnError {
 impl UserFacingError for LocalProxyConnError {
     fn to_string_client(&self) -> String {
         "Could not establish HTTP connection to the database".to_string()
+    }
+}
+
+#[cfg(test)]
+mod jwk_tests {
+    use ed25519_dalek::SigningKey;
+
+    use super::public_jwk;
+
+    /// `pg_session_jwt.jwk` gets the same JSON `jose-jwk` wrote (the key of
+    /// `local_conn_pool`'s `jwt_token_snapshot`).
+    #[test]
+    fn public_jwk_json() {
+        let key = SigningKey::from_bytes(&[1; 32]);
+        assert_eq!(
+            serde_json::to_string(&public_jwk(&key)).unwrap(),
+            r#"{"kty":"OKP","crv":"Ed25519","x":"iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w"}"#
+        );
     }
 }

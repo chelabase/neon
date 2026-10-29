@@ -34,7 +34,7 @@ framed-websockets.workspace = true
 futures.workspace = true
 hashbrown.workspace = true
 hex.workspace = true
-hmac.workspace = true
+hmac = { workspace = true, features = ["reset"] }
 hostname.workspace = true
 http.workspace = true
 http-utils.workspace = true
@@ -116,18 +116,15 @@ subzero-core = { path = "../libs/proxy/subzero_core", features = ["postgresql"],
 ouroboros = { version = "0.18", optional = true }
 
 # jwt stuff
-jose-jwa = "0.1.2"
-jose-jwk = { version = "0.1.2", features = ["p256", "p384", "rsa"] }
+jsonwebtoken.workspace = true
 signature = "2"
-ecdsa = "0.16"
-p256 = { version = "0.13", features = ["jwk"] }
 ed25519-dalek = { version = "2", default-features = false, features = ["rand_core"] }
-rsa = "0.9"
 
 workspace_hack.workspace = true
 
 [dev-dependencies]
 assert-json-diff.workspace = true
+aws-lc-rs.workspace = true
 camino-tempfile.workspace = true
 fallible-iterator.workspace = true
 flate2.workspace = true
