@@ -90,3 +90,30 @@ fn default_config_serialises_as_before() {
         r#"{"jwks":{"keys":[]},"tls":null}"#
     );
 }
+
+/// jsonwebtoken 9 refused a whole compute spec whose JWKS held a key of an unknown `kty`
+/// or an OKP key on a curve it can't verify with (X25519, Ed448). jsonwebtoken 11 parses
+/// them (`AlgorithmParameters::Other`, `OctetKeyPair` with that curve), and compute_ctl
+/// skips such a key at verify time with a WARN (`chelabase_jwks_two_keys` pins that).
+/// The set must still round-trip unchanged, so the spec compute_ctl reports back is the
+/// one it was given.
+#[test]
+fn a_jwkset_with_an_unusable_key_parses_and_round_trips() {
+    let good = r#"{"kty":"OKP","use":"sig","alg":"EdDSA","kid":"good","crv":"Ed25519","x":"RYwaNBayR-eGI0iXB4s3QxE3Nl2g1iWbr6KtLWeVD_w"}"#;
+    for bad in [
+        r#"{"kty":"foo","x":"y"}"#,
+        r#"{"kty":"OKP","crv":"X25519","x":"RYwaNBayR-eGI0iXB4s3QxE3Nl2g1iWbr6KtLWeVD_w"}"#,
+        r#"{"kty":"OKP","crv":"Ed448","x":"RYwaNBayR-eGI0iXB4s3QxE3Nl2g1iWbr6KtLWeVD_w"}"#,
+    ] {
+        let json = format!(r#"{{"jwks":{{"keys":[{bad},{good}]}},"tls":null}}"#);
+        let config: ComputeCtlConfig = serde_json::from_str(&json)
+            .unwrap_or_else(|e| panic!("a spec holding {bad} parses: {e}"));
+        assert_eq!(config.jwks.keys.len(), 2, "{bad}");
+        let again = serde_json::to_string(&config).unwrap();
+        assert_eq!(
+            canonical(serde_json::from_str(&again).unwrap()),
+            canonical(serde_json::from_str(&json).unwrap()),
+            "{bad} round-trips unchanged"
+        );
+    }
+}

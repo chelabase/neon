@@ -8,6 +8,7 @@
 //!   refused. A set mixing Ed25519 and RS256 keys switches the whole set to RS256.
 //! - An expired token is refused (60 s leeway), and so is an `exp` that isn't a number
 //!   (it would never expire).
+//! - A key compute_ctl can't use (unknown `kty`, OKP on X25519/Ed448) loads but is skipped.
 
 use std::ffi::OsString;
 use std::fs;
@@ -391,6 +392,44 @@ async fn expiry_is_checked_and_a_non_numeric_exp_is_refused() {
             status(&router, &jwt(&a, &claims)).await,
             StatusCode::UNAUTHORIZED,
             "exp {exp}"
+        );
+    }
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A JWKS holding a key compute_ctl can't use (an unknown `kty`, or an OKP key on X25519
+/// or Ed448) loads since jsonwebtoken 11 (v9 refused the whole spec). That key is skipped
+/// at verify time: the set's good key still verifies, and a token signed by the private
+/// half of the unusable key's `x` is refused.
+#[tokio::test]
+async fn an_unusable_key_in_the_jwks_is_skipped_and_verifies_nothing() {
+    let dir = fresh("jwks_unusable_key");
+    let (good, c) = (ed_key("good"), ed_key("c"));
+    let c_x = match &c.jwk.algorithm {
+        AlgorithmParameters::OctetKeyPair(okp) => okp.x.clone(),
+        _ => unreachable!(),
+    };
+    let mut keys: Vec<Jwk> = [
+        json!({ "kty": "foo", "kid": "c", "x": c_x }),
+        json!({ "kty": "OKP", "crv": "X25519", "kid": "c", "alg": "EdDSA", "x": c_x }),
+        json!({ "kty": "OKP", "crv": "Ed448", "kid": "c", "alg": "EdDSA", "x": c_x }),
+    ]
+    .into_iter()
+    .map(|v| serde_json::from_value(v).unwrap())
+    .collect();
+    keys.push(good.jwk.clone());
+    let router = external(&dir, keys);
+    assert_eq!(
+        status(&router, &jwt(&good, &control_claims())).await,
+        StatusCode::OK,
+        "the good key"
+    );
+    for kid in [Some("c"), Some("good"), None] {
+        let token = jwt_with(Algorithm::EdDSA, &c.encoding, kid, &control_claims());
+        assert_eq!(
+            status(&router, &token).await,
+            StatusCode::UNAUTHORIZED,
+            "the unusable keys' private half, kid {kid:?}"
         );
     }
     fs::remove_dir_all(&dir).unwrap();

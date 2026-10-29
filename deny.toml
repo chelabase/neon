@@ -125,6 +125,12 @@ name = "async-executor"
 [[bans.deny]]
 name = "smol"
 
+[[bans.features]]
+# jsonwebtoken 11 picks its crypto backend by feature. With both `aws_lc_rs` and
+# `rust_crypto` on, `CryptoProvider::get_default()` panics on every verify.
+crate = "jsonwebtoken"
+deny = ["rust_crypto"]
+
 [[bans.deny]]
 # We want to use rustls instead of the platform's native tls implementation.
 name = "native-tls"
