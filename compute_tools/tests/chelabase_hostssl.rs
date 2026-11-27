@@ -20,7 +20,11 @@ const BASEBACKUP: &str = include_str!("../../libs/postgres_ffi/samples/pg_hba.co
 /// The catch-all compute_ctl wrote before chelabase#248 (plaintext allowed).
 const PLAIN_CATCH_ALL: &str = "host\tall\t\tall\t\tall\t\tmd5";
 const CATCH_ALL: &str = "hostssl\tall\t\tall\t\tall\t\tmd5";
-const LOOPBACK: [&str; 2] = ["127.0.0.1/32", "::1/128"];
+
+/// Loopback: anything in 127.0.0.0/8 (pooled endpoints' 127.0.0.2 block too) or ::1.
+fn is_loopback(address: &str) -> bool {
+    address.starts_with("127.") || address == "::1/128" || address == "::1"
+}
 
 fn pgdata(name: &str, major: u32) -> PathBuf {
     let dir = Path::new("./tests/tmp").join(name);
@@ -50,17 +54,17 @@ fn check_invariant(hba: &str, case: &str) {
     let rules = rules(hba);
     for f in &rules {
         match f[0] {
-            "local" | "include_if_exists" => {}
-            "host" => {
-                // host DATABASE USER ADDRESS METHOD [OPTIONS]
+            "local" | "include_if_exists" | "hostssl" => {}
+            // host, hostnossl, hostgssenc, hostnogssenc: not TLS-only.
+            t if t.starts_with("host") => {
+                // TYPE DATABASE USER ADDRESS METHOD [OPTIONS]
                 assert!(f.len() >= 5, "{case}: short line {f:?}");
                 assert!(
-                    LOOPBACK.contains(&f[3]) || f[4] == "reject",
-                    "{case}: a plaintext-capable non-loopback rule {f:?} in\n{hba}"
+                    is_loopback(f[3]) || f[4] == "reject",
+                    "{case}: a non-TLS non-loopback rule {f:?} in\n{hba}"
                 );
             }
-            "hostssl" => {}
-            other => panic!("{case}: unexpected connection type {other:?} in {f:?}"),
+            other => panic!("{case}: unexpected line type {other:?} in {f:?}"),
         }
     }
     let catch_all: Vec<usize> = hba
