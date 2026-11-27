@@ -5,9 +5,10 @@ name: advisories
 # on, the single open issue titled "New RustSec advisory" (advisory_issue.sh).
 # A passing run opens nothing.
 #
-# The image tag is computed the way build-tools.yml and ci-local.sh compute it
-# (first 12 hex of sha256sum build-tools/Dockerfile); this workflow does not
-# build the image, so it fails (red run, no issue) if that tag was never pushed.
+# The image comes from build-tools.yml (workflow_call), as in pr.yml and
+# images.yml: it builds and pushes the tag (first 12 hex of sha256sum
+# build-tools/Dockerfile) when it is missing, so a deleted or never-pushed
+# image is rebuilt instead of failing the run.
 
 on:
   schedule:
@@ -21,26 +22,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  tag:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
+  build-tools:
     permissions:
       contents: read
-    outputs:
-      image: ${{ steps.tag.outputs.image }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Compute the image tag
-        id: tag
-        run: |
-          tag="$(sha256sum build-tools/Dockerfile | cut -c1-12)"
-          echo "image=ghcr.io/chelabase/neon-build-tools:${tag}" | tee -a "$GITHUB_OUTPUT"
+      packages: write
+    uses: ./.github/workflows/build-tools.yml
 
   deny:
-    needs: [tag]
+    needs: [build-tools]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -50,7 +39,7 @@ jobs:
       status: ${{ steps.deny.outputs.status }}
       ids: ${{ steps.deny.outputs.ids }}
     container:
-      image: ${{ needs.tag.outputs.image }}
+      image: ${{ needs.build-tools.outputs.image }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}

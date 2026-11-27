@@ -58,7 +58,7 @@
 # with the regression suite's logs in test-logs.tar.zst. The exit status is
 # non-zero when any step failed.
 #
-# Requires `docker login ghcr.io` (the build-tools package is private). The
+# The build-tools package is public, so pulling it needs no login. The
 # checkout must be a normal clone (not a `git worktree`): its .git is mounted.
 
 IMAGE_REPO="ghcr.io/chelabase/neon-build-tools"
@@ -640,7 +640,8 @@ ensure_image() {
     echo "ci-local.sh: pulling $IMAGE"
     if ! docker pull "$IMAGE"; then
         echo "ci-local.sh: could not pull $IMAGE." >&2
-        echo "  The package is private: run 'docker login ghcr.io' with a token that has read:packages." >&2
+        echo "  The package is public, so the pull needs no login: check network access, and that" >&2
+        echo "  build-tools.yml has pushed this tag (gh -R chelabase/neon workflow run build-tools.yml)." >&2
         return 1
     fi
 }
