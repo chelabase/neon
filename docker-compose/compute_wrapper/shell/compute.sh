@@ -88,6 +88,20 @@ if [[ -e "/usr/local/lib/${ulid_extension}.so" ]]; then
   shared_libraries=$(jq -r '.spec.cluster.settings[] | select(.name=="shared_preload_libraries").value' ${CONFIG_FILE})
   sed -i "s|${shared_libraries}|${shared_libraries},${ulid_extension}|" ${CONFIG_FILE}
 fi
+# TLS: compute_ctl's password catch-all is `hostssl` (chelabase#248), so the test
+# containers' password logins (libpq's default sslmode=prefer) need the compute to
+# serve TLS. A throwaway self-signed P-256 certificate (what compute_ctl accepts).
+tls_dir=/tmp/compute-tls
+mkdir -p "${tls_dir}"
+openssl req -x509 -new -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -sha256 \
+    -days 30 -subj "/CN=compute1" \
+    -keyout "${tls_dir}/server.key" -out "${tls_dir}/server.crt"
+jq --arg key "${tls_dir}/server.key" --arg crt "${tls_dir}/server.crt" \
+    '.spec.features = ((.spec.features // []) + ["tls_experimental"] | unique)
+     | .compute_ctl_config.tls = {key_path: $key, cert_path: $crt}' \
+    "${CONFIG_FILE}" > "${CONFIG_FILE}.tls"
+mv "${CONFIG_FILE}.tls" "${CONFIG_FILE}"
+
 echo "Overwrite tenant id and timeline id in spec file"
 sed -i "s|TENANT_ID|${tenant_id}|" ${CONFIG_FILE}
 sed -i "s|TIMELINE_ID|${timeline_id}|" ${CONFIG_FILE}

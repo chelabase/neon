@@ -50,7 +50,7 @@ const TAIL: &str = "# chelabase: end of realtime logins\n";
 const IDENT_HEAD: &str = "# chelabase: realtime certificate map (chelabase_realtime)\n";
 const IDENT_TAIL: &str = "# chelabase: end of realtime certificate map\n";
 const MEMBER_IDENT_TAIL: &str = "# chelabase: end of member certificate map\n";
-const MD5: &str = "host\tall\t\tall\t\tall\t\tmd5\n";
+const MD5: &str = "hostssl\tall\t\tall\t\tall\t\tmd5\n";
 const RT_CN: &str = "chelabase-realtime";
 const ORCH: &str = "chelabase-orchestrator";
 /// The basebackup's sample pg_hba.conf rules.
@@ -321,14 +321,20 @@ fn no_tls_or_below_v17_only_rejects() {
             text.contains(&reject_only),
             "PG_VERSION {version:?}: reject lines only:\n{text}"
         );
-        assert!(!text.contains("hostssl"), "PG_VERSION {version:?}:\n{text}");
+        assert!(
+            !text.replace(MD5.trim_end(), "").contains("hostssl"),
+            "PG_VERSION {version:?}:\n{text}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
     let dir = pgdata("k4_rt_hba_no_tls", Some("17"));
     update_pg_hba(&dir, None, Some(&ml), Some(&rl), false).unwrap();
     let text = read(&dir.join("pg_hba.conf"));
     assert!(text.contains(&reject_only), "no TLS:\n{text}");
-    assert!(!text.contains("hostssl"), "no TLS:\n{text}");
+    assert!(
+        !text.replace(MD5.trim_end(), "").contains("hostssl"),
+        "no TLS:\n{text}"
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 
     let dir = pgdata("k4_rt_hba_v17", Some("17"));
