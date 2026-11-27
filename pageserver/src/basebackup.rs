@@ -28,9 +28,9 @@ use postgres_ffi::{
 use postgres_ffi_types::constants::{DEFAULTTABLESPACE_OID, GLOBALTABLESPACE_OID};
 use postgres_ffi_types::forknum::{INIT_FORKNUM, MAIN_FORKNUM};
 use tokio::io::{self, AsyncWrite, AsyncWriteExt as _};
-use tokio_tar::{Builder, EntryType, Header};
 use tracing::*;
 use utils::lsn::Lsn;
+use utils::tar_archive::{Builder, EntryType, Header};
 
 use crate::context::RequestContext;
 use crate::pgdatadir_mapping::Version;
@@ -174,7 +174,7 @@ where
     if let Some(gzip_level) = gzip_level {
         let mut encoder = GzipEncoder::with_quality(write, gzip_level);
         Basebackup {
-            ar: Builder::new_non_terminated(&mut encoder),
+            ar: Builder::new(&mut encoder),
             timeline,
             lsn,
             prev_record_lsn,
@@ -192,7 +192,7 @@ where
             .map_err(|err| BasebackupError::Client(err, "gzip"))?;
     } else {
         Basebackup {
-            ar: Builder::new_non_terminated(write),
+            ar: Builder::new(write),
             timeline,
             lsn,
             prev_record_lsn,
@@ -1464,5 +1464,135 @@ mod slot_state_check_edges {
             reseal(&mut buf);
             assert_eq!(check_slot_state(v, &buf), Ok(()), "{v:?}");
         }
+    }
+}
+
+/// The basebackup archive, member by member, against a listing taken from the
+/// astral-tokio-tar build before the move to async-tar: computes from older images
+/// read these archives, so the bytes must not change.
+#[cfg(test)]
+mod archive_tests {
+    use super::*;
+    use crate::import_datadir::raw_tar::{self, RawEntry};
+    use crate::import_datadir::tests as import_tests;
+
+    /// path, type, mode, size, crc32c of the data, crc32c of the header with mtime
+    /// and checksum blanked.
+    fn render(entries: &[RawEntry]) -> String {
+        entries
+            .iter()
+            .map(|e| {
+                format!(
+                    "{} {:?} {:o} {} {:08x} {:08x}\n",
+                    e.path, e.typeflag as char, e.mode, e.size, e.data_crc, e.header_crc
+                )
+            })
+            .collect()
+    }
+
+    /// Taken from the astral-tokio-tar build.
+    const GOLDEN: &str = r"global '5' 755 0 00000000 db3772d8
+pg_wal/archive_status '5' 755 0 00000000 ade617e9
+pg_commit_ts '5' 755 0 00000000 622e7172
+pg_dynshmem '5' 755 0 00000000 9112cc5a
+pg_notify '5' 755 0 00000000 bb563b31
+pg_serial '5' 755 0 00000000 d38f8269
+pg_snapshots '5' 755 0 00000000 2458ae37
+pg_subtrans '5' 755 0 00000000 5b9e9834
+pg_twophase '5' 755 0 00000000 235ba720
+pg_multixact '5' 755 0 00000000 c4383217
+pg_multixact/members '5' 755 0 00000000 968d3c21
+pg_multixact/offsets '5' 755 0 00000000 8ab8b97e
+base '5' 755 0 00000000 cff8ce3b
+base/1 '5' 755 0 00000000 c401a1fa
+pg_replslot '5' 755 0 00000000 34b854c9
+pg_tblspc '5' 755 0 00000000 2ef1f396
+pg_stat '5' 755 0 00000000 c515c964
+pg_stat_tmp '5' 755 0 00000000 aa155c43
+pg_xact '5' 755 0 00000000 11957d45
+pg_logical '5' 755 0 00000000 f5080e05
+pg_logical/snapshots '5' 755 0 00000000 3ad06a91
+pg_logical/mappings '5' 755 0 00000000 c2e61277
+pg_hba.conf '\0' 600 4789 9f95185b f5bf4bf4
+pg_ident.conf '\0' 600 0 00000000 6855f1ac
+postgresql.auto.conf '\0' 600 0 00000000 e08f3f84
+pg_xact/0000 '\0' 600 8192 d0dfd9bc d119a117
+base/5 '5' 755 0 00000000 84916e30
+base/5/PG_VERSION '\0' 600 2 55f42388 e8188a7d
+base/5/pg_filenode.map '\0' 600 512 54709569 0f29ac37
+neon.signal '\0' 600 17 40718a57 aad52874
+zenith.signal '\0' 600 17 40718a57 02584e84
+global/pg_control '\0' 600 8192 87208743 f359eda2
+pg_wal/000000010000000000000003 '\0' 600 16777216 db62568d 72b98c07
+";
+
+    const GOLDEN_FULL: &str = r"global '5' 755 0 00000000 db3772d8
+pg_wal/archive_status '5' 755 0 00000000 ade617e9
+pg_commit_ts '5' 755 0 00000000 622e7172
+pg_dynshmem '5' 755 0 00000000 9112cc5a
+pg_notify '5' 755 0 00000000 bb563b31
+pg_serial '5' 755 0 00000000 d38f8269
+pg_snapshots '5' 755 0 00000000 2458ae37
+pg_subtrans '5' 755 0 00000000 5b9e9834
+pg_twophase '5' 755 0 00000000 235ba720
+pg_multixact '5' 755 0 00000000 c4383217
+pg_multixact/members '5' 755 0 00000000 968d3c21
+pg_multixact/offsets '5' 755 0 00000000 8ab8b97e
+base '5' 755 0 00000000 cff8ce3b
+base/1 '5' 755 0 00000000 c401a1fa
+pg_replslot '5' 755 0 00000000 34b854c9
+pg_tblspc '5' 755 0 00000000 2ef1f396
+pg_stat '5' 755 0 00000000 c515c964
+pg_stat_tmp '5' 755 0 00000000 aa155c43
+pg_xact '5' 755 0 00000000 11957d45
+pg_logical '5' 755 0 00000000 f5080e05
+pg_logical/snapshots '5' 755 0 00000000 3ad06a91
+pg_logical/mappings '5' 755 0 00000000 c2e61277
+pg_hba.conf '\0' 600 4789 9f95185b f5bf4bf4
+pg_ident.conf '\0' 600 0 00000000 6855f1ac
+postgresql.auto.conf '\0' 600 0 00000000 e08f3f84
+pg_xact/0000 '\0' 600 8192 d0dfd9bc d119a117
+base/5 '5' 755 0 00000000 84916e30
+base/5/PG_VERSION '\0' 600 2 55f42388 e8188a7d
+base/5/pg_filenode.map '\0' 600 512 54709569 0f29ac37
+base/5/1259 '\0' 600 16384 f3332422 f64f1f25
+neon.signal '\0' 600 17 40718a57 aad52874
+zenith.signal '\0' 600 17 40718a57 02584e84
+global/pg_control '\0' 600 8192 87208743 f359eda2
+pg_wal/000000010000000000000003 '\0' 600 16777216 db62568d 72b98c07
+";
+
+    #[tokio::test]
+    async fn a_basebackup_archive_matches_the_golden_listing() -> anyhow::Result<()> {
+        let archive = import_tests::datadir(|t| {
+            t.file("base/5/1259", &import_tests::rel_data());
+        })
+        .end();
+        let (_tenant, tline, ctx) =
+            import_tests::import("a_basebackup_archive_matches_the_golden_listing", &archive)
+                .await?;
+        let mut mismatches = Vec::new();
+        for (full_backup, golden) in [(false, GOLDEN), (true, GOLDEN_FULL)] {
+            let mut out: Vec<u8> = Vec::new();
+            send_basebackup_tarball(
+                &mut out,
+                &tline,
+                Some(import_tests::BASE_LSN),
+                None,
+                full_backup,
+                false,
+                None,
+                &ctx,
+            )
+            .await?;
+            let got = render(&raw_tar::list(&out));
+            if got != golden {
+                mismatches.push(format!(
+                    "full_backup={full_backup}: listing differs; got:\n{got}"
+                ));
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+        Ok(())
     }
 }
