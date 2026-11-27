@@ -106,6 +106,10 @@ When a new PostgreSQL minor release becomes available:
 
 Neon's own `REL_x_STABLE_neon` branches remain read-only references; we do not track them.
 
+## Dependencies
+
+- **Tar archives use `async-tar` (tokio runtime, no async-std), not `astral-tokio-tar`**, which is unmaintained (RUSTSEC-2026-0440). The workspace keeps the `tokio-tar` dependency name. Basebackups, datadir and WAL imports, safekeeper snapshots and the writing of zstd tarballs go through `utils::tar_archive`, a thin wrapper over the crate that adds two things: a builder dropped unfinished (an error return or a cancelled future) writes no end-of-archive marker instead of panicking, and a reader whose input ends before the marker fails instead of ending quietly, so a cut basebackup, import or snapshot is an error, never a shorter archive. Basebackup bytes are unchanged: `basebackup::archive_tests` compares them with a listing taken from the astral build.
+
 ## Tests
 
 CI quarantines known test failures in `test_runner/known_failures.txt`, each with a reason. This list may only shrink.

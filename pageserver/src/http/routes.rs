@@ -3714,7 +3714,7 @@ async fn hadron_reset_alert_gauges(
 /// Read the end of a tar archive.
 ///
 /// A tar archive normally ends with two consecutive blocks of zeros, 512 bytes each.
-/// `tokio_tar` already read the first such block. Read the second all-zeros block,
+/// The tar reader (`utils::tar_archive::entries`) already read the first such block. Read the second all-zeros block,
 /// and check that there is no more data after the EOF marker.
 ///
 /// 'tar' command can also write extra blocks of zeros, up to a record

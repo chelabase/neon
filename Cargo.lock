@@ -169,23 +169,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "astral-tokio-tar"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f2e989b33246fe9240d39accf4dd9a01e0b6c1f3ce9dd095e0a47fa02505523"
-dependencies = [
- "futures-core",
- "libc",
- "portable-atomic",
- "rustc-hash 2.1.1",
- "rustix 1.1.5",
- "tokio",
- "tokio-stream",
- "xattr",
- "zerocopy 0.8.59",
-]
-
-[[package]]
 name = "async-channel"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -239,6 +222,21 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "async-tar"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12007d3d00127108cbc09b7ff8b220fd317f329ef57c78d75451a70067272769"
+dependencies = [
+ "filetime",
+ "futures-core",
+ "libc",
+ "redox_syscall 0.7.5",
+ "tokio",
+ "tokio-stream",
+ "xattr",
 ]
 
 [[package]]
@@ -2437,7 +2435,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2517,14 +2515,12 @@ checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
 name = "filetime"
-version = "0.2.22"
+version = "0.2.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4029edd3e734da6fe05b6cd7bd2960760a616bd2ddd0d59a0124746d6272af0"
+checksum = "e1255e7a9f1902190d4c10a75f2f7f495d3d3ce13e9ba26e6c48683a0f4dbed7"
 dependencies = [
  "cfg-if",
  "libc",
- "redox_syscall 0.3.5",
- "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -4307,7 +4303,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4674,7 +4670,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arc-swap",
- "astral-tokio-tar",
  "async-compression",
  "async-stream",
  "base64 0.22.1",
@@ -5869,7 +5864,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.1",
  "rustls",
- "socket2 0.5.5",
+ "socket2 0.6.5",
  "thiserror 2.0.11",
  "tokio",
  "tracing",
@@ -5907,9 +5902,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.5",
+ "socket2 0.6.5",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6175,6 +6170,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4722d768eff46b75989dd134e5c353f0d6296e5aaa3132e776cbdb56be7731aa"
 dependencies = [
  "bitflags 1.3.2",
+]
+
+[[package]]
+name = "redox_syscall"
+version = "0.7.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4666a1a60d8412eab19d94f6d13dcc9cea0a5ef4fdf6a5db306537413c661b1b"
+dependencies = [
+ "bitflags 2.13.2",
 ]
 
 [[package]]
@@ -6536,15 +6540,15 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.5"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags 2.13.2",
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6623,7 +6627,6 @@ name = "safekeeper"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "astral-tokio-tar",
  "async-stream",
  "byteorder",
  "bytes",
@@ -8031,9 +8034,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-stream"
-version = "0.1.16"
+version = "0.1.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f4e6ce100d0eb49a2734f8c0812bcd324cf357d21810932c5df6b96ef2b86f1"
+checksum = "a3d06f0b082ba57c26b79407372e57cf2a1e28124f78e9479fe80322cf53420b"
 dependencies = [
  "futures-core",
  "pin-project-lite",
@@ -8693,8 +8696,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arc-swap",
- "astral-tokio-tar",
  "async-compression",
+ "async-tar",
  "bincode",
  "byteorder",
  "bytes",
@@ -8730,6 +8733,7 @@ dependencies = [
  "signal-hook",
  "strum",
  "strum_macros",
+ "sync_wrapper 0.1.2",
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
@@ -9488,6 +9492,7 @@ dependencies = [
  "subtle",
  "syn 2.0.119",
  "syn 3.0.6",
+ "sync_wrapper 0.1.2",
  "thiserror 2.0.11",
  "tikv-jemalloc-ctl",
  "tikv-jemalloc-sys",
@@ -9505,7 +9510,6 @@ dependencies = [
  "tracing-subscriber",
  "typenum",
  "url",
- "zerocopy 0.8.59",
  "zeroize",
  "zstd",
  "zstd-safe",
@@ -9557,13 +9561,12 @@ dependencies = [
 
 [[package]]
 name = "xattr"
-version = "1.4.0"
+version = "1.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e105d177a3871454f754b33bb0ee637ecaaac997446375fd3e5d43a2ed00c909"
+checksum = "963d6fab92d5504b971dc8bd90ca743c2575e590bc8071ea5bc571598667ae08"
 dependencies = [
  "libc",
- "linux-raw-sys 0.4.14",
- "rustix 0.38.41",
+ "rustix 1.1.6",
 ]
 
 [[package]]

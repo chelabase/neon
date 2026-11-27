@@ -39,6 +39,7 @@ signal-hook.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 tokio-tar.workspace = true
+sync_wrapper.workspace = true
 tokio-util.workspace = true
 toml_edit = { workspace = true, features = ["serde"] }
 tracing.workspace = true

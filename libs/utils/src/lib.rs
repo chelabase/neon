@@ -85,6 +85,7 @@ pub mod failpoint_support;
 
 pub mod yielding_loop;
 
+pub mod tar_archive;
 pub mod zstd;
 
 pub mod env;
