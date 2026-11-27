@@ -140,6 +140,10 @@ pub(crate) enum WakeComputeError {
     #[error("Console responded with a malformed compute address: {0}")]
     BadComputeAddress(Box<str>),
 
+    /// The compute's certificate name is missing, so TLS to it can't be verified.
+    #[error("Console responded without a server_name for compute {0}")]
+    MissingServerName(Box<str>),
+
     #[error(transparent)]
     ControlPlane(ControlPlaneError),
 
@@ -162,7 +166,7 @@ impl UserFacingError for WakeComputeError {
         match self {
             // We shouldn't show user the address even if it's broken.
             // Besides, user is unlikely to care about this detail.
-            Self::BadComputeAddress(_) => REQUEST_FAILED.to_owned(),
+            Self::BadComputeAddress(_) | Self::MissingServerName(_) => REQUEST_FAILED.to_owned(),
             // However, control plane might return a meaningful error.
             Self::ControlPlane(e) => e.to_string_client(),
 
@@ -178,7 +182,9 @@ impl UserFacingError for WakeComputeError {
 impl ReportableError for WakeComputeError {
     fn get_error_kind(&self) -> crate::error::ErrorKind {
         match self {
-            Self::BadComputeAddress(_) => crate::error::ErrorKind::ControlPlane,
+            Self::BadComputeAddress(_) | Self::MissingServerName(_) => {
+                crate::error::ErrorKind::ControlPlane
+            }
             Self::ControlPlane(e) => e.get_error_kind(),
             Self::TooManyConnections => crate::error::ErrorKind::RateLimit,
             Self::TooManyConnectionAttempts(e) => e.get_error_kind(),
@@ -189,7 +195,7 @@ impl ReportableError for WakeComputeError {
 impl CouldRetry for WakeComputeError {
     fn could_retry(&self) -> bool {
         match self {
-            Self::BadComputeAddress(_) => false,
+            Self::BadComputeAddress(_) | Self::MissingServerName(_) => false,
             Self::ControlPlane(e) => e.could_retry(),
             Self::TooManyConnections => false,
             Self::TooManyConnectionAttempts(_) => false,

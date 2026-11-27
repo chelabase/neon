@@ -4094,6 +4094,7 @@ class NeonAuthBroker:
         mgmt_port: int,
         external_http_port: int,
         auth_backend: NeonAuthBroker.ProxyV1,
+        compute_ca: Path | None = None,
     ):
         self.domain = "local.neon.build"  # resolves to 127.0.0.1
         self.host = "127.0.0.1"
@@ -4103,6 +4104,8 @@ class NeonAuthBroker:
         self.test_output_dir = test_output_dir
         self.mgmt_port = mgmt_port
         self.auth_backend = auth_backend
+        # The CA the proxy verifies computes (local_proxy) against.
+        self.compute_ca = compute_ca
         self.http_timeout_seconds = 15
         self._popen: subprocess.Popen[bytes] | None = None
 
@@ -4113,6 +4116,10 @@ class NeonAuthBroker:
         crt_path = self.test_output_dir / "proxy.crt"
         key_path = self.test_output_dir / "proxy.key"
         generate_proxy_tls_certs(f"apiauth.{self.domain}", key_path, crt_path)
+
+        env = dict(os.environ)
+        if self.compute_ca is not None:
+            env["NEON_INTERNAL_CA_FILE"] = str(self.compute_ca)
 
         args = [
             str(self.neon_binpath / "proxy"),
@@ -4127,7 +4134,7 @@ class NeonAuthBroker:
         ]
 
         logfile = open(self.test_output_dir / "proxy.log", "w")
-        self._popen = subprocess.Popen(args, stdout=logfile, stderr=logfile)
+        self._popen = subprocess.Popen(args, stdout=logfile, stderr=logfile, env=env)
         self._wait_until_ready()
         return self
 
@@ -4659,10 +4666,12 @@ def static_auth_broker(
 
     local_proxy_addr = f"{http2_echoserver.host}:{http2_echoserver.port}"
 
-    # return local_proxy addr on ProxyWakeCompute.
+    # return local_proxy addr on ProxyWakeCompute, with the name its TLS certificate
+    # is for (the proxy refuses an answer without one rather than go plaintext).
     httpserver.expect_request("/cplane/wake_compute").respond_with_json(
         {
             "address": local_proxy_addr,
+            "server_name": http2_echoserver.server_name,
             "aux": {
                 "compute_id": "compute-foo-bar-1234-5678",
                 "endpoint_id": "ep-foo-bar-1234",
@@ -4702,6 +4711,7 @@ def static_auth_broker(
         mgmt_port=mgmt_port,
         external_http_port=external_http_port,
         auth_backend=NeonAuthBroker.ProxyV1(httpserver.url_for("/cplane")),
+        compute_ca=http2_echoserver.ca_path,
     ) as proxy:
         proxy.start()
         yield proxy

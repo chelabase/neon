@@ -65,6 +65,8 @@ line_has "nbf validation" '\bnbf\b'
 line_has "the proxy's Valkey password file" '--redis-plain-password-file'
 line_has "local_proxy's compute_ctl token file" '--compute-ctl-token-file'
 line_has "the proxy's control-plane token file" '--control-plane-token-file'
+line_has "a wake_compute answer without server_name is refused" 'wake_compute' 'server_name' 'refus'
+line_has "the /sql disconnect cancel over compute TLS, time-limited" '/sql' 'cancel' 'TLS' 'time'
 # storage controller
 line_has "storcon's serialization-failure backoff" 'backoff' '(storcon|storage controller|storage_controller)'
 

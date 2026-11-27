@@ -8,11 +8,17 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import datetime
 import io
 import json
+import ssl
 from typing import TYPE_CHECKING, final
 
 import pytest_asyncio
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
 from h2.config import H2Configuration
 from h2.connection import H2Connection
 from h2.errors import ErrorCodes
@@ -31,6 +37,7 @@ from typing_extensions import override
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterable
+    from pathlib import Path
     from typing import Any
 
 
@@ -39,9 +46,67 @@ RequestData = collections.namedtuple("RequestData", ["headers", "data"])
 
 @final
 class H2Server:
-    def __init__(self, host: str, port: int) -> None:
+    def __init__(self, host: str, port: int, server_name: str, ca_path: Path) -> None:
         self.host = host
         self.port = port
+        # The name its TLS certificate is for, signed by the CA at `ca_path`: the
+        # proxy reaches a local_proxy only over TLS, verified as this name.
+        self.server_name = server_name
+        self.ca_path = ca_path
+
+
+SERVER_NAME = "local-proxy.test"
+
+
+def generate_tls(dir: Path) -> tuple[Path, ssl.SSLContext]:
+    """A CA (written to `dir`/ca.crt) and a server context with a certificate for
+    SERVER_NAME signed by it."""
+    now = datetime.datetime.now(datetime.UTC)
+    validity = (now - datetime.timedelta(hours=1), now + datetime.timedelta(days=1))
+
+    ca_key = ec.generate_private_key(ec.SECP256R1())
+    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "h2server test CA")])
+    ca = (
+        x509.CertificateBuilder()
+        .subject_name(ca_name)
+        .issuer_name(ca_name)
+        .public_key(ca_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(validity[0])
+        .not_valid_after(validity[1])
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(ca_key, hashes.SHA256())
+    )
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, SERVER_NAME)]))
+        .issuer_name(ca_name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(validity[0])
+        .not_valid_after(validity[1])
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName(SERVER_NAME)]), critical=False)
+        .sign(ca_key, hashes.SHA256())
+    )
+
+    ca_path = dir / "ca.crt"
+    cert_path = dir / "server.crt"
+    key_path = dir / "server.key"
+    ca_path.write_bytes(ca.public_bytes(serialization.Encoding.PEM))
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert_path, key_path)
+    return ca_path, context
 
 
 @final
@@ -199,14 +264,15 @@ class H2Protocol(asyncio.Protocol):
 
 
 @pytest_asyncio.fixture(scope="function")
-async def http2_echoserver() -> AsyncIterable[H2Server]:
+async def http2_echoserver(tmp_path: Path) -> AsyncIterable[H2Server]:
+    ca_path, context = generate_tls(tmp_path)
     loop = asyncio.get_event_loop()
-    serve = await loop.create_server(H2Protocol, "127.0.0.1", 0)
+    serve = await loop.create_server(H2Protocol, "127.0.0.1", 0, ssl=context)
     (host, port) = serve.sockets[0].getsockname()
 
     asyncio.create_task(serve.wait_closed())
 
-    server = H2Server(host, port)
+    server = H2Server(host, port, SERVER_NAME, ca_path)
     yield server
 
     serve.close()

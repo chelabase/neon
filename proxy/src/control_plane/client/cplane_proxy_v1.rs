@@ -303,32 +303,7 @@ impl NeonControlPlaneClient {
             info!(duration = ?start.elapsed(), "received http response");
             let body = parse_body::<WakeCompute>(response.status(), response.bytes().await?)?;
 
-            let Some((host, port)) = parse_host_port(&body.address) else {
-                return Err(WakeComputeError::BadComputeAddress(body.address));
-            };
-
-            let host_addr = IpAddr::from_str(host).ok();
-
-            let ssl_mode = match &body.server_name {
-                Some(_) => SslMode::Require,
-                None => SslMode::Disable,
-            };
-            let host = match body.server_name {
-                Some(host) => host.into(),
-                None => host.into(),
-            };
-
-            let node = NodeInfo {
-                conn_info: compute::ConnectInfo {
-                    host_addr,
-                    host,
-                    port,
-                    ssl_mode,
-                },
-                aux: body.aux,
-            };
-
-            Ok(node)
+            node_info_from_wake_compute(body)
         }
         .inspect_err(|e| tracing::debug!(error = ?e))
         .instrument(info_span!("do_wake_compute"))
@@ -534,9 +509,117 @@ fn parse_host_port(input: &str) -> Option<(&str, u16)> {
     Some((host.trim_matches(ipv6_brackets), port.parse().ok()?))
 }
 
+/// The compute to connect to, from the control plane's wake_compute answer: always over
+/// TLS, verified as `server_name`. An answer without `server_name` (or with an empty or
+/// blank one) is refused rather than connected to in plaintext.
+fn node_info_from_wake_compute(body: WakeCompute) -> Result<NodeInfo, WakeComputeError> {
+    let Some((host, port)) = parse_host_port(&body.address) else {
+        return Err(WakeComputeError::BadComputeAddress(body.address));
+    };
+
+    let host_addr = IpAddr::from_str(host).ok();
+
+    let Some(server_name) = body.server_name.filter(|name| !name.trim().is_empty()) else {
+        tracing::error!(
+            address = &*body.address,
+            compute_id = &*body.aux.compute_id,
+            "control plane answered wake_compute without server_name: refusing to connect to the compute without TLS"
+        );
+        return Err(WakeComputeError::MissingServerName(body.address));
+    };
+
+    Ok(NodeInfo {
+        conn_info: compute::ConnectInfo {
+            host_addr,
+            host: server_name.into(),
+            port,
+            ssl_mode: SslMode::Require,
+        },
+        aux: body.aux,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_plane::errors::REQUEST_FAILED;
+    use crate::error::UserFacingError;
+
+    fn wake_compute_answer(server_name: Option<&str>) -> WakeCompute {
+        serde_json::from_value(serde_json::json!({
+            "address": "10.0.0.7:55432",
+            "server_name": server_name,
+            "aux": {
+                "endpoint_id": "ep-foo",
+                "project_id": "foo",
+                "branch_id": "br-foo",
+                "compute_id": "compute-foo",
+            },
+        }))
+        .expect("valid wake_compute answer")
+    }
+
+    #[test]
+    fn wake_compute_with_server_name_requires_tls_to_that_name() {
+        let node = node_info_from_wake_compute(wake_compute_answer(Some("ep-foo.compute.test")))
+            .expect("a named compute is accepted");
+        assert_eq!(node.conn_info.ssl_mode, SslMode::Require);
+        assert_eq!(&*node.conn_info.host, "ep-foo.compute.test");
+        assert_eq!(node.conn_info.port, 55432);
+        assert_eq!(node.conn_info.host_addr, Some(IpAddr::from([10, 0, 0, 7])));
+    }
+
+    /// An empty or blank `server_name` names no certificate either: refused the same way.
+    #[test]
+    fn wake_compute_with_an_empty_server_name_is_refused() {
+        for name in ["", " "] {
+            match node_info_from_wake_compute(wake_compute_answer(Some(name))) {
+                Ok(node) => panic!(
+                    "server_name {name:?} was accepted: host {:?}, {:?}",
+                    &*node.conn_info.host, node.conn_info.ssl_mode
+                ),
+                Err(err) => {
+                    assert!(
+                        matches!(err, WakeComputeError::MissingServerName(_)),
+                        "{err}"
+                    );
+                    assert!(!err.could_retry());
+                }
+            }
+        }
+    }
+
+    /// No `server_name` means the proxy can't verify the compute's certificate:
+    /// the answer is refused (no plaintext fallback) and not retried.
+    #[test]
+    #[tracing_test::traced_test]
+    fn wake_compute_without_server_name_is_refused() {
+        for answer in [
+            wake_compute_answer(None),
+            serde_json::from_value(serde_json::json!({
+                "address": "10.0.0.7:55432",
+                "aux": {
+                    "endpoint_id": "ep-foo",
+                    "project_id": "foo",
+                    "branch_id": "br-foo",
+                    "compute_id": "compute-foo",
+                },
+            }))
+            .expect("valid wake_compute answer"),
+        ] {
+            match node_info_from_wake_compute(answer) {
+                Ok(node) => panic!(
+                    "a wake_compute answer without server_name was accepted with {:?}",
+                    node.conn_info.ssl_mode
+                ),
+                Err(err) => {
+                    assert!(!err.could_retry(), "the refusal must not be retried: {err}");
+                    assert_eq!(err.to_string_client(), REQUEST_FAILED);
+                }
+            }
+        }
+        assert!(logs_contain("server_name"));
+    }
 
     #[test]
     fn test_parse_host_port_v4() {
