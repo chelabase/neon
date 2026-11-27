@@ -21,9 +21,37 @@ const BASEBACKUP: &str = include_str!("../../libs/postgres_ffi/samples/pg_hba.co
 const PLAIN_CATCH_ALL: &str = "host\tall\t\tall\t\tall\t\tmd5";
 const CATCH_ALL: &str = "hostssl\tall\t\tall\t\tall\t\tmd5";
 
-/// Loopback: anything in 127.0.0.0/8 (pooled endpoints' 127.0.0.2 block too) or ::1.
+/// Loopback: an address inside 127.0.0.0/8 (pooled endpoints' 127.0.0.2 block
+/// too) with a mask of at least 8, or ::1/128.
 fn is_loopback(address: &str) -> bool {
-    address.starts_with("127.") || address == "::1/128" || address == "::1"
+    let (ip, mask) = match address.split_once('/') {
+        Some((ip, mask)) => (ip, mask.parse::<u8>().ok()),
+        None => (address, None),
+    };
+    match ip.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => {
+            v4.is_loopback() && mask.is_some_and(|m| (8..=32).contains(&m))
+        }
+        Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback() && mask == Some(128),
+        Err(_) => false,
+    }
+}
+
+#[test]
+fn is_loopback_needs_a_loopback_network() {
+    for yes in ["127.0.0.1/32", "127.0.0.2/32", "127.0.0.0/8", "::1/128"] {
+        assert!(is_loopback(yes), "{yes}");
+    }
+    for no in [
+        "127.0.0.1/0",
+        "127.0.0.1/7",
+        "127.0.0.1",
+        "::1/0",
+        "10.0.0.1/32",
+        "all",
+    ] {
+        assert!(!is_loopback(no), "{no}");
+    }
 }
 
 fn pgdata(name: &str, major: u32) -> PathBuf {

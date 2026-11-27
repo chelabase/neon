@@ -595,6 +595,11 @@ pub(crate) fn plan_pg_hba(
     let pghba_path = pgdata_path.join("pg_hba.conf");
 
     let major = pgdata_major_version(pgdata_path);
+    if !tls {
+        tracing::warn!(
+            "compute TLS is off: pg_hba.conf's password catch-all is hostssl, so no password login from a non-loopback address is accepted"
+        );
+    }
     let cert_tls = tls && major.is_some_and(|v| v >= 17);
     if tls && !cert_tls && (member_logins.is_some() || realtime_logins.is_some()) {
         tracing::warn!(

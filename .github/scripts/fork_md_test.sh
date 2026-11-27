@@ -56,6 +56,7 @@ line_has "RT4-7: /configure without the token on a compute that has one is refus
     '/configure' 'storage_auth_token' '(400|refus)'
 line_has "the DuckDB pins" 'duckdb\.disabled_filesystems'
 line_has "the realtime pg_hba block" 'realtime_logins' 'pg_hba'
+line_has "the hostssl password catch-all" 'hostssl' 'md5' 'loopback' 'TLS'
 # storage auth
 line_has "the metrics scope" '`?metrics`? scope|scope[^.]*`?metrics`?|Scope::Metrics'
 line_has "route authorization" '\broutes?\b' 'authori[sz]'
