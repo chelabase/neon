@@ -18,7 +18,7 @@ use tracing::{error, info, instrument};
 use crate::compute::ComputeNodeParams;
 use crate::metrics::{CPLANE_REQUESTS_TOTAL, CPlaneRequestRPC, UNKNOWN_HTTP_STATUS};
 use crate::migration::{MigrationFailure, MigrationKind, MigrationRunner};
-use crate::params::PG_HBA_ALL_MD5;
+use crate::params::{PG_HBA_ALL_MD5, PG_HBA_ALL_MD5_PLAIN};
 
 // Do control plane request and return response if any. In case of error it
 // returns a bool flag indicating whether it makes sense to retry the request
@@ -424,7 +424,8 @@ fn pgdata_major_version(pgdata_path: &Path) -> Option<u32> {
 /// Check `pg_hba.conf` and update if needed: the member-login block first, the
 /// realtime-login block right after it (each replaced between its own markers
 /// when it's there, the rest of the file kept byte for byte), then the
-/// databricks include, then the catch-all `md5` line last.
+/// databricks include, then the catch-all `hostssl … md5` line last (a
+/// password login from a non-loopback address needs TLS).
 ///
 /// The blocks' `hostssl … clientcert=verify-full map=…` lines need v17 (older
 /// majors refuse `map=` with a client certificate check); below v17, or when
@@ -553,6 +554,24 @@ pub(crate) fn write_ident_then_hba(ident: &ConfRewrite, hba: &ConfRewrite) -> Re
     Ok(())
 }
 
+/// `text` with each line equal to `old` (compared without its line end)
+/// replaced by `new`, where it stands; the rest kept byte for byte.
+fn with_line_replaced(text: String, old: &str, new: &str) -> String {
+    if !text.lines().any(|l| l == old) {
+        return text;
+    }
+    text.split_inclusive('\n')
+        .map(|l| {
+            let body = l.trim_end_matches('\n').trim_end_matches('\r');
+            if body == old {
+                format!("{new}{}", &l[body.len()..])
+            } else {
+                l.to_string()
+            }
+        })
+        .collect()
+}
+
 /// `text` with `line` (compared without its line end) added at the end unless a
 /// line of `text` already equals it.
 fn with_line(text: String, line: &str) -> String {
@@ -629,7 +648,10 @@ pub(crate) fn plan_pg_hba(
         ),
         None => updated,
     };
-    let updated = with_line(updated, PG_HBA_ALL_MD5);
+    let updated = with_line(
+        with_line_replaced(updated, PG_HBA_ALL_MD5_PLAIN, PG_HBA_ALL_MD5),
+        PG_HBA_ALL_MD5,
+    );
 
     Ok(ConfRewrite {
         path: pghba_path,

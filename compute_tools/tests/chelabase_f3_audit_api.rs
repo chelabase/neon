@@ -30,7 +30,7 @@ use compute_tools::config::rewrite_config_files;
 use compute_tools::tls::{read_tls_digest, wait_for_tls};
 
 const HEAD: &str = "# chelabase: member logins (cb_m_*) only from the orchestrator\n";
-const MD5: &str = "host\tall\t\tall\t\tall\t\tmd5\n";
+const MD5: &str = "hostssl\tall\t\tall\t\tall\t\tmd5\n";
 
 fn fresh(name: &str) -> PathBuf {
     let dir = Path::new("./tests/tmp").join(name);
@@ -191,7 +191,9 @@ fn a_rewrite_writes_all_three_files() {
     assert!(dir.join("server.crt").exists() && dir.join("server.key").exists());
     let hba = read(&dir.join("pg_hba.conf"));
     assert!(
-        hba.starts_with(HEAD) && hba.contains("hostssl") && hba.contains("10.213.4.10/32"),
+        hba.starts_with(HEAD)
+            && hba.replace(MD5.trim_end(), "").contains("hostssl")
+            && hba.contains("10.213.4.10/32"),
         "{hba}"
     );
     let ident = read(&dir.join("pg_ident.conf"));
@@ -212,7 +214,10 @@ fn a_rewrite_without_tls_writes_the_reject_only_block() {
     seed(&dir, &format!("local all all trust\n{MD5}"));
     rewrite(&dir, &spec(&["chelabase-orchestrator"])).unwrap();
     let hba = read(&dir.join("pg_hba.conf"));
-    assert!(hba.starts_with(HEAD) && !hba.contains("hostssl"), "{hba}");
+    assert!(
+        hba.starts_with(HEAD) && !hba.replace(MD5.trim_end(), "").contains("hostssl"),
+        "{hba}"
+    );
     assert!(read(&dir.join("postgresql.conf")).contains("neon.branch_protected"));
     std::fs::remove_dir_all(&dir).unwrap();
 }

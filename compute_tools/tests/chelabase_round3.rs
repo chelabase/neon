@@ -124,10 +124,7 @@ host    all             all             127.0.0.1/32            trust\n";
     assert!(text.starts_with(&block), "{text}");
     assert_eq!(text.matches(HEAD.trim_end()).count(), 1, "once");
     assert!(text[block.len()..].contains("127.0.0.1/32            trust"));
-    assert!(
-        text.trim_end().ends_with("host\tall\t\tall\t\tall\t\tmd5"),
-        "{text}"
-    );
+    assert!(text.trim_end().ends_with(MD5.trim_end()), "{text}");
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -297,7 +294,7 @@ fn only_a_failure_that_leaves_a_fail_open_migration_unapplied_is_fatal() {
 // F3 (fork round 3, final fix round)
 // ---------------------------------------------------------------------------
 
-const MD5: &str = "host\tall\t\tall\t\tall\t\tmd5\n";
+const MD5: &str = "hostssl\tall\t\tall\t\tall\t\tmd5\n";
 const ORCH: &str = "chelabase-orchestrator";
 
 /// A fresh `./tests/tmp/<name>` pgdata, with `PG_VERSION` when given.
@@ -366,7 +363,7 @@ fn update_pg_hba_replaces_the_block_between_the_markers() {
 
     update_pg_hba(&dir, None, None, None, true).unwrap();
     assert_eq!(read(&hba), expect(None), "no member_logins: reject only");
-    assert!(!read(&hba).contains("hostssl"));
+    assert!(!read(&hba).replace(MD5.trim_end(), "").contains("hostssl"));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -425,7 +422,10 @@ fn below_v17_the_block_only_rejects() {
             text.starts_with(&format!("{HEAD}{REJECT}{TAIL}")),
             "PG_VERSION {version:?}: reject lines only:\n{text}"
         );
-        assert!(!text.contains("hostssl"), "PG_VERSION {version:?}");
+        assert!(
+            !text.replace(MD5.trim_end(), "").contains("hostssl"),
+            "PG_VERSION {version:?}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
     let dir = pgdata("f3_hba_version_17", Some("17"));

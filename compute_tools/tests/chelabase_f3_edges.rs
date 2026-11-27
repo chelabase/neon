@@ -85,7 +85,7 @@ fn a_cut_ident_block_is_refused() {
 fn a_block_at_the_end_of_the_file_is_replaced() {
     let old = logins(&["10.213.4.10/32"], &["cn"]);
     let new = logins(&["10.213.4.11/32"], &["cn"]);
-    let md5 = "host\tall\t\tall\t\tall\t\tmd5\n";
+    let md5 = "hostssl\tall\t\tall\t\tall\t\tmd5\n";
 
     let dir = fresh("f3e_hba_end");
     let hba = dir.join("pg_hba.conf");

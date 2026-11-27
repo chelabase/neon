@@ -57,7 +57,7 @@ const ENDPOINT_STORAGE_TOKEN: &str = "f1EndpointStorageNeedle.eyJ0IjoyfQ.c2ln";
 const ENDPOINT_STORAGE_NEEDLE: &str = "f1EndpointStorageNeedle";
 const ORCH: &str = "chelabase-orchestrator";
 const RT_CN: &str = "chelabase-realtime";
-const MD5: &str = "host\tall\t\tall\t\tall\t\tmd5\n";
+const MD5: &str = "hostssl\tall\t\tall\t\tall\t\tmd5\n";
 /// The basebackup's sample pg_hba.conf rules.
 const BASEBACKUP: &str = "local   all             all                                     trust\n\
 host    all             all             127.0.0.1/32            trust\n\

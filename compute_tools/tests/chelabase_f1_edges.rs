@@ -32,7 +32,7 @@ use serde_json::{Value, json};
 const SPEC: &str = include_str!("../../libs/compute_api/tests/cluster_spec.json");
 const ORCH: &str = "chelabase-orchestrator";
 const RT_CN: &str = "chelabase-realtime";
-const MD5: &str = "host\tall\t\tall\t\tall\t\tmd5\n";
+const MD5: &str = "hostssl\tall\t\tall\t\tall\t\tmd5\n";
 const BASEBACKUP: &str = "local   all             all                                     trust\n\
 host    all             all             127.0.0.1/32            trust\n";
 

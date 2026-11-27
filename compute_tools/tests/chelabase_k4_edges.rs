@@ -289,7 +289,7 @@ async fn an_empty_jwks_refuses_everything() {
 // pg_hba / pg_ident
 // ---------------------------------------------------------------------------
 
-const MD5: &str = "host\tall\t\tall\t\tall\t\tmd5\n";
+const MD5: &str = "hostssl\tall\t\tall\t\tall\t\tmd5\n";
 
 fn logins(cidrs: &[&str], cns: &[&str]) -> MemberLogins {
     MemberLogins {
