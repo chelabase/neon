@@ -684,11 +684,24 @@ async fn handle_auth_broker_inner(
 
 /// Cancels the query running on `cancel_token`'s connection, with the same TLS as the
 /// connection itself (`compute_config`, the proxy's compute TLS config, when it used TLS).
+/// The whole attempt (connect, SSLRequest, handshake, request) is bounded by
+/// `compute_config.timeout`, so a compute that stalls can't hold the request's task.
 async fn cancel_compute_query(
     cancel_token: &CancelToken,
     compute_config: &ComputeConfig,
-) -> Result<(), postgres_client::Error> {
-    cancel_token.cancel_query(compute_config).await
+) -> anyhow::Result<()> {
+    match time::timeout(
+        compute_config.timeout,
+        cancel_token.cancel_query(compute_config),
+    )
+    .await
+    {
+        Ok(result) => Ok(result?),
+        Err(_) => Err(anyhow::anyhow!(
+            "the cancel request timed out after {:?}",
+            compute_config.timeout
+        )),
+    }
 }
 
 impl QueryData {
@@ -1141,6 +1154,58 @@ mod tests {
             .unwrap();
         assert_eq!(sni.as_deref(), Some(COMPUTE_NAME));
         assert_eq!(request, CANCEL_REQUEST);
+    }
+
+    /// A compute that answers `S` and then never handshakes: the cancel must still end.
+    #[tokio::test]
+    async fn cancel_ends_when_the_handshake_stalls() {
+        let (ca, _, _) = compute_certs();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let compute = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut ssl_request = [0u8; 8];
+            stream.read_exact(&mut ssl_request).await.unwrap();
+            stream.write_all(b"S").await.unwrap();
+            time::sleep(Duration::from_secs(120)).await;
+            drop(stream);
+        });
+        let token = cancel_token(addr, COMPUTE_NAME, SslMode::Require);
+        // The token's connect timeout and the compute config's timeout are both 5 s.
+        let res = time::timeout(
+            Duration::from_secs(12),
+            cancel_compute_query(&token, &compute_config(ca)),
+        )
+        .await;
+        compute.abort();
+        assert!(
+            res.is_ok(),
+            "cancel_compute_query was still waiting on the TLS handshake after 12 s"
+        );
+    }
+
+    /// Same, for a compute that never answers the SSLRequest.
+    #[tokio::test]
+    async fn cancel_ends_when_the_ssl_request_is_not_answered() {
+        let (ca, _, _) = compute_certs();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let compute = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            time::sleep(Duration::from_secs(120)).await;
+            drop(stream);
+        });
+        let token = cancel_token(addr, COMPUTE_NAME, SslMode::Require);
+        let res = time::timeout(
+            Duration::from_secs(12),
+            cancel_compute_query(&token, &compute_config(ca)),
+        )
+        .await;
+        compute.abort();
+        assert!(
+            res.is_ok(),
+            "cancel_compute_query was still waiting for the SSLRequest answer after 12 s"
+        );
     }
 
     /// A connection without TLS (local_proxy's loopback connection to its own

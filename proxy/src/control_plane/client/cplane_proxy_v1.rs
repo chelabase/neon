@@ -510,8 +510,8 @@ fn parse_host_port(input: &str) -> Option<(&str, u16)> {
 }
 
 /// The compute to connect to, from the control plane's wake_compute answer: always over
-/// TLS, verified as `server_name`. An answer without `server_name` is refused rather than
-/// connected to in plaintext.
+/// TLS, verified as `server_name`. An answer without `server_name` (or with an empty or
+/// blank one) is refused rather than connected to in plaintext.
 fn node_info_from_wake_compute(body: WakeCompute) -> Result<NodeInfo, WakeComputeError> {
     let Some((host, port)) = parse_host_port(&body.address) else {
         return Err(WakeComputeError::BadComputeAddress(body.address));
@@ -519,7 +519,7 @@ fn node_info_from_wake_compute(body: WakeCompute) -> Result<NodeInfo, WakeComput
 
     let host_addr = IpAddr::from_str(host).ok();
 
-    let Some(server_name) = body.server_name else {
+    let Some(server_name) = body.server_name.filter(|name| !name.trim().is_empty()) else {
         tracing::error!(
             address = &*body.address,
             compute_id = &*body.aux.compute_id,
@@ -567,6 +567,26 @@ mod tests {
         assert_eq!(&*node.conn_info.host, "ep-foo.compute.test");
         assert_eq!(node.conn_info.port, 55432);
         assert_eq!(node.conn_info.host_addr, Some(IpAddr::from([10, 0, 0, 7])));
+    }
+
+    /// An empty or blank `server_name` names no certificate either: refused the same way.
+    #[test]
+    fn wake_compute_with_an_empty_server_name_is_refused() {
+        for name in ["", " "] {
+            match node_info_from_wake_compute(wake_compute_answer(Some(name))) {
+                Ok(node) => panic!(
+                    "server_name {name:?} was accepted: host {:?}, {:?}",
+                    &*node.conn_info.host, node.conn_info.ssl_mode
+                ),
+                Err(err) => {
+                    assert!(
+                        matches!(err, WakeComputeError::MissingServerName(_)),
+                        "{err}"
+                    );
+                    assert!(!err.could_retry());
+                }
+            }
+        }
     }
 
     /// No `server_name` means the proxy can't verify the compute's certificate:
