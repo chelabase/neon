@@ -137,6 +137,19 @@ where
     }
 }
 
+impl<S> MakeTlsConnect<S> for &ComputeConfig
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    type Stream = private::RustlsStream<S>;
+    type TlsConnect = private::RustlsConnect;
+    type Error = InvalidDnsNameError;
+
+    fn make_tls_connect(&self, hostname: &str) -> Result<Self::TlsConnect, Self::Error> {
+        make_tls_connect(&self.tls, hostname)
+    }
+}
+
 pub fn make_tls_connect(
     tls: &Arc<rustls::ClientConfig>,
     hostname: &str,

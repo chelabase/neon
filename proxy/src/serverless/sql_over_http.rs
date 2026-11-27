@@ -14,7 +14,9 @@ use hyper::http::{HeaderName, HeaderValue};
 use hyper::{Request, Response, StatusCode, header};
 use indexmap::IndexMap;
 use postgres_client::error::{DbError, ErrorPosition, SqlState};
-use postgres_client::{GenericClient, IsolationLevel, NoTls, ReadyForQueryStatus, Transaction};
+use postgres_client::{
+    CancelToken, GenericClient, IsolationLevel, ReadyForQueryStatus, Transaction,
+};
 use serde_json::Value;
 use serde_json::value::RawValue;
 use tokio::time::{self, Instant};
@@ -32,7 +34,7 @@ use super::http_util::{
 };
 use super::json::{JsonConversionError, json_to_pg_text, pg_text_row_to_json};
 use crate::auth::backend::ComputeCredentialKeys;
-use crate::config::{HttpConfig, ProxyConfig};
+use crate::config::{ComputeConfig, HttpConfig, ProxyConfig};
 use crate::context::RequestContext;
 use crate::error::{ErrorKind, ReportableError, UserFacingError};
 use crate::http::read_body_with_limit;
@@ -564,8 +566,14 @@ async fn handle_db_inner(
     // Now execute the query and return the result.
     let json_output = match payload {
         Payload::Single(stmt) => {
-            stmt.process(&config.http_config, cancel, &mut client, parsed_headers)
-                .await?
+            stmt.process(
+                &config.http_config,
+                &config.connect_to_compute,
+                cancel,
+                &mut client,
+                parsed_headers,
+            )
+            .await?
         }
         Payload::Batch(statements) => {
             if parsed_headers.txn_read_only {
@@ -582,7 +590,13 @@ async fn handle_db_inner(
             }
 
             statements
-                .process(&config.http_config, cancel, &mut client, parsed_headers)
+                .process(
+                    &config.http_config,
+                    &config.connect_to_compute,
+                    cancel,
+                    &mut client,
+                    parsed_headers,
+                )
                 .await?
         }
     };
@@ -668,10 +682,20 @@ async fn handle_auth_broker_inner(
         .map(|b| b.boxed()))
 }
 
+/// Cancels the query running on `cancel_token`'s connection, with the same TLS as the
+/// connection itself (`compute_config`, the proxy's compute TLS config, when it used TLS).
+async fn cancel_compute_query(
+    cancel_token: &CancelToken,
+    compute_config: &ComputeConfig,
+) -> Result<(), postgres_client::Error> {
+    cancel_token.cancel_query(compute_config).await
+}
+
 impl QueryData {
     async fn process(
         self,
         config: &'static HttpConfig,
+        compute_config: &'static ComputeConfig,
         cancel: CancellationToken,
         client: &mut Client,
         parsed_headers: HttpHeaders,
@@ -696,7 +720,7 @@ impl QueryData {
             Either::Left((res, __not_yet_cancelled)) => res,
             Either::Right((_cancelled, query)) => {
                 tracing::info!("cancelling query");
-                if let Err(err) = cancel_token.cancel_query(NoTls).await {
+                if let Err(err) = cancel_compute_query(&cancel_token, compute_config).await {
                     tracing::warn!(?err, "could not cancel query");
                 }
                 // wait for the query cancellation
@@ -747,6 +771,7 @@ impl BatchQueryData {
     async fn process(
         self,
         config: &'static HttpConfig,
+        compute_config: &'static ComputeConfig,
         cancel: CancellationToken,
         client: &mut Client,
         parsed_headers: HttpHeaders,
@@ -798,7 +823,7 @@ impl BatchQueryData {
                 json_output
             }
             Err(SqlOverHttpError::Cancelled(_)) => {
-                if let Err(err) = cancel_token.cancel_query(NoTls).await {
+                if let Err(err) = cancel_compute_query(&cancel_token, compute_config).await {
                     tracing::warn!(?err, "could not cancel query");
                 }
                 // TODO: after cancelling, wait to see if we can get a status. maybe the connection is still safe.
@@ -1003,7 +1028,147 @@ impl Discard<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    use postgres_client::config::{Host, SslMode};
+    use postgres_client::{RawCancelToken, SocketConfig};
+    use rustls::crypto::ring;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
     use super::*;
+    use crate::config::RetryConfig;
+    use crate::tls::client_config::compute_client_config_with_certs;
+
+    const COMPUTE_NAME: &str = "ep-foo.compute.test";
+    /// `CancelRequest`: length 16, code 80877102, the process id and secret key.
+    const CANCEL_REQUEST: [u8; 16] = [0, 0, 0, 16, 4, 210, 22, 46, 0, 0, 0, 42, 0, 0, 0, 7];
+
+    /// A CA and a server certificate for [`COMPUTE_NAME`] signed by it.
+    fn compute_certs() -> (
+        CertificateDer<'static>,
+        CertificateDer<'static>,
+        PrivateKeyDer<'static>,
+    ) {
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params = rcgen::CertificateParams::default();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec![COMPUTE_NAME.into()])
+            .unwrap()
+            .signed_by(&key, &ca, &ca_key)
+            .unwrap();
+        (
+            ca.der().clone(),
+            cert.der().clone(),
+            PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+        )
+    }
+
+    fn compute_config(ca: CertificateDer<'static>) -> ComputeConfig {
+        ComputeConfig {
+            retry: RetryConfig {
+                max_retries: 0,
+                base_delay: Duration::from_millis(10),
+                backoff_factor: 2.0,
+            },
+            tls: Arc::new(compute_client_config_with_certs([ca])),
+            timeout: Duration::from_secs(5),
+        }
+    }
+
+    fn cancel_token(addr: SocketAddr, host: &str, ssl_mode: SslMode) -> CancelToken {
+        CancelToken {
+            socket_config: SocketConfig {
+                host_addr: Some(addr.ip()),
+                host: Host::Tcp(host.to_owned()),
+                port: addr.port(),
+                connect_timeout: Some(Duration::from_secs(5)),
+            },
+            raw: RawCancelToken {
+                ssl_mode,
+                process_id: 42,
+                secret_key: 7,
+            },
+        }
+    }
+
+    /// The cancel sent when an HTTP client disconnects reaches a compute that
+    /// requires TLS: over TLS, to the compute's name, with the proxy's compute
+    /// TLS config (not `NoTls`, which fails after the server accepts TLS).
+    #[tokio::test]
+    async fn disconnect_cancel_reaches_a_tls_compute() {
+        let (ca, cert, key) = compute_certs();
+        let server_config =
+            rustls::ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert], key)
+                .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let compute = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut ssl_request = [0u8; 8];
+            stream.read_exact(&mut ssl_request).await.unwrap();
+            assert_eq!(
+                ssl_request,
+                [0, 0, 0, 8, 4, 210, 22, 47],
+                "expected an SSLRequest"
+            );
+            stream.write_all(b"S").await.unwrap();
+            let mut tls = acceptor.accept(stream).await.unwrap();
+            let sni = tls.get_ref().1.server_name().map(str::to_owned);
+            let mut request = [0u8; 16];
+            tls.read_exact(&mut request).await.unwrap();
+            (sni, request)
+        });
+
+        let token = cancel_token(addr, COMPUTE_NAME, SslMode::Require);
+        cancel_compute_query(&token, &compute_config(ca))
+            .await
+            .expect("the cancel reaches the compute over TLS");
+
+        let (sni, request) = time::timeout(Duration::from_secs(5), compute)
+            .await
+            .expect("the compute got the cancel in time")
+            .unwrap();
+        assert_eq!(sni.as_deref(), Some(COMPUTE_NAME));
+        assert_eq!(request, CANCEL_REQUEST);
+    }
+
+    /// A connection without TLS (local_proxy's loopback connection to its own
+    /// Postgres, by IP) still cancels in plaintext.
+    #[tokio::test]
+    async fn disconnect_cancel_without_tls_stays_plaintext() {
+        let (ca, _, _) = compute_certs();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let compute = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 16];
+            stream.read_exact(&mut request).await.unwrap();
+            request
+        });
+
+        let token = cancel_token(addr, &addr.ip().to_string(), SslMode::Disable);
+        cancel_compute_query(&token, &compute_config(ca))
+            .await
+            .expect("the plaintext cancel is sent");
+
+        let request = time::timeout(Duration::from_secs(5), compute)
+            .await
+            .expect("the compute got the cancel in time")
+            .unwrap();
+        assert_eq!(request, CANCEL_REQUEST);
+    }
 
     #[test]
     fn test_payload() {
