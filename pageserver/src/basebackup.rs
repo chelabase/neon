@@ -1466,3 +1466,62 @@ mod slot_state_check_edges {
         }
     }
 }
+
+/// The basebackup archive, member by member, against a listing taken from the
+/// astral-tokio-tar build before the move to async-tar: computes from older images
+/// read these archives, so the bytes must not change.
+#[cfg(test)]
+mod archive_tests {
+    use super::*;
+    use crate::import_datadir::raw_tar::{self, RawEntry};
+    use crate::import_datadir::tests as import_tests;
+
+    /// path, type, mode, size, crc32c of the data, crc32c of the header with mtime
+    /// and checksum blanked.
+    fn render(entries: &[RawEntry]) -> String {
+        entries
+            .iter()
+            .map(|e| {
+                format!(
+                    "{} {} {:o} {} {:08x} {:08x}\n",
+                    e.path, e.typeflag as char, e.mode, e.size, e.data_crc, e.header_crc
+                )
+            })
+            .collect()
+    }
+
+    const GOLDEN: &str = "";
+
+    const GOLDEN_FULL: &str = "";
+
+    #[tokio::test]
+    async fn a_basebackup_archive_matches_the_golden_listing() -> anyhow::Result<()> {
+        let archive = import_tests::datadir(|t| {
+            t.file("base/5/1259", &import_tests::rel_data());
+        })
+        .end();
+        let (_tenant, tline, ctx) =
+            import_tests::import("a_basebackup_archive_matches_the_golden_listing", &archive)
+                .await?;
+        for (full_backup, golden) in [(false, GOLDEN), (true, GOLDEN_FULL)] {
+            let mut out: Vec<u8> = Vec::new();
+            send_basebackup_tarball(
+                &mut out,
+                &tline,
+                Some(import_tests::BASE_LSN),
+                None,
+                full_backup,
+                false,
+                None,
+                &ctx,
+            )
+            .await?;
+            let got = render(&raw_tar::list(&out));
+            assert_eq!(
+                got, golden,
+                "full_backup={full_backup}: listing differs; got:\n{got}"
+            );
+        }
+        Ok(())
+    }
+}

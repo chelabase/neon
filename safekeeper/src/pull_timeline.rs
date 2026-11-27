@@ -684,6 +684,44 @@ pub async fn handle_request(
     }
 }
 
+/// Extracts a snapshot archive into `dir`, fsyncing each file. We don't use simple
+/// unpack() so that files are fsynced.
+async fn extract_snapshot(
+    reader: impl tokio::io::AsyncRead + Unpin + Send,
+    dir: &camino::Utf8Path,
+) -> Result<()> {
+    let mut entries = Archive::new(reader).entries()?;
+    while let Some(base_tar_entry) = entries.next().await {
+        let mut entry = base_tar_entry?;
+        let header = entry.header();
+        let file_path = header.path()?.into_owned();
+        match header.entry_type() {
+            tokio_tar::EntryType::Regular => {
+                let utf8_file_path =
+                    Utf8PathBuf::from_path_buf(file_path).expect("non-Unicode path");
+                let dst_path = dir.join(utf8_file_path);
+                let mut f = OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .write(true)
+                    .open(&dst_path)
+                    .await?;
+                tokio::io::copy(&mut entry, &mut f).await?;
+                // fsync the file
+                f.sync_all().await?;
+            }
+            _ => {
+                bail!(
+                    "entry {} in backup tar archive is of unexpected type: {:?}",
+                    file_path.display(),
+                    header.entry_type()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn pull_timeline(
     status: TimelineStatus,
     host: String,
@@ -717,37 +755,8 @@ async fn pull_timeline(
     // and turn it into StreamReader implementing AsyncRead.
     let bb_reader = tokio_util::io::StreamReader::new(bb_stream);
 
-    // Extract it on the fly to the disk. We don't use simple unpack() to fsync
-    // files.
-    let mut entries = Archive::new(bb_reader).entries()?;
-    while let Some(base_tar_entry) = entries.next().await {
-        let mut entry = base_tar_entry?;
-        let header = entry.header();
-        let file_path = header.path()?.into_owned();
-        match header.entry_type() {
-            tokio_tar::EntryType::Regular => {
-                let utf8_file_path =
-                    Utf8PathBuf::from_path_buf(file_path).expect("non-Unicode path");
-                let dst_path = tli_dir_path.join(utf8_file_path);
-                let mut f = OpenOptions::new()
-                    .create(true)
-                    .truncate(true)
-                    .write(true)
-                    .open(&dst_path)
-                    .await?;
-                tokio::io::copy(&mut entry, &mut f).await?;
-                // fsync the file
-                f.sync_all().await?;
-            }
-            _ => {
-                bail!(
-                    "entry {} in backup tar archive is of unexpected type: {:?}",
-                    file_path.display(),
-                    header.entry_type()
-                );
-            }
-        }
-    }
+    // Extract it on the fly to the disk.
+    extract_snapshot(bb_reader, &tli_dir_path).await?;
 
     // fsync temp timeline directory to remember its contents.
     fsync_async_opt(&tli_dir_path, !conf.no_sync).await?;
@@ -781,4 +790,76 @@ async fn pull_timeline(
     Ok(PullTimelineResponse {
         safekeeper_host: Some(host),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use camino_tempfile::tempdir;
+
+    use super::*;
+
+    fn content(len: usize, seed: u8) -> Vec<u8> {
+        (0..len).map(|i| (i as u8).wrapping_mul(7).wrapping_add(seed)).collect()
+    }
+
+    const FILES: [(&str, usize); 3] = [("safekeeper.control", 300), ("seg1", 20000), ("seg2", 512)];
+
+    /// Writes FILES with the snapshot writer; `finish` false drops the builder
+    /// unfinished, as a snapshot that bails out (a term change) does.
+    async fn snapshot_bytes(finish: bool) -> Vec<u8> {
+        let (tx, mut rx) = mpsc::channel(1024);
+        let collect = tokio::spawn(async move {
+            let mut out = Vec::new();
+            while let Some(chunk) = rx.recv().await {
+                out.extend_from_slice(&chunk.unwrap());
+            }
+            out
+        });
+        let mut ar = prepare_tar_stream(tx);
+        for (i, (name, len)) in FILES.into_iter().enumerate() {
+            let data = content(len, i as u8);
+            let mut header = Header::new_gnu();
+            header.set_size(len as u64);
+            ar.append_data(&mut header, name, data.as_slice()).await.unwrap();
+        }
+        if finish {
+            ar.finish().await.unwrap();
+        }
+        drop(ar);
+        collect.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_round_trips() {
+        let bytes = snapshot_bytes(true).await;
+        let dir = tempdir().unwrap();
+        extract_snapshot(bytes.as_slice(), dir.path()).await.unwrap();
+        for (i, (name, len)) in FILES.into_iter().enumerate() {
+            let got = std::fs::read(dir.path().join(name)).unwrap();
+            assert_eq!(got, content(len, i as u8), "{name}");
+        }
+    }
+
+    /// A snapshot whose writer stopped before finishing never extracts.
+    #[tokio::test]
+    async fn an_unfinished_snapshot_fails_to_extract() {
+        let bytes = snapshot_bytes(false).await;
+        let dir = tempdir().unwrap();
+        let res = extract_snapshot(bytes.as_slice(), dir.path()).await;
+        assert!(res.is_err(), "an unfinished snapshot was extracted");
+    }
+
+    /// A snapshot cut anywhere before its end-of-archive marker fails to extract.
+    #[tokio::test]
+    async fn a_truncated_snapshot_fails_to_extract() {
+        let full = snapshot_bytes(true).await;
+        // inside the first header; after the first member; inside seg1's data;
+        // after the last member, before the marker
+        let cuts = [100, 512 + 512, 2 * 512 + 512 + 5000, full.len() - 1024];
+        for cut in cuts {
+            let dir = tempdir().unwrap();
+            let res = extract_snapshot(&full[..cut], dir.path()).await;
+            assert!(res.is_err(), "cut at {cut} of {} was extracted", full.len());
+        }
+    }
 }
